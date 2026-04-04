@@ -39,18 +39,32 @@ tests/
 
 ## Deploying
 
+Use `start_miner.sh` instead of calling `neuron.py` directly — it checks DNS resolution with exponential backoff before launching, preventing crash loops when the network is temporarily unavailable.
+
 ```bash
 # Agent 1
-python miner/neuron.py --agent_dir agents/frontier_sniper/ \
+./start_miner.sh --agent_dir agents/frontier_sniper/ \
     --wallet.name miner1 --netuid <N> --subtensor.network <network>
 
 # Agent 2
-python miner/neuron.py --agent_dir agents/bucket_specialist/ \
+./start_miner.sh --agent_dir agents/bucket_specialist/ \
     --wallet.name miner2 --netuid <N> --subtensor.network <network>
 
 # Agent 3
-python miner/neuron.py --agent_dir agents/pareto_hunter/ \
+./start_miner.sh --agent_dir agents/pareto_hunter/ \
     --wallet.name miner3 --netuid <N> --subtensor.network <network>
+```
+
+### PM2 (recommended)
+
+Use the included `ecosystem.config.js` which adds exponential backoff restart delays:
+
+```bash
+# Edit ecosystem.config.js to set your wallet names and netuid, then:
+pm2 start ecosystem.config.js
+
+# Or start a single miner:
+pm2 start ecosystem.config.js --only miner_1
 ```
 
 The harness volume-mounts the agent directory to `/workspace/agent/` and calls `design_architecture(challenge, client)` from `agent.py`.
