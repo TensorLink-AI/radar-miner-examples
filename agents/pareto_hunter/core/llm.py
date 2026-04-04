@@ -3,7 +3,7 @@
 import sys
 
 
-DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_MODEL = "deepseek-ai/DeepSeek-V3-0324-TEE"
 MAX_RETRIES = 3
 
 
