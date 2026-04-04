@@ -6,7 +6,8 @@ import sys
 import os
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Use any agent dir — all contain identical core/ modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
 
 from core.history import (
     get_history, add_entry, get_bucket_history, format_history,

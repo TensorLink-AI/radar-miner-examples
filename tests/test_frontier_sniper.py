@@ -1,16 +1,22 @@
 """Tests for frontier_sniper agent strategy logic."""
 
+import importlib.util
 import sys
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
+# Load the agent module with a unique name to avoid cache collisions
+_agent_dir = os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper")
+sys.path.insert(0, _agent_dir)
+_spec = importlib.util.spec_from_file_location(
+    "frontier_sniper_agent", os.path.join(_agent_dir, "agent.py"))
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
 
-from agents.frontier_sniper.agent import (
-    get_frontier_for_bucket, analyze_frontier,
-    build_strategy_instructions, update_playbook,
-)
+get_frontier_for_bucket = _mod.get_frontier_for_bucket
+analyze_frontier = _mod.analyze_frontier
+build_strategy_instructions = _mod.build_strategy_instructions
+update_playbook = _mod.update_playbook
 
 
 class TestGetFrontierForBucket:
@@ -30,7 +36,7 @@ class TestGetFrontierForBucket:
     def test_non_list(self):
         challenge = {"feasible_frontier": "invalid"}
         result = get_frontier_for_bucket(challenge)
-        assert result == []  # non-list returns empty
+        assert result == []
 
 
 class TestAnalyzeFrontier:
@@ -97,21 +103,15 @@ class TestUpdatePlaybook:
 
 
 class TestIntegration:
-    @patch("core.llm.chat")
-    def test_extract_and_validate(self, mock_chat):
-        """Integration test: mock LLM returns valid harness code."""
-        mock_chat.return_value = "Hello model code"
+    def test_extract_and_validate(self):
+        """Integration test: code extraction + validation pipeline."""
+        from core.llm import extract_code
+        from core.validation import validate
+
         challenge = {
             "task": {"run_command": "python harness.py"},
             "flops_budget": {"min": 500_000, "max": 2_000_000},
-            "feasible_frontier": [],
-            "db_url": "",
-            "llm_url": "",
         }
-
-        # Test that the code extraction + validation pipeline works
-        from core.llm import extract_code
-        from core.validation import validate
 
         raw = '''```python
 import torch

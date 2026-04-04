@@ -1,15 +1,21 @@
 """Tests for bucket_specialist agent strategy logic."""
 
+import importlib.util
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "bucket_specialist"))
+# Load the agent module with a unique name to avoid cache collisions
+_agent_dir = os.path.join(os.path.dirname(__file__), "..", "agents", "bucket_specialist")
+sys.path.insert(0, _agent_dir)
+_spec = importlib.util.spec_from_file_location(
+    "bucket_specialist_agent", os.path.join(_agent_dir, "agent.py"))
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
 
-from agents.bucket_specialist.agent import (
-    get_bucket_template_prompt, build_strategy_instructions,
-    save_template, BUCKET_TEMPLATES,
-)
+get_bucket_template_prompt = _mod.get_bucket_template_prompt
+build_strategy_instructions = _mod.build_strategy_instructions
+save_template = _mod.save_template
+BUCKET_TEMPLATES = _mod.BUCKET_TEMPLATES
 
 
 class TestBucketTemplates:

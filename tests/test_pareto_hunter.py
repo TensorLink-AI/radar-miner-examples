@@ -1,15 +1,21 @@
 """Tests for pareto_hunter agent strategy logic."""
 
+import importlib.util
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "pareto_hunter"))
+# Load the agent module with a unique name to avoid cache collisions
+_agent_dir = os.path.join(os.path.dirname(__file__), "..", "agents", "pareto_hunter")
+sys.path.insert(0, _agent_dir)
+_spec = importlib.util.spec_from_file_location(
+    "pareto_hunter_agent", os.path.join(_agent_dir, "agent.py"))
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
 
-from agents.pareto_hunter.agent import (
-    analyze_frontier_weaknesses, get_dominatable_targets,
-    build_strategy_instructions, OBJECTIVE_WEIGHTS,
-)
+analyze_frontier_weaknesses = _mod.analyze_frontier_weaknesses
+get_dominatable_targets = _mod.get_dominatable_targets
+build_strategy_instructions = _mod.build_strategy_instructions
+OBJECTIVE_WEIGHTS = _mod.OBJECTIVE_WEIGHTS
 
 
 class TestObjectiveWeights:
@@ -83,7 +89,6 @@ class TestGetDominatableTargets:
         ]
         targets = get_dominatable_targets(frontier)
         assert len(targets) == 2
-        # Most weak first
         assert targets[0]["_weakness_score"] >= targets[1]["_weakness_score"]
 
     def test_no_weaknesses(self):

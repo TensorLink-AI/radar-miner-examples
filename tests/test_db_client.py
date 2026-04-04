@@ -5,7 +5,8 @@ import sys
 import os
 from unittest.mock import MagicMock
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Use any agent dir — all contain identical core/ modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
 
 from core.db_client import (
     recent_experiments, pareto_front, recent_failures,

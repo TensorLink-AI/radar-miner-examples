@@ -4,7 +4,8 @@ import pytest
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Use any agent dir — all contain identical core/ modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
 
 from core.validation import validate, is_harness_task
 

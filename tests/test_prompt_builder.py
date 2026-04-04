@@ -4,7 +4,8 @@ import pytest
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Use any agent dir — all contain identical core/ modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
 
 from core.prompt_builder import (
     build_system_prompt, build_user_prompt, format_frontier, format_db_context
