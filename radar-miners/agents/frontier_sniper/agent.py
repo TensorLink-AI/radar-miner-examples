@@ -1,17 +1,9 @@
-#!/usr/bin/env python3
 """Frontier Sniper — surgical micro-improvements to beat the frontier by tiny margins."""
 
-import json
 import sys
-import os
+import tempfile
 
-# Add parent dirs to path for core imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-# When deployed via Dockerfile, core/ is at /app/core/
-sys.path.insert(0, "/app")
-
-from core import llm, scratchpad, db_client, validation, prompt_builder, history
+from core import llm, db_client, validation, prompt_builder, history
 
 STRATEGY_PREAMBLE = """You are a code reviewer, not an architect. You receive working code that is \
 already competitive. Your job is to find the single most impactful improvement — a better learning \
@@ -115,10 +107,8 @@ def update_playbook(state: dict, bucket: str, name: str, motivation: str) -> dic
     return state
 
 
-def main():
-    # Read challenge from stdin
-    challenge = json.load(sys.stdin)
-
+def design_architecture(challenge: dict, client) -> dict:
+    """Entry point called by the harness. Returns proposal dict."""
     # Identify bucket
     flops_budget = challenge.get("flops_budget", {})
     flops_min = flops_budget.get("min", 0)
@@ -129,8 +119,9 @@ def main():
     print(f"[sniper] Bucket: {bucket}, FLOPs: {flops_min:,}-{flops_max:,}, "
           f"target: {target_flops:,}", file=sys.stderr)
 
-    # Load scratchpad
-    state = scratchpad.load(challenge)
+    # Load scratchpad (load_scratchpad is injected by harness)
+    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    state = history.load_state(scratch_dir) if scratch_dir else {}
     print(f"[sniper] Scratchpad loaded: {len(state)} keys", file=sys.stderr)
 
     # Get frontier
@@ -139,12 +130,13 @@ def main():
 
     # Query DB for context
     db_url = challenge.get("db_url", "")
-    recent = db_client.recent_experiments(db_url) if db_url else {}
-    failures = db_client.recent_failures(db_url) if db_url else {}
-    comp_stats = db_client.component_stats(db_url) if db_url else {}
-    dead = db_client.dead_ends(db_url) if db_url else {}
+    recent = db_client.recent_experiments(client, db_url) if db_url else {}
+    failures = db_client.recent_failures(client, db_url) if db_url else {}
+    comp_stats = db_client.component_stats(client, db_url) if db_url else {}
+    dead = db_client.dead_ends(client, db_url) if db_url else {}
 
     # Build prompts
+    llm_url = challenge.get("llm_url", "")
     strategy_instr = build_strategy_instructions(frontier, state, bucket)
     frontier_ctx = prompt_builder.format_frontier(frontier, max_entries=3)
     db_ctx = prompt_builder.format_db_context(recent, failures, comp_stats, dead)
@@ -188,7 +180,7 @@ def main():
             })
 
         try:
-            response = llm.chat(messages, temperature=0.7)
+            response = llm.chat(client, llm_url, messages, temperature=0.7)
             code = llm.extract_code(response)
 
             # Try to extract name/motivation from response
@@ -220,16 +212,12 @@ def main():
         bucket=bucket, flops=target_flops, strategy="frontier_sniper",
     )
     state = update_playbook(state, bucket, name, motivation)
-    scratchpad.save(challenge, state)
+    scratch_dir = scratch_dir or tempfile.mkdtemp()
+    history.save_state(scratch_dir, state)
+    save_scratchpad(challenge, scratch_dir)  # noqa: F821
 
-    # Output proposal JSON to stdout
-    proposal = {
+    return {
         "code": code,
         "name": name,
         "motivation": motivation,
     }
-    print(json.dumps(proposal))
-
-
-if __name__ == "__main__":
-    main()

@@ -1,6 +1,5 @@
 """Tests for frontier_sniper agent strategy logic."""
 
-import json
 import sys
 import os
 from unittest.mock import patch, MagicMock
@@ -8,7 +7,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
 
-from agents.frontier_sniper.run import (
+from agents.frontier_sniper.agent import (
     get_frontier_for_bucket, analyze_frontier,
     build_strategy_instructions, update_playbook,
 )
@@ -99,13 +98,22 @@ class TestUpdatePlaybook:
 
 class TestIntegration:
     @patch("core.llm.chat")
-    @patch("core.scratchpad.load")
-    @patch("core.scratchpad.save")
-    def test_main_with_mocked_llm(self, mock_save, mock_load, mock_chat):
+    def test_extract_and_validate(self, mock_chat):
         """Integration test: mock LLM returns valid harness code."""
-        mock_load.return_value = {}
-        mock_save.return_value = True
-        mock_chat.return_value = '''```python
+        mock_chat.return_value = "Hello model code"
+        challenge = {
+            "task": {"run_command": "python harness.py"},
+            "flops_budget": {"min": 500_000, "max": 2_000_000},
+            "feasible_frontier": [],
+            "db_url": "",
+            "llm_url": "",
+        }
+
+        # Test that the code extraction + validation pipeline works
+        from core.llm import extract_code
+        from core.validation import validate
+
+        raw = '''```python
 import torch
 import torch.nn as nn
 
@@ -115,18 +123,6 @@ def build_model(context_len, prediction_len, num_variates, quantiles):
 def build_optimizer(model):
     return torch.optim.Adam(model.parameters(), lr=1e-3)
 ```'''
-        challenge = {
-            "task": {"run_command": "python harness.py"},
-            "flops_budget": {"min": 500_000, "max": 2_000_000},
-            "feasible_frontier": [],
-            "db_url": "",
-            "scratchpad": {},
-        }
-
-        # Test that the code extraction + validation pipeline works
-        from core.llm import extract_code
-        from core.validation import validate
-
-        code = extract_code(mock_chat.return_value)
+        code = extract_code(raw)
         ok, errors = validate(code, challenge)
         assert ok, f"Validation failed: {errors}"

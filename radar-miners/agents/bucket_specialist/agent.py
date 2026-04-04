@@ -1,15 +1,9 @@
-#!/usr/bin/env python3
 """Bucket Specialist — dominate specific FLOPs ranges with pre-optimized templates."""
 
-import json
 import sys
-import os
+import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-sys.path.insert(0, "/app")
-
-from core import llm, scratchpad, db_client, validation, prompt_builder, history
+from core import llm, db_client, validation, prompt_builder, history
 
 STRATEGY_PREAMBLE = """You are optimizing for a specific compute budget. You have deep expertise \
 with models in this exact size range. You maintain a library of bucket-specific architectures \
@@ -155,9 +149,8 @@ def save_template(state: dict, bucket: str, code: str,
     return state
 
 
-def main():
-    challenge = json.load(sys.stdin)
-
+def design_architecture(challenge: dict, client) -> dict:
+    """Entry point called by the harness. Returns proposal dict."""
     flops_budget = challenge.get("flops_budget", {})
     flops_min = flops_budget.get("min", 0)
     flops_max = flops_budget.get("max", 0)
@@ -167,7 +160,9 @@ def main():
     print(f"[specialist] Bucket: {bucket}, FLOPs: {flops_min:,}-{flops_max:,}, "
           f"target: {target_flops:,}", file=sys.stderr)
 
-    state = scratchpad.load(challenge)
+    # Load scratchpad (load_scratchpad is injected by harness)
+    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    state = history.load_state(scratch_dir) if scratch_dir else {}
     print(f"[specialist] Scratchpad loaded: {len(state)} keys", file=sys.stderr)
 
     frontier = challenge.get("feasible_frontier", [])
@@ -177,13 +172,14 @@ def main():
 
     # Query DB — focus on bucket-relevant experiments
     db_url = challenge.get("db_url", "")
-    recent = db_client.recent_experiments(db_url) if db_url else {}
-    failures = db_client.recent_failures(db_url) if db_url else {}
-    comp_stats = db_client.component_stats(db_url) if db_url else {}
-    dead = db_client.dead_ends(db_url) if db_url else {}
-    families = db_client.family_summaries(db_url) if db_url else {}
+    recent = db_client.recent_experiments(client, db_url) if db_url else {}
+    failures = db_client.recent_failures(client, db_url) if db_url else {}
+    comp_stats = db_client.component_stats(client, db_url) if db_url else {}
+    dead = db_client.dead_ends(client, db_url) if db_url else {}
+    families = db_client.family_summaries(client, db_url) if db_url else {}
 
     # Build prompts
+    llm_url = challenge.get("llm_url", "")
     strategy_instr = build_strategy_instructions(
         frontier, state, bucket, flops_min, flops_max
     )
@@ -228,7 +224,7 @@ def main():
             })
 
         try:
-            response = llm.chat(messages, temperature=0.7)
+            response = llm.chat(client, llm_url, messages, temperature=0.7)
             code = llm.extract_code(response)
 
             for line in response.split("\n"):
@@ -258,15 +254,12 @@ def main():
         bucket=bucket, flops=target_flops, strategy="bucket_specialist",
     )
     state = save_template(state, bucket, code)
-    scratchpad.save(challenge, state)
+    scratch_dir = scratch_dir or tempfile.mkdtemp()
+    history.save_state(scratch_dir, state)
+    save_scratchpad(challenge, scratch_dir)  # noqa: F821
 
-    proposal = {
+    return {
         "code": code,
         "name": name,
         "motivation": motivation,
     }
-    print(json.dumps(proposal))
-
-
-if __name__ == "__main__":
-    main()
