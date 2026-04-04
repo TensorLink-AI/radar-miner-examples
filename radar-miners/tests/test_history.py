@@ -1,14 +1,16 @@
 """Tests for core.history module."""
 
+import json
 import pytest
 import sys
 import os
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.history import (
     get_history, add_entry, get_bucket_history, format_history,
-    identify_bucket, SIZE_BUCKETS,
+    identify_bucket, SIZE_BUCKETS, load_state, save_state,
 )
 
 
@@ -100,3 +102,30 @@ class TestIdentifyBucket:
 
     def test_all_buckets_defined(self):
         assert len(SIZE_BUCKETS) == 5
+
+
+class TestLoadState:
+    def test_empty_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            assert load_state(d) == {}
+
+    def test_loads_existing_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = {"history": [{"name": "exp1"}]}
+            with open(os.path.join(d, "state.json"), "w") as f:
+                json.dump(state, f)
+            assert load_state(d) == state
+
+
+class TestSaveState:
+    def test_saves_and_loads(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = {"key": "value", "count": 42}
+            save_state(d, state)
+            assert load_state(d) == state
+
+    def test_creates_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            nested = os.path.join(d, "sub", "dir")
+            save_state(nested, {"x": 1})
+            assert os.path.exists(os.path.join(nested, "state.json"))

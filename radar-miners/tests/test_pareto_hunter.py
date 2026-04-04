@@ -6,7 +6,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "pareto_hunter"))
 
-from agents.pareto_hunter.run import (
+from agents.pareto_hunter.agent import (
     analyze_frontier_weaknesses, get_dominatable_targets,
     build_strategy_instructions, OBJECTIVE_WEIGHTS,
 )

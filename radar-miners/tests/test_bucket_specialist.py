@@ -6,7 +6,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "bucket_specialist"))
 
-from agents.bucket_specialist.run import (
+from agents.bucket_specialist.agent import (
     get_bucket_template_prompt, build_strategy_instructions,
     save_template, BUCKET_TEMPLATES,
 )

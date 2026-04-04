@@ -1,15 +1,9 @@
-#!/usr/bin/env python3
 """Pareto Hunter — exploit the 1.5x dominance bonus by targeting all objectives."""
 
-import json
 import sys
-import os
+import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-sys.path.insert(0, "/app")
-
-from core import llm, scratchpad, db_client, validation, prompt_builder, history
+from core import llm, db_client, validation, prompt_builder, history
 
 STRATEGY_PREAMBLE = """You are a multi-objective optimizer. You MUST beat the frontier on ALL \
 metrics simultaneously to earn the 1.5x dominance bonus. The objectives are:
@@ -148,9 +142,8 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
     return "\n\n".join(parts)
 
 
-def main():
-    challenge = json.load(sys.stdin)
-
+def design_architecture(challenge: dict, client) -> dict:
+    """Entry point called by the harness. Returns proposal dict."""
     flops_budget = challenge.get("flops_budget", {})
     flops_min = flops_budget.get("min", 0)
     flops_max = flops_budget.get("max", 0)
@@ -160,7 +153,9 @@ def main():
     print(f"[pareto] Bucket: {bucket}, FLOPs: {flops_min:,}-{flops_max:,}, "
           f"target: {target_flops:,}", file=sys.stderr)
 
-    state = scratchpad.load(challenge)
+    # Load scratchpad state (load_scratchpad is injected by harness)
+    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    state = history.load_state(scratch_dir) if scratch_dir else {}
     print(f"[pareto] Scratchpad loaded: {len(state)} keys", file=sys.stderr)
 
     frontier = challenge.get("feasible_frontier", [])
@@ -170,12 +165,13 @@ def main():
 
     # Query DB
     db_url = challenge.get("db_url", "")
-    recent = db_client.recent_experiments(db_url) if db_url else {}
-    failures = db_client.recent_failures(db_url) if db_url else {}
-    comp_stats = db_client.component_stats(db_url) if db_url else {}
-    dead = db_client.dead_ends(db_url) if db_url else {}
+    recent = db_client.recent_experiments(client, db_url) if db_url else {}
+    failures = db_client.recent_failures(client, db_url) if db_url else {}
+    comp_stats = db_client.component_stats(client, db_url) if db_url else {}
+    dead = db_client.dead_ends(client, db_url) if db_url else {}
 
     # Build prompts
+    llm_url = challenge.get("llm_url", "")
     strategy_instr = build_strategy_instructions(frontier, state, bucket)
     frontier_ctx = prompt_builder.format_frontier(frontier, max_entries=5)
     db_ctx = prompt_builder.format_db_context(recent, failures, comp_stats, dead)
@@ -231,7 +227,7 @@ def main():
             })
 
         try:
-            response = llm.chat(messages, temperature=0.7)
+            response = llm.chat(client, llm_url, messages, temperature=0.7)
             code = llm.extract_code(response)
 
             for line in response.split("\n"):
@@ -260,15 +256,12 @@ def main():
         state, name=name, code=code, motivation=motivation,
         bucket=bucket, flops=target_flops, strategy="pareto_hunter",
     )
-    scratchpad.save(challenge, state)
+    scratch_dir = scratch_dir or tempfile.mkdtemp()
+    history.save_state(scratch_dir, state)
+    save_scratchpad(challenge, scratch_dir)  # noqa: F821
 
-    proposal = {
+    return {
         "code": code,
         "name": name,
         "motivation": motivation,
     }
-    print(json.dumps(proposal))
-
-
-if __name__ == "__main__":
-    main()

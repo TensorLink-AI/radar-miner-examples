@@ -1,5 +1,7 @@
 """Persistent experiment history across rounds — stored in scratchpad state."""
 
+import json
+import os
 import time
 
 
@@ -52,6 +54,23 @@ def format_history(entries: list[dict], max_entries: int = 10) -> str:
             f"strategy={e.get('strategy', '?')}): {e.get('motivation', '')}"
         )
     return "\n".join(lines)
+
+
+def load_state(scratch_dir: str) -> dict:
+    """Load state dict from scratch_dir/state.json."""
+    path = os.path.join(scratch_dir, "state.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(scratch_dir: str, state: dict) -> None:
+    """Save state dict to scratch_dir/state.json."""
+    os.makedirs(scratch_dir, exist_ok=True)
+    path = os.path.join(scratch_dir, "state.json")
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 SIZE_BUCKETS = {
