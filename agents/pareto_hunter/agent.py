@@ -27,6 +27,7 @@ Design principles for multi-objective dominance:
 OBJECTIVE_WEIGHTS = {"crps": 1.0, "mase": 0.5, "exec_time": 0.2, "memory_mb": 0.1}
 
 
+
 def analyze_frontier_weaknesses(frontier: list[dict]) -> str:
     """Identify which frontier members are 'dominatable' on secondary objectives."""
     if not frontier:
@@ -144,9 +145,7 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
 
 def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness. Returns proposal dict."""
-    flops_budget = challenge.get("flops_budget", {})
-    flops_min = flops_budget.get("min", 0)
-    flops_max = flops_budget.get("max", 0)
+    flops_min, flops_max = history.extract_flops_budget(challenge)
     bucket = history.identify_bucket(flops_min, flops_max)
     target_flops = int(flops_max * 0.6)
 

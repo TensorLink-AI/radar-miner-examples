@@ -110,9 +110,7 @@ def update_playbook(state: dict, bucket: str, name: str, motivation: str) -> dic
 def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness. Returns proposal dict."""
     # Identify bucket
-    flops_budget = challenge.get("flops_budget", {})
-    flops_min = flops_budget.get("min", 0)
-    flops_max = flops_budget.get("max", 0)
+    flops_min, flops_max = history.extract_flops_budget(challenge)
     bucket = history.identify_bucket(flops_min, flops_max)
     target_flops = int(flops_max * 0.6)
 

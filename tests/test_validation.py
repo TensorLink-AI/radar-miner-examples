@@ -41,9 +41,15 @@ class TestValidateSyntax:
         assert not ok
         assert any("SyntaxError" in e for e in errors)
 
-    def test_empty_code(self):
+    def test_empty_code_rejected(self):
         ok, errors = validate("", {})
-        assert ok
+        assert not ok
+        assert any("Empty" in e for e in errors)
+
+    def test_whitespace_only_rejected(self):
+        ok, errors = validate("   \n\n  ", {})
+        assert not ok
+        assert any("Empty" in e for e in errors)
 
 
 class TestForbiddenImports:

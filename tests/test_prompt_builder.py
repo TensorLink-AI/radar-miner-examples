@@ -24,6 +24,16 @@ SAMPLE_CHALLENGE = {
 }
 
 
+FLAT_CHALLENGE = {
+    "task": {
+        "run_command": "python harness.py",
+        "domain_system_prompt": "Time-series forecaster.",
+    },
+    "min_flops_equivalent": 10_000_000,
+    "max_flops_equivalent": 50_000_000,
+}
+
+
 class TestBuildSystemPrompt:
     def test_includes_domain(self):
         prompt = build_system_prompt(SAMPLE_CHALLENGE)
@@ -76,6 +86,18 @@ class TestBuildUserPrompt:
     def test_output_format_instruction(self):
         prompt = build_user_prompt(SAMPLE_CHALLENGE)
         assert "```python" in prompt
+
+    def test_flat_challenge_flops(self):
+        prompt = build_user_prompt(FLAT_CHALLENGE)
+        assert "10,000,000" in prompt
+        assert "50,000,000" in prompt
+
+    def test_harness_explicit_shapes(self):
+        prompt = build_user_prompt(SAMPLE_CHALLENGE)
+        assert "(batch, 512, 370)" in prompt or "512" in prompt
+        assert "build_model" in prompt
+        assert "build_optimizer" in prompt
+        assert "REJECTED" in prompt or "CRITICAL" in prompt
 
 
 class TestFormatFrontier:

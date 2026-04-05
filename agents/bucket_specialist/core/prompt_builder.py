@@ -1,6 +1,7 @@
 """Task-aware prompt construction from challenge spec."""
 
 import json
+from core.history import extract_flops_budget
 
 
 def build_system_prompt(challenge: dict, strategy_preamble: str = "") -> str:
@@ -42,9 +43,8 @@ def build_user_prompt(challenge: dict, *,
     """Build the user prompt with budget, frontier, DB context, and history."""
     parts: list[str] = []
 
-    # FLOPs budget
-    flops_min = challenge.get("flops_budget", {}).get("min", 0)
-    flops_max = challenge.get("flops_budget", {}).get("max", 0)
+    # FLOPs budget — supports both nested and flat challenge formats
+    flops_min, flops_max = extract_flops_budget(challenge)
     target = int(flops_max * 0.6) if flops_max else 0
     parts.append(
         f"### FLOPs Budget\n"
@@ -60,11 +60,20 @@ def build_user_prompt(challenge: dict, *,
     if "harness.py" in run_cmd:
         parts.append(
             "### Required Interface (Harness Task)\n"
-            "You MUST define:\n"
-            "- `build_model(context_len, prediction_len, num_variates, quantiles) -> nn.Module`\n"
-            "- `build_optimizer(model) -> Optimizer`\n\n"
+            "Your code MUST define these two top-level functions (not inside a class):\n\n"
+            "1. `def build_model(context_len, prediction_len, num_variates, quantiles):`\n"
+            "   - Called as: build_model(512, 96, 370, [0.1, 0.5, 0.9])\n"
+            "   - Must return an nn.Module\n"
+            "   - Forward input shape:  (batch, 512, 370)\n"
+            "   - Forward output shape: (batch, 96, 370, 3)  "
+            "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n\n"
+            "2. `def build_optimizer(model):`\n"
+            "   - Takes the model returned by build_model()\n"
+            "   - Must return a torch.optim.Optimizer\n\n"
             "Optional hooks: training_config(), init_weights(), configure_amp(), "
-            "transform_batch(), on_step_end(), build_scheduler(), compute_loss()"
+            "transform_batch(), on_step_end(), build_scheduler(), compute_loss()\n\n"
+            "CRITICAL: If build_model or build_optimizer is missing, the code is "
+            "REJECTED before evaluation. Both MUST be present as top-level def statements."
         )
 
     if strategy_instructions:

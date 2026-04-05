@@ -26,6 +26,10 @@ def validate(code: str, challenge: dict) -> tuple[bool, list[str]]:
     """Validate generated code. Returns (ok, list_of_errors)."""
     errors: list[str] = []
 
+    # 0. Reject empty / whitespace-only code
+    if not code or not code.strip():
+        return False, ["Empty code — no source provided"]
+
     # 1. Syntax check
     try:
         tree = ast.parse(code)
