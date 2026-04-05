@@ -73,6 +73,25 @@ def save_state(scratch_dir: str, state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
+def extract_flops_budget(challenge: dict) -> tuple[int, int]:
+    """Extract FLOPs min/max from challenge, supporting both field formats.
+
+    The challenge may provide FLOPs bounds as either:
+      - challenge["flops_budget"]["min"] / challenge["flops_budget"]["max"]
+      - challenge["min_flops_equivalent"] / challenge["max_flops_equivalent"]
+    """
+    # Try nested format first
+    fb = challenge.get("flops_budget", {})
+    if isinstance(fb, dict) and (fb.get("min") or fb.get("max")):
+        return int(fb.get("min", 0)), int(fb.get("max", 0))
+    # Try flat format
+    fmin = challenge.get("min_flops_equivalent", 0)
+    fmax = challenge.get("max_flops_equivalent", 0)
+    if fmin or fmax:
+        return int(fmin), int(fmax)
+    return 0, 0
+
+
 SIZE_BUCKETS = {
     "tiny":         (100_000,     500_000),
     "small":        (500_000,   2_000_000),

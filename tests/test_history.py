@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "fron
 from core.history import (
     get_history, add_entry, get_bucket_history, format_history,
     identify_bucket, SIZE_BUCKETS, load_state, save_state,
+    extract_flops_budget,
 )
 
 
@@ -103,6 +104,35 @@ class TestIdentifyBucket:
 
     def test_all_buckets_defined(self):
         assert len(SIZE_BUCKETS) == 5
+
+
+class TestExtractFlopsBudget:
+    def test_nested_format(self):
+        challenge = {"flops_budget": {"min": 500_000, "max": 2_000_000}}
+        assert extract_flops_budget(challenge) == (500_000, 2_000_000)
+
+    def test_flat_format(self):
+        challenge = {"min_flops_equivalent": 100_000, "max_flops_equivalent": 500_000}
+        assert extract_flops_budget(challenge) == (100_000, 500_000)
+
+    def test_nested_preferred_over_flat(self):
+        challenge = {
+            "flops_budget": {"min": 1, "max": 2},
+            "min_flops_equivalent": 10,
+            "max_flops_equivalent": 20,
+        }
+        assert extract_flops_budget(challenge) == (1, 2)
+
+    def test_empty_challenge(self):
+        assert extract_flops_budget({}) == (0, 0)
+
+    def test_flat_format_with_empty_nested(self):
+        challenge = {
+            "flops_budget": {},
+            "min_flops_equivalent": 50_000_000,
+            "max_flops_equivalent": 125_000_000,
+        }
+        assert extract_flops_budget(challenge) == (50_000_000, 125_000_000)
 
 
 class TestLoadState:

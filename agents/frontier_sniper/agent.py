@@ -18,6 +18,40 @@ Key rules:
 - NEVER change the model architecture dramatically — only tune the training dynamics
 - Keep FLOPs within budget — do NOT add layers or increase hidden dims"""
 
+FALLBACK_CODE = '''\
+import torch
+import torch.nn as nn
+
+class FallbackLinearMixer(nn.Module):
+    def __init__(self, context_len, prediction_len, num_variates, quantiles):
+        super().__init__()
+        self.prediction_len = prediction_len
+        self.num_variates = num_variates
+        self.num_quantiles = len(quantiles)
+        d_model = 64
+        self.proj_in = nn.Linear(num_variates, d_model)
+        self.mixer = nn.Sequential(
+            nn.Linear(context_len, context_len),
+            nn.GELU(),
+            nn.Linear(context_len, 1),
+        )
+        self.proj_out = nn.Linear(d_model, prediction_len * num_variates * self.num_quantiles)
+
+    def forward(self, x):
+        B = x.shape[0]
+        h = self.proj_in(x)            # (B, context_len, d_model)
+        h = h.permute(0, 2, 1)         # (B, d_model, context_len)
+        h = self.mixer(h).squeeze(-1)   # (B, d_model)
+        out = self.proj_out(h)          # (B, prediction_len * num_variates * num_quantiles)
+        return out.view(B, self.prediction_len, self.num_variates, self.num_quantiles)
+
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return FallbackLinearMixer(context_len, prediction_len, num_variates, quantiles)
+
+def build_optimizer(model):
+    return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+'''
+
 BOOTSTRAP_INSTRUCTIONS = """No frontier exists yet. Submit a strong, proven baseline:
 - For time-series: a simple but well-tuned model (linear mixer, small transformer, or patch-based)
 - Use standard best practices: LayerNorm, residual connections, cosine LR schedule
@@ -110,9 +144,7 @@ def update_playbook(state: dict, bucket: str, name: str, motivation: str) -> dic
 def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness. Returns proposal dict."""
     # Identify bucket
-    flops_budget = challenge.get("flops_budget", {})
-    flops_min = flops_budget.get("min", 0)
-    flops_max = flops_budget.get("max", 0)
+    flops_min, flops_max = history.extract_flops_budget(challenge)
     bucket = history.identify_bucket(flops_min, flops_max)
     target_flops = int(flops_max * 0.6)
 
@@ -200,11 +232,14 @@ def design_architecture(challenge: dict, client) -> dict:
         except Exception as exc:
             print(f"[sniper] LLM error: {exc}", file=sys.stderr)
 
-    # Final validation
+    # Final validation — fall back to known-good code if LLM failed
     ok, errors = validation.validate(code, challenge)
     if not ok:
-        print(f"[sniper] WARNING: Final code has errors: {errors}",
+        print(f"[sniper] WARNING: Final code has errors: {errors}, using fallback",
               file=sys.stderr)
+        code = FALLBACK_CODE
+        name = f"sniper_fallback_{bucket}"
+        motivation = "Fallback: LLM failed to produce valid code"
 
     # Update scratchpad
     state = history.add_entry(
