@@ -26,45 +26,6 @@ Design principles for multi-objective dominance:
 
 OBJECTIVE_WEIGHTS = {"crps": 1.0, "mase": 0.5, "exec_time": 0.2, "memory_mb": 0.1}
 
-FALLBACK_CODE = '''\
-import torch
-import torch.nn as nn
-
-class FallbackLinearMixer(nn.Module):
-    def __init__(self, context_len, prediction_len, num_variates, quantiles):
-        super().__init__()
-        self.prediction_len = prediction_len
-        self.num_variates = num_variates
-        self.num_quantiles = len(quantiles)
-        d_model = 64
-        self.proj_in = nn.Linear(num_variates, d_model)
-        self.mixer = nn.Sequential(
-            nn.Linear(context_len, context_len),
-            nn.GELU(),
-            nn.Linear(context_len, 1),
-        )
-        self.proj_out = nn.Linear(d_model, prediction_len * num_variates * self.num_quantiles)
-
-    def forward(self, x):
-        B = x.shape[0]
-        h = self.proj_in(x)            # (B, context_len, d_model)
-        h = h.permute(0, 2, 1)         # (B, d_model, context_len)
-        h = self.mixer(h).squeeze(-1)   # (B, d_model)
-        out = self.proj_out(h)          # (B, prediction_len * num_variates * num_quantiles)
-        return out.view(B, self.prediction_len, self.num_variates, self.num_quantiles)
-
-def build_model(context_len, prediction_len, num_variates, quantiles):
-    return FallbackLinearMixer(context_len, prediction_len, num_variates, quantiles)
-
-def build_optimizer(model):
-    return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-
-def configure_amp():
-    return {"enabled": True, "dtype": "bfloat16"}
-
-def training_config():
-    return {"batch_size": 64, "grad_clip": 1.0}
-'''
 
 
 def analyze_frontier_weaknesses(frontier: list[dict]) -> str:
@@ -286,11 +247,8 @@ def design_architecture(challenge: dict, client) -> dict:
 
     ok, errors = validation.validate(code, challenge)
     if not ok:
-        print(f"[pareto] WARNING: Final code has errors: {errors}, using fallback",
+        print(f"[pareto] WARNING: Final code has errors: {errors}",
               file=sys.stderr)
-        code = FALLBACK_CODE
-        name = f"pareto_fallback_{bucket}"
-        motivation = "Fallback: LLM failed to produce valid code"
 
     # Update scratchpad
     state = history.add_entry(

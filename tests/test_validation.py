@@ -155,54 +155,6 @@ def configure_amp():
         assert ok
 
 
-class TestFallbackCodeValidation:
-    """Ensure the fallback code embedded in each agent passes validation."""
-
-    FALLBACK_CODE = '''\
-import torch
-import torch.nn as nn
-
-class FallbackLinearMixer(nn.Module):
-    def __init__(self, context_len, prediction_len, num_variates, quantiles):
-        super().__init__()
-        self.prediction_len = prediction_len
-        self.num_variates = num_variates
-        self.num_quantiles = len(quantiles)
-        d_model = 64
-        self.proj_in = nn.Linear(num_variates, d_model)
-        self.mixer = nn.Sequential(
-            nn.Linear(context_len, context_len),
-            nn.GELU(),
-            nn.Linear(context_len, 1),
-        )
-        self.proj_out = nn.Linear(d_model, prediction_len * num_variates * self.num_quantiles)
-
-    def forward(self, x):
-        B = x.shape[0]
-        h = self.proj_in(x)
-        h = h.permute(0, 2, 1)
-        h = self.mixer(h).squeeze(-1)
-        out = self.proj_out(h)
-        return out.view(B, self.prediction_len, self.num_variates, self.num_quantiles)
-
-def build_model(context_len, prediction_len, num_variates, quantiles):
-    return FallbackLinearMixer(context_len, prediction_len, num_variates, quantiles)
-
-def build_optimizer(model):
-    return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-'''
-
-    def test_fallback_passes_harness_validation(self):
-        ok, errors = validate(self.FALLBACK_CODE, HARNESS_CHALLENGE)
-        assert ok, f"Fallback code failed validation: {errors}"
-
-    def test_fallback_has_build_model(self):
-        assert "def build_model(" in self.FALLBACK_CODE
-
-    def test_fallback_has_build_optimizer(self):
-        assert "def build_optimizer(" in self.FALLBACK_CODE
-
-
 class TestMultipleErrors:
     def test_forbidden_import_and_missing_function(self):
         code = '''
