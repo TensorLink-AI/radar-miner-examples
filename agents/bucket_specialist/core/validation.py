@@ -16,6 +16,37 @@ HARNESS_OPTIONAL = [
 ]
 
 
+FALLBACK_CODE = '''\
+import torch
+import torch.nn as nn
+
+
+class _FallbackModel(nn.Module):
+    """Minimal linear model used when the LLM fails to produce valid code."""
+
+    def __init__(self, context_len, prediction_len, num_variates, n_quantiles):
+        super().__init__()
+        self.prediction_len = prediction_len
+        self.n_quantiles = n_quantiles
+        self.linear = nn.Linear(context_len, prediction_len * n_quantiles)
+
+    def forward(self, x):
+        # x: (batch, context_len, num_variates)
+        out = self.linear(x.transpose(1, 2))  # (batch, num_variates, pred*q)
+        b, v, _ = out.shape
+        out = out.view(b, v, self.prediction_len, self.n_quantiles)
+        return out.permute(0, 2, 1, 3)  # (batch, pred, variates, quantiles)
+
+
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return _FallbackModel(context_len, prediction_len, num_variates, len(quantiles))
+
+
+def build_optimizer(model):
+    return torch.optim.Adam(model.parameters(), lr=1e-3)
+'''
+
+
 def is_harness_task(challenge: dict) -> bool:
     """Always True — all tasks use the training harness."""
     return True

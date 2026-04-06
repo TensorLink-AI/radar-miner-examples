@@ -60,15 +60,21 @@ def extract_code(text: str) -> str:
     for marker in markers:
         if marker in text:
             start = text.index(marker) + len(marker)
-            end = text.index("```", start)
-            return text[start:end].strip()
+            closing = text.find("```", start)
+            if closing == -1:
+                # Truncated output — take everything after the marker
+                return text[start:].strip()
+            return text[start:closing].strip()
     # Fallback: if no fenced block, try to find bare triple-backtick block
     if "```" in text:
         start = text.index("```") + 3
-        # Skip optional language tag on same line
-        nl = text.index("\n", start)
+        nl = text.find("\n", start)
+        if nl == -1:
+            return text[start:].strip()
         start = nl + 1
-        end = text.index("```", start)
-        return text[start:end].strip()
+        closing = text.find("```", start)
+        if closing == -1:
+            return text[start:].strip()
+        return text[start:closing].strip()
     # Last resort: return the whole text
     return text.strip()
