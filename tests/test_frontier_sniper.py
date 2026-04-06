@@ -116,8 +116,25 @@ class TestIntegration:
 import torch
 import torch.nn as nn
 
+class _Model(nn.Module):
+    def __init__(self, context_len, prediction_len, num_variates, n_quantiles):
+        super().__init__()
+        self.prediction_len = prediction_len
+        self.n_quantiles = n_quantiles
+        # Small hidden dim to stay within the 500K-2M FLOPs bucket
+        self.proj = nn.Linear(context_len, 3)
+        self.out = nn.Linear(3, prediction_len * n_quantiles)
+
+    def forward(self, x):
+        # x: (batch, context_len, num_variates)
+        h = self.proj(x.transpose(1, 2))  # (batch, num_variates, 3)
+        out = self.out(h)                 # (batch, num_variates, pred*q)
+        b, v, _ = out.shape
+        out = out.view(b, v, self.prediction_len, self.n_quantiles)
+        return out.permute(0, 2, 1, 3)
+
 def build_model(context_len, prediction_len, num_variates, quantiles):
-    return nn.Linear(context_len * num_variates, prediction_len * len(quantiles))
+    return _Model(context_len, prediction_len, num_variates, len(quantiles))
 
 def build_optimizer(model):
     return torch.optim.Adam(model.parameters(), lr=1e-3)

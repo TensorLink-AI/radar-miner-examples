@@ -1,7 +1,10 @@
-"""AST-based code validation — syntax, required functions, forbidden imports."""
+"""AST-based code validation — syntax, required functions, forbidden imports, FLOPs bounds."""
 
 import ast
 import sys
+
+from core.flops_estimator import estimate_flops
+from core.history import extract_flops_budget
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
 
@@ -99,5 +102,26 @@ def validate(code: str, challenge: dict) -> tuple[bool, list[str]]:
                         errors.append(
                             f"{fname} missing parameter: {rp}"
                         )
+
+    # 4. FLOPs bounds check — only if no structural errors so far
+    if not errors:
+        flops_min, flops_max = extract_flops_budget(challenge)
+        if flops_min or flops_max:
+            gate_min = int(flops_min * 0.9)
+            gate_max = int(flops_max * 1.1)
+            estimated, err = estimate_flops(code, challenge)
+            if err:
+                errors.append(f"FLOPs estimation failed: {err}")
+            elif estimated is not None:
+                if estimated < gate_min:
+                    errors.append(
+                        f"Estimated FLOPs ({estimated:,}) below hard gate "
+                        f"minimum ({gate_min:,}). Increase model capacity."
+                    )
+                elif estimated > gate_max:
+                    errors.append(
+                        f"Estimated FLOPs ({estimated:,}) above hard gate "
+                        f"maximum ({gate_max:,}). Reduce model capacity."
+                    )
 
     return len(errors) == 0, errors
