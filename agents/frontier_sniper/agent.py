@@ -198,11 +198,15 @@ def design_architecture(challenge: dict, client) -> dict:
         except Exception as exc:
             print(f"[sniper] LLM error: {exc}", file=sys.stderr)
 
-    # Final validation
+    # Final validation — fall back to a minimal valid stub so the proposal
+    # passes pre_validate_code() instead of being silently rejected.
     ok, errors = validation.validate(code, challenge)
     if not ok:
-        print(f"[sniper] WARNING: Final code has errors: {errors}",
+        print(f"[sniper] Final code invalid ({errors}), using fallback stub",
               file=sys.stderr)
+        code = validation.FALLBACK_CODE
+        name = "fallback_linear"
+        motivation = "Fallback — LLM failed to produce valid code"
 
     # Update scratchpad
     state = history.add_entry(
