@@ -35,7 +35,7 @@ def analyze_frontier_weaknesses(frontier: list[dict]) -> str:
 
     lines = ["### Frontier Weakness Analysis\n"]
     for i, member in enumerate(frontier):
-        metrics = member.get("metrics", {})
+        metrics = member.get("objectives", {})
         crps = metrics.get("crps", None)
         mase = metrics.get("mase", None)
         exec_time = metrics.get("exec_time", None)
@@ -79,7 +79,7 @@ def get_dominatable_targets(frontier: list[dict]) -> list[dict]:
     """Find frontier members that are weak on secondary objectives."""
     targets = []
     for member in frontier:
-        m = member.get("metrics", {})
+        m = member.get("objectives", {})
         weakness_score = 0
         if isinstance(m.get("exec_time"), (int, float)) and m["exec_time"] > 100:
             weakness_score += 1

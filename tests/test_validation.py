@@ -24,15 +24,22 @@ class TestIsHarnessTask:
         assert is_harness_task(HARNESS_CHALLENGE) is True
 
     def test_standalone_task(self):
-        assert is_harness_task(STANDALONE_CHALLENGE) is False
+        assert is_harness_task(STANDALONE_CHALLENGE) is True
 
     def test_empty_challenge(self):
-        assert is_harness_task({}) is False
+        assert is_harness_task({}) is True
 
 
 class TestValidateSyntax:
     def test_valid_syntax(self):
-        ok, errors = validate("x = 1 + 2", {})
+        code = '''
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return None
+def build_optimizer(model):
+    return None
+x = 1 + 2
+'''
+        ok, errors = validate(code, STANDALONE_CHALLENGE)
         assert ok
         assert errors == []
 
@@ -69,7 +76,15 @@ class TestForbiddenImports:
         assert any("ftplib" in e for e in errors)
 
     def test_allowed_imports(self):
-        ok, errors = validate("import torch\nimport numpy as np", {})
+        code = '''
+import torch
+import numpy as np
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return None
+def build_optimizer(model):
+    return None
+'''
+        ok, errors = validate(code, STANDALONE_CHALLENGE)
         assert ok
 
     def test_subprocess_from_import(self):
@@ -123,10 +138,11 @@ def build_optimizer(model):
         assert not ok
         assert any("num_variates" in e for e in errors)
 
-    def test_standalone_no_harness_check(self):
+    def test_harness_check_always_applied(self):
         code = "x = 42"
         ok, errors = validate(code, STANDALONE_CHALLENGE)
-        assert ok
+        assert not ok
+        assert any("build_model" in e for e in errors)
 
     def test_optional_hooks_not_required(self):
         code = '''

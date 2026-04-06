@@ -11,6 +11,9 @@ def _get(client, base_url: str, path: str, params: dict | None = None) -> dict |
         url = f"{url}?{qs}"
     try:
         result = client.get_json(url)
+        if isinstance(result, dict) and "error" in result:
+            print(f"[db] GET {path} returned error: {result['error']}", file=sys.stderr)
+            return {}
         print(f"[db] GET {path} -> {type(result).__name__} "
               f"({len(result) if isinstance(result, (list, dict)) else '?'} items)",
               file=sys.stderr)
@@ -25,6 +28,9 @@ def _post(client, base_url: str, path: str, body: dict) -> dict | list:
     url = f"{base_url.rstrip('/')}{path}"
     try:
         result = client.post_json(url, body)
+        if isinstance(result, dict) and "error" in result:
+            print(f"[db] POST {path} returned error: {result['error']}", file=sys.stderr)
+            return {}
         print(f"[db] POST {path} -> {type(result).__name__} "
               f"({len(result) if isinstance(result, (list, dict)) else '?'} items)",
               file=sys.stderr)

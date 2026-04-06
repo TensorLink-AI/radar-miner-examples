@@ -40,14 +40,14 @@ def analyze_frontier(frontier: list[dict]) -> str:
 
     lines = ["Analyze these frontier members and find the weakest point to improve:\n"]
     for i, member in enumerate(frontier):
-        metrics = member.get("metrics", {})
+        metrics = member.get("objectives", {})
         code = member.get("code", "")
         lines.append(f"--- Frontier Member {i + 1} ---")
         lines.append(f"CRPS: {metrics.get('crps', '?')}")
         lines.append(f"MASE: {metrics.get('mase', '?')}")
         lines.append(f"Exec time: {metrics.get('exec_time', '?')}s")
         lines.append(f"Memory: {metrics.get('memory_mb', '?')}MB")
-        lines.append(f"FLOPs: {member.get('flops_equivalent_size', '?')}")
+        lines.append(f"FLOPs: {member.get('objectives', {}).get('flops_equivalent_size', '?')}")
         if code:
             if len(code) > 5000:
                 code = code[:5000] + "\n# ... truncated"
