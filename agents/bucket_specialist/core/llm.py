@@ -36,11 +36,16 @@ def chat(client, llm_url: str, messages: list[dict], *,
         "max_tokens": max_tokens,
     }
 
+    print(f"[llm] calling {llm_url}/v1/chat/completions model={model} "
+          f"msgs={len(messages)} temp={temperature}", file=sys.stderr)
+
     last_err: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
             resp = client.post_json(f"{llm_url}/v1/chat/completions", payload)
-            return resp["choices"][0]["message"]["content"]
+            content = resp["choices"][0]["message"]["content"]
+            print(f"[llm] response received: {len(content)} chars", file=sys.stderr)
+            return content
         except Exception as exc:
             last_err = exc
             print(f"[llm] attempt {attempt + 1}/{MAX_RETRIES} failed: {exc}",

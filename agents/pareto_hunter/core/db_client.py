@@ -10,7 +10,11 @@ def _get(client, base_url: str, path: str, params: dict | None = None) -> dict |
         qs = "&".join(f"{k}={v}" for k, v in params.items())
         url = f"{url}?{qs}"
     try:
-        return client.get_json(url)
+        result = client.get_json(url)
+        print(f"[db] GET {path} -> {type(result).__name__} "
+              f"({len(result) if isinstance(result, (list, dict)) else '?'} items)",
+              file=sys.stderr)
+        return result
     except Exception as exc:
         print(f"[db] GET {path} failed: {exc}", file=sys.stderr)
         return {}
@@ -20,7 +24,11 @@ def _post(client, base_url: str, path: str, body: dict) -> dict | list:
     """POST request with graceful fallback."""
     url = f"{base_url.rstrip('/')}{path}"
     try:
-        return client.post_json(url, body)
+        result = client.post_json(url, body)
+        print(f"[db] POST {path} -> {type(result).__name__} "
+              f"({len(result) if isinstance(result, (list, dict)) else '?'} items)",
+              file=sys.stderr)
+        return result
     except Exception as exc:
         print(f"[db] POST {path} failed: {exc}", file=sys.stderr)
         return {}
