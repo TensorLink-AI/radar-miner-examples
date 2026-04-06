@@ -103,22 +103,22 @@ class TestEstimateFlops:
         assert flops is None
         assert "build_model" in err
 
-    def test_broken_forward_returns_error(self):
+    def test_model_with_no_layers_returns_zero(self):
         code = '''\
 import torch.nn as nn
-class Bad(nn.Module):
+class Empty(nn.Module):
     def __init__(self):
         super().__init__()
     def forward(self, x):
-        raise RuntimeError("boom")
+        return x
 def build_model(context_len, prediction_len, num_variates, quantiles):
-    return Bad()
+    return Empty()
 def build_optimizer(model):
     return None
 '''
         flops, err = estimate_flops(code, NO_FLOPS_CHALLENGE)
-        assert flops is None
-        assert "Forward pass failed" in err
+        assert err == ""
+        assert flops == 0
 
     def test_larger_model_has_more_flops(self):
         small_flops, _ = estimate_flops(SMALL_MODEL_CODE, NO_FLOPS_CHALLENGE)
