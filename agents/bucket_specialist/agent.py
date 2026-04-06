@@ -174,7 +174,6 @@ def design_architecture(challenge: dict, client) -> dict:
     failures = db_client.recent_failures(client, db_url) if db_url else {}
     comp_stats = db_client.component_stats(client, db_url) if db_url else {}
     dead = db_client.dead_ends(client, db_url) if db_url else {}
-    families = db_client.family_summaries(client, db_url) if db_url else {}
 
     # Build prompts
     llm_url = challenge.get("llm_url", "")

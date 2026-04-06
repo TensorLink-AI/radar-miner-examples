@@ -17,11 +17,8 @@ HARNESS_OPTIONAL = [
 
 
 def is_harness_task(challenge: dict) -> bool:
-    """Check if the task uses the training harness (vs standalone)."""
-    run_cmd = challenge.get("task", {}).get("run_command", "")
-    if not run_cmd:
-        return True
-    return "harness.py" in run_cmd
+    """Always True — all tasks use the training harness."""
+    return True
 
 
 def validate(code: str, challenge: dict) -> tuple[bool, list[str]]:

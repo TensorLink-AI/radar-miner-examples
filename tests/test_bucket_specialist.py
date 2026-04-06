@@ -47,7 +47,7 @@ class TestGetBucketTemplatePrompt:
 
 class TestBuildStrategyInstructions:
     def test_with_frontier(self):
-        frontier = [{"metrics": {"crps": 0.4}}]
+        frontier = [{"objectives": {"crps": 0.4}}]
         result = build_strategy_instructions(
             frontier, {}, "small", 500_000, 2_000_000
         )

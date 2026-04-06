@@ -32,32 +32,32 @@ class TestAnalyzeFrontierWeaknesses:
         assert "No frontier" in result
 
     def test_slow_member(self):
-        frontier = [{"metrics": {"crps": 0.4, "exec_time": 250, "memory_mb": 1000}}]
+        frontier = [{"objectives": {"crps": 0.4, "exec_time": 250, "memory_mb": 1000}}]
         result = analyze_frontier_weaknesses(frontier)
         assert "SLOW" in result
 
     def test_memory_hog(self):
-        frontier = [{"metrics": {"crps": 0.4, "exec_time": 50, "memory_mb": 5000}}]
+        frontier = [{"objectives": {"crps": 0.4, "exec_time": 50, "memory_mb": 5000}}]
         result = analyze_frontier_weaknesses(frontier)
         assert "MEMORY HOG" in result or "HEAVY" in result
 
     def test_weak_mase(self):
-        frontier = [{"metrics": {"crps": 0.4, "mase": 0.8, "exec_time": 50, "memory_mb": 500}}]
+        frontier = [{"objectives": {"crps": 0.4, "mase": 0.8, "exec_time": 50, "memory_mb": 500}}]
         result = analyze_frontier_weaknesses(frontier)
         assert "MASE" in result
 
     def test_no_weaknesses(self):
-        frontier = [{"metrics": {"crps": 0.3, "mase": 0.3, "exec_time": 30, "memory_mb": 500}}]
+        frontier = [{"objectives": {"crps": 0.3, "mase": 0.3, "exec_time": 30, "memory_mb": 500}}]
         result = analyze_frontier_weaknesses(frontier)
         assert "No obvious weaknesses" in result
 
     def test_includes_code(self):
-        frontier = [{"metrics": {}, "code": "x = efficient_model()"}]
+        frontier = [{"objectives": {}, "code": "x = efficient_model()"}]
         result = analyze_frontier_weaknesses(frontier)
         assert "efficient_model" in result
 
     def test_truncates_long_code(self):
-        frontier = [{"metrics": {}, "code": "x = 1\n" * 3000}]
+        frontier = [{"objectives": {}, "code": "x = 1\n" * 3000}]
         result = analyze_frontier_weaknesses(frontier)
         assert "truncated" in result
 
@@ -68,24 +68,24 @@ class TestGetDominatableTargets:
 
     def test_identifies_slow(self):
         frontier = [
-            {"metrics": {"exec_time": 200, "memory_mb": 500, "mase": 0.3}},
-            {"metrics": {"exec_time": 30, "memory_mb": 500, "mase": 0.3}},
+            {"objectives": {"exec_time": 200, "memory_mb": 500, "mase": 0.3}},
+            {"objectives": {"exec_time": 30, "memory_mb": 500, "mase": 0.3}},
         ]
         targets = get_dominatable_targets(frontier)
         assert len(targets) == 1
-        assert targets[0]["metrics"]["exec_time"] == 200
+        assert targets[0]["objectives"]["exec_time"] == 200
 
     def test_identifies_memory_hog(self):
         frontier = [
-            {"metrics": {"exec_time": 50, "memory_mb": 5000, "mase": 0.3}},
+            {"objectives": {"exec_time": 50, "memory_mb": 5000, "mase": 0.3}},
         ]
         targets = get_dominatable_targets(frontier)
         assert len(targets) == 1
 
     def test_sorted_by_weakness(self):
         frontier = [
-            {"metrics": {"exec_time": 200, "memory_mb": 5000, "mase": 0.8}},  # 3 weaknesses
-            {"metrics": {"exec_time": 200, "memory_mb": 500, "mase": 0.3}},   # 1 weakness
+            {"objectives": {"exec_time": 200, "memory_mb": 5000, "mase": 0.8}},  # 3 weaknesses
+            {"objectives": {"exec_time": 200, "memory_mb": 500, "mase": 0.3}},   # 1 weakness
         ]
         targets = get_dominatable_targets(frontier)
         assert len(targets) == 2
@@ -93,14 +93,14 @@ class TestGetDominatableTargets:
 
     def test_no_weaknesses(self):
         frontier = [
-            {"metrics": {"exec_time": 30, "memory_mb": 500, "mase": 0.3}},
+            {"objectives": {"exec_time": 30, "memory_mb": 500, "mase": 0.3}},
         ]
         assert get_dominatable_targets(frontier) == []
 
 
 class TestBuildStrategyInstructions:
     def test_with_dominatable_frontier(self):
-        frontier = [{"metrics": {"crps": 0.4, "exec_time": 300, "memory_mb": 5000}}]
+        frontier = [{"objectives": {"crps": 0.4, "exec_time": 300, "memory_mb": 5000}}]
         result = build_strategy_instructions(frontier, {}, "small")
         assert "DOMINATABLE" in result
 

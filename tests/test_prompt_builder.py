@@ -107,8 +107,7 @@ class TestFormatFrontier:
 
     def test_single_member(self):
         frontier = [{
-            "metrics": {"crps": 0.42, "mase": 0.55, "exec_time": 200, "memory_mb": 4000},
-            "flops_equivalent_size": 1_000_000,
+            "objectives": {"crps": 0.42, "mase": 0.55, "exec_time": 200, "memory_mb": 4000, "flops_equivalent_size": 1_000_000},
             "code": "x = 1",
         }]
         result = format_frontier(frontier)
@@ -117,14 +116,14 @@ class TestFormatFrontier:
 
     def test_truncates_long_code(self):
         frontier = [{
-            "metrics": {"crps": 0.5},
+            "objectives": {"crps": 0.5},
             "code": "x = 1\n" * 2000,
         }]
         result = format_frontier(frontier)
         assert "truncated" in result
 
     def test_max_entries(self):
-        frontier = [{"metrics": {"crps": i}, "code": ""} for i in range(10)]
+        frontier = [{"objectives": {"crps": i}, "code": ""} for i in range(10)]
         result = format_frontier(frontier, max_entries=2)
         assert "Member 1" in result
         assert "Member 2" in result
@@ -137,12 +136,12 @@ class TestFormatDbContext:
         assert "No DB context" in result
 
     def test_recent_experiments_list(self):
-        recent = [{"name": "exp1", "metrics": {"crps": 0.4}, "flops": 1000}]
+        recent = [{"name": "exp1", "objectives": {"crps": 0.4}, "flops": 1000}]
         result = format_db_context(recent, {}, {}, {})
         assert "exp1" in result
 
     def test_recent_experiments_dict(self):
-        recent = {"experiments": [{"name": "exp1", "metrics": {"crps": 0.4}, "flops": 1000}]}
+        recent = {"experiments": [{"name": "exp1", "objectives": {"crps": 0.4}, "flops": 1000}]}
         result = format_db_context(recent, {}, {}, {})
         assert "exp1" in result
 

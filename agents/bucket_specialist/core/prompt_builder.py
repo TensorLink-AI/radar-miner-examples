@@ -54,11 +54,8 @@ def build_user_prompt(challenge: dict, *,
         f"- Hard gate: [{int(flops_min * 0.9):,}, {int(flops_max * 1.1):,}]"
     )
 
-    # Task info
-    task = challenge.get("task", {})
-    run_cmd = task.get("run_command", "")
-    if "harness.py" in run_cmd:
-        parts.append(
+    # Harness interface — always included (all tasks use the training harness)
+    parts.append(
             "### Required Interface (Harness Task)\n"
             "Your code MUST define these two top-level functions (not inside a class):\n\n"
             "1. `def build_model(context_len, prediction_len, num_variates, quantiles):`\n"
@@ -104,14 +101,14 @@ def format_frontier(frontier: list[dict], max_entries: int = 3) -> str:
 
     lines: list[str] = []
     for i, member in enumerate(frontier[:max_entries]):
-        metrics = member.get("metrics", {})
+        metrics = member.get("objectives", {})
         lines.append(
             f"**Member {i + 1}**: "
             f"crps={metrics.get('crps', '?')}, "
             f"mase={metrics.get('mase', '?')}, "
             f"exec_time={metrics.get('exec_time', '?')}s, "
             f"memory={metrics.get('memory_mb', '?')}MB, "
-            f"flops={member.get('flops_equivalent_size', '?')}"
+            f"flops={member.get('objectives', {}).get('flops_equivalent_size', '?')}"
         )
         code = member.get("code", "")
         if code:

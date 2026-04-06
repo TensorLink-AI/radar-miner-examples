@@ -54,27 +54,24 @@ def build_user_prompt(challenge: dict, *,
         f"- Hard gate: [{int(flops_min * 0.9):,}, {int(flops_max * 1.1):,}]"
     )
 
-    # Task info
-    task = challenge.get("task", {})
-    run_cmd = task.get("run_command", "")
-    if "harness.py" in run_cmd:
-        parts.append(
-            "### Required Interface (Harness Task)\n"
-            "Your code MUST define these two top-level functions (not inside a class):\n\n"
-            "1. `def build_model(context_len, prediction_len, num_variates, quantiles):`\n"
-            "   - Called as: build_model(512, 96, 370, [0.1, 0.5, 0.9])\n"
-            "   - Must return an nn.Module\n"
-            "   - Forward input shape:  (batch, 512, 370)\n"
-            "   - Forward output shape: (batch, 96, 370, 3)  "
-            "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n\n"
-            "2. `def build_optimizer(model):`\n"
-            "   - Takes the model returned by build_model()\n"
-            "   - Must return a torch.optim.Optimizer\n\n"
-            "Optional hooks: training_config(), init_weights(), configure_amp(), "
-            "transform_batch(), on_step_end(), build_scheduler(), compute_loss()\n\n"
-            "CRITICAL: If build_model or build_optimizer is missing, the code is "
-            "REJECTED before evaluation. Both MUST be present as top-level def statements."
-        )
+    # Harness interface — always included (all tasks use the training harness)
+    parts.append(
+        "### Required Interface (Harness Task)\n"
+        "Your code MUST define these two top-level functions (not inside a class):\n\n"
+        "1. `def build_model(context_len, prediction_len, num_variates, quantiles):`\n"
+        "   - Called as: build_model(512, 96, 370, [0.1, 0.5, 0.9])\n"
+        "   - Must return an nn.Module\n"
+        "   - Forward input shape:  (batch, 512, 370)\n"
+        "   - Forward output shape: (batch, 96, 370, 3)  "
+        "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n\n"
+        "2. `def build_optimizer(model):`\n"
+        "   - Takes the model returned by build_model()\n"
+        "   - Must return a torch.optim.Optimizer\n\n"
+        "Optional hooks: training_config(), init_weights(), configure_amp(), "
+        "transform_batch(), on_step_end(), build_scheduler(), compute_loss()\n\n"
+        "CRITICAL: If build_model or build_optimizer is missing, the code is "
+        "REJECTED before evaluation. Both MUST be present as top-level def statements."
+    )
 
     if strategy_instructions:
         parts.append(f"### Strategy\n{strategy_instructions}")
@@ -104,14 +101,14 @@ def format_frontier(frontier: list[dict], max_entries: int = 3) -> str:
 
     lines: list[str] = []
     for i, member in enumerate(frontier[:max_entries]):
-        metrics = member.get("metrics", {})
+        metrics = member.get("objectives", {})
         lines.append(
             f"**Member {i + 1}**: "
             f"crps={metrics.get('crps', '?')}, "
             f"mase={metrics.get('mase', '?')}, "
             f"exec_time={metrics.get('exec_time', '?')}s, "
             f"memory={metrics.get('memory_mb', '?')}MB, "
-            f"flops={member.get('flops_equivalent_size', '?')}"
+            f"flops={member.get('objectives', {}).get('flops_equivalent_size', '?')}"
         )
         code = member.get("code", "")
         if code:

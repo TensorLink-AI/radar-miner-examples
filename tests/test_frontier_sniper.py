@@ -45,8 +45,7 @@ class TestAnalyzeFrontier:
 
     def test_includes_metrics(self):
         frontier = [{
-            "metrics": {"crps": 0.42, "mase": 0.55, "exec_time": 200, "memory_mb": 4000},
-            "flops_equivalent_size": 1_000_000,
+            "objectives": {"crps": 0.42, "mase": 0.55, "exec_time": 200, "memory_mb": 4000, "flops_equivalent_size": 1_000_000},
             "code": "model = Linear(10, 10)",
         }]
         result = analyze_frontier(frontier)
@@ -55,14 +54,14 @@ class TestAnalyzeFrontier:
         assert "surgical" in result.lower() or "improvement" in result.lower()
 
     def test_truncates_long_code(self):
-        frontier = [{"metrics": {}, "code": "x = 1\n" * 3000}]
+        frontier = [{"objectives": {}, "code": "x = 1\n" * 3000}]
         result = analyze_frontier(frontier)
         assert "truncated" in result
 
 
 class TestBuildStrategyInstructions:
     def test_with_frontier(self):
-        frontier = [{"metrics": {"crps": 0.4}, "code": "x=1"}]
+        frontier = [{"objectives": {"crps": 0.4}, "code": "x=1"}]
         result = build_strategy_instructions(frontier, {}, "small")
         assert "sniping" in result.lower()
 
