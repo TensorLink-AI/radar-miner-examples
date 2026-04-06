@@ -50,19 +50,22 @@ class TestExtractCode:
 class TestChat:
     def test_calls_client_post_json(self):
         client = MagicMock()
-        client.post_json.return_value = {"content": "Hello!", "remaining_queries": 10}
+        client.post_json.return_value = {
+            "choices": [{"message": {"content": "Hello!"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+        }
         result = chat(client, "http://llm:8080", [{"role": "user", "content": "hi"}])
         assert result == "Hello!"
         client.post_json.assert_called_once()
         call_url, call_payload = client.post_json.call_args[0]
-        assert call_url == "http://llm:8080/chat"
+        assert call_url == "http://llm:8080/v1/chat/completions"
         assert call_payload["messages"] == [{"role": "user", "content": "hi"}]
 
     def test_retries_on_failure(self):
         client = MagicMock()
         client.post_json.side_effect = [
             Exception("timeout"),
-            {"content": "recovered", "remaining_queries": 5},
+            {"choices": [{"message": {"content": "recovered"}}]},
         ]
         result = chat(client, "http://llm:8080", [{"role": "user", "content": "hi"}])
         assert result == "recovered"
@@ -86,9 +89,18 @@ class TestGetModels:
         client.get_json.return_value = ["model-a", "model-b"]
         result = get_models(client, "http://llm:8080")
         assert result == ["model-a", "model-b"]
-        client.get_json.assert_called_once_with("http://llm:8080/models")
+        client.get_json.assert_called_once_with("http://llm:8080/v1/models")
 
-    def test_returns_models_from_dict(self):
+    def test_returns_models_from_openai_format(self):
+        client = MagicMock()
+        client.get_json.return_value = {
+            "object": "list",
+            "data": [{"id": "model-a", "object": "model"}, {"id": "model-b", "object": "model"}],
+        }
+        result = get_models(client, "http://llm:8080")
+        assert result == ["model-a", "model-b"]
+
+    def test_returns_models_from_legacy_dict(self):
         client = MagicMock()
         client.get_json.return_value = {"models": ["model-a"]}
         result = get_models(client, "http://llm:8080")

@@ -10,9 +10,12 @@ MAX_RETRIES = 3
 def get_models(client, llm_url: str) -> list[str]:
     """List available models from the LLM endpoint."""
     try:
-        resp = client.get_json(f"{llm_url}/models")
+        resp = client.get_json(f"{llm_url}/v1/models")
         if isinstance(resp, list):
             return resp
+        # OpenAI format: {"object": "list", "data": [{"id": "model-name", ...}]}
+        if "data" in resp:
+            return [m["id"] for m in resp["data"]]
         return resp.get("models", [])
     except Exception as exc:
         print(f"[llm] failed to list models: {exc}", file=sys.stderr)
@@ -36,8 +39,8 @@ def chat(client, llm_url: str, messages: list[dict], *,
     last_err: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            resp = client.post_json(f"{llm_url}/chat", payload)
-            return resp["content"]
+            resp = client.post_json(f"{llm_url}/v1/chat/completions", payload)
+            return resp["choices"][0]["message"]["content"]
         except Exception as exc:
             last_err = exc
             print(f"[llm] attempt {attempt + 1}/{MAX_RETRIES} failed: {exc}",
