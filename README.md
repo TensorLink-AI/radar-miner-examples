@@ -83,6 +83,68 @@ def design_architecture(challenge: dict, client: GatedClient) -> dict:
 | `challenge["llm_url"]` | `client.post_json(f"{url}/v1/chat/completions", {"model": "...", "messages": [...], "temperature": 0.7, "max_tokens": 4096})` |
 | `challenge["llm_url"]/v1/models` | `client.get_json(...)` to list allowed models |
 
+## How the Agent Response Reaches the Validator
+
+Understanding the end-to-end flow prevents the most common rejection: a missing `build_model()` definition.
+
+### 1. Validator launches the agent pod
+
+The validator calls `launch_agent_pod()` (in `validator/collection.py`) to spin up a sandboxed container with the miner's agent directory mounted at `/workspace/agent/`. It then calls `run_agent_on_pod()`, passing the challenge as JSON.
+
+### 2. Harness runs inside the pod
+
+The official harness (`runner/agent/harness.py`) inside the container:
+
+1. Imports the miner's `agent.py` module.
+2. Calls `agent_mod.design_architecture(challenge, client)`.
+3. The agent function returns a dict: `{"code": str, "name": str, "motivation": str}`.
+4. The harness prints the result as JSON to **stdout** (`print(json.dumps(proposal))`).
+
+### 3. Validator captures stdout
+
+`run_agent_on_pod()` reads the JSON from stdout. If the result contains a `"code"` key it wraps it in a `Proposal(code=..., name=..., motivation=...)`, uploads the code to R2, and returns the proposal.
+
+### 4. Pre-validation checks
+
+Before any training or scoring, the validator runs `pre_validate_code(proposal.code)` (`validator/neuron.py`). This step AST-parses the `code` string and checks for:
+
+- A top-level `def build_model(context_len, prediction_len, num_variates, quantiles)` function definition.
+- A top-level `def build_optimizer(model)` function definition.
+
+If either is missing, the proposal is **rejected immediately** — it never reaches evaluation.
+
+### Common rejection causes
+
+| Cause | Symptom |
+|-------|---------|
+| LLM names the function differently (e.g. `create_model`) | `Missing required function: build_model` |
+| Function is inside a class | Not detected as a top-level `def` by the AST walk |
+| LLM output truncated (often by 429 rate-limit errors) | Code string is incomplete or empty |
+| Code wrapped in explanation text instead of a code block | `extract_code()` returns prose, not Python |
+
+### How the agents guard against this
+
+Each agent in this repo runs a **validation loop** (up to 3 attempts):
+
+```python
+for attempt in range(3):
+    response = llm.chat(client, llm_url, messages)
+    code = llm.extract_code(response)          # extract ```python ... ``` block
+    ok, errors = validation.validate(code, challenge)  # AST check
+    if ok:
+        break
+    # feed errors back to LLM for the next attempt
+```
+
+`validation.validate()` (`core/validation.py`) enforces the same rules the validator does:
+
+1. Reject empty code.
+2. `ast.parse()` syntax check.
+3. No forbidden imports (`subprocess`, `socket`, `ftplib`).
+4. Both `build_model` and `build_optimizer` exist as top-level functions with the correct parameter names.
+
+This local pre-flight catches most problems before the proposal ever leaves the pod.
+
 ## Testing
 
 ```bash
