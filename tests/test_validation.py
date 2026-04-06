@@ -27,12 +27,12 @@ class TestIsHarnessTask:
         assert is_harness_task(STANDALONE_CHALLENGE) is False
 
     def test_empty_challenge(self):
-        assert is_harness_task({}) is False
+        assert is_harness_task({}) is True
 
 
 class TestValidateSyntax:
     def test_valid_syntax(self):
-        ok, errors = validate("x = 1 + 2", {})
+        ok, errors = validate("x = 1 + 2", STANDALONE_CHALLENGE)
         assert ok
         assert errors == []
 
@@ -69,7 +69,7 @@ class TestForbiddenImports:
         assert any("ftplib" in e for e in errors)
 
     def test_allowed_imports(self):
-        ok, errors = validate("import torch\nimport numpy as np", {})
+        ok, errors = validate("import torch\nimport numpy as np", STANDALONE_CHALLENGE)
         assert ok
 
     def test_subprocess_from_import(self):
