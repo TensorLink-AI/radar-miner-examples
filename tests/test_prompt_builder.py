@@ -55,9 +55,16 @@ class TestBuildSystemPrompt:
         prompt = build_system_prompt(SAMPLE_CHALLENGE, "SNIPER MODE")
         assert "SNIPER MODE" in prompt
 
+    def test_includes_absolute_requirements(self):
+        prompt = build_system_prompt(SAMPLE_CHALLENGE)
+        assert "build_model" in prompt
+        assert "build_optimizer" in prompt
+        assert "REJECTED" in prompt
+
     def test_empty_challenge(self):
         prompt = build_system_prompt({})
         assert isinstance(prompt, str)
+        assert "build_model" in prompt
 
 
 class TestBuildUserPrompt:
@@ -91,6 +98,12 @@ class TestBuildUserPrompt:
         prompt = build_user_prompt(FLAT_CHALLENGE)
         assert "10,000,000" in prompt
         assert "50,000,000" in prompt
+
+    def test_includes_skeleton_example(self):
+        prompt = build_user_prompt(SAMPLE_CHALLENGE)
+        assert "def build_model(context_len, prediction_len, num_variates, quantiles):" in prompt
+        assert "def build_optimizer(model):" in prompt
+        assert "class MyModel(nn.Module):" in prompt
 
     def test_harness_explicit_shapes(self):
         prompt = build_user_prompt(SAMPLE_CHALLENGE)

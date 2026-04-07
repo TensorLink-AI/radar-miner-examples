@@ -32,6 +32,15 @@ def build_system_prompt(challenge: dict, strategy_preamble: str = "") -> str:
     if example_hypotheses:
         parts.append("### Example Hypotheses\n" + "\n".join(f"- {h}" for h in example_hypotheses))
 
+    # Always reinforce the harness contract in the system prompt
+    parts.append(
+        "### Absolute Requirements\n"
+        "Every response MUST be a single ```python code block containing "
+        "top-level `def build_model(context_len, prediction_len, num_variates, quantiles)` "
+        "and `def build_optimizer(model)` functions. Code missing either function is "
+        "REJECTED automatically."
+    )
+
     return "\n\n".join(parts)
 
 
@@ -78,7 +87,24 @@ def build_user_prompt(challenge: dict, *,
         "Optional hooks: training_config(), init_weights(), configure_amp(), "
         "transform_batch(), on_step_end(), build_scheduler(), compute_loss()\n\n"
         "CRITICAL: If build_model or build_optimizer is missing, the code is "
-        "REJECTED before evaluation. Both MUST be present as top-level def statements."
+        "REJECTED before evaluation. Both MUST be present as top-level def statements.\n\n"
+        "Minimal skeleton (your code must follow this structure):\n"
+        "```python\n"
+        "import torch\n"
+        "import torch.nn as nn\n\n"
+        "class MyModel(nn.Module):\n"
+        "    def __init__(self, context_len, prediction_len, num_variates, quantiles):\n"
+        "        super().__init__()\n"
+        "        # ... your architecture ...\n"
+        "    def forward(self, x):\n"
+        "        # x: (batch, context_len, num_variates)\n"
+        "        # return: (batch, prediction_len, num_variates, len(quantiles))\n"
+        "        ...\n\n"
+        "def build_model(context_len, prediction_len, num_variates, quantiles):\n"
+        "    return MyModel(context_len, prediction_len, num_variates, quantiles)\n\n"
+        "def build_optimizer(model):\n"
+        "    return torch.optim.Adam(model.parameters(), lr=1e-3)\n"
+        "```"
     )
 
     if strategy_instructions:
