@@ -76,5 +76,5 @@ def extract_code(text: str) -> str:
         if closing == -1:
             return text[start:].strip()
         return text[start:closing].strip()
-    # Last resort: return the whole text
-    return text.strip()
+    # No code block found — return empty so validation rejects cleanly
+    return ""
