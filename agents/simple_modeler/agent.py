@@ -133,6 +133,7 @@ def design_architecture(challenge: dict, client) -> dict:
 
     # LLM call with validation loop (up to 3 attempts)
     code = ""
+    last_errors: list[str] = []
     name = f"simple_modeler_{bucket}"
     motivation = f"Well-designed model for {bucket} bucket"
 
@@ -144,18 +145,29 @@ def design_architecture(challenge: dict, client) -> dict:
             {"role": "user", "content": user_prompt},
         ]
 
-        # On retry, feed back validation errors
-        if attempt > 0 and code:
-            messages.append({"role": "assistant", "content": f"```python\n{code}\n```"})
-            ok, errors = validation.validate(code, challenge)
-            messages.append({
-                "role": "user",
-                "content": (
-                    "The code has validation errors:\n"
-                    + "\n".join(f"- {e}" for e in errors)
-                    + "\n\nFix these errors and return the corrected code."
-                ),
-            })
+        # On retry, feed back correction context
+        if attempt > 0:
+            if code:
+                messages.append({"role": "assistant", "content": f"```python\n{code}\n```"})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "The code has validation errors:\n"
+                        + "\n".join(f"- {e}" for e in last_errors)
+                        + "\n\nFix these errors and return the corrected code."
+                    ),
+                })
+            else:
+                # Empty code — LLM didn't return a fenced code block
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous response did not contain a fenced Python code block. "
+                        "You MUST respond with a single ```python ... ``` block containing "
+                        "top-level `def build_model(context_len, prediction_len, num_variates, quantiles)` "
+                        "and `def build_optimizer(model)` functions. Try again."
+                    ),
+                })
 
         try:
             response = llm.chat(client, llm_url, messages, temperature=0.7)
@@ -168,6 +180,7 @@ def design_architecture(challenge: dict, client) -> dict:
                     motivation = line.split(":", 1)[1].strip()
 
             ok, errors = validation.validate(code, challenge)
+            last_errors = errors
             if ok:
                 print(f"[simple] Validation passed on attempt {attempt + 1}",
                       file=sys.stderr)
