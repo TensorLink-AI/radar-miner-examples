@@ -76,5 +76,8 @@ def extract_code(text: str) -> str:
         if closing == -1:
             return text[start:].strip()
         return text[start:closing].strip()
+    # Fallback: if no fenced block but text looks like Python code, use it directly
+    if "def build_model" in text and "import" in text:
+        return text.strip()
     # No code block found — return empty so validation rejects cleanly
     return ""

@@ -199,6 +199,7 @@ def design_architecture(challenge: dict, client) -> dict:
     code = ""
     name = f"bucket_specialist_{bucket}"
     motivation = f"Bucket-specialized architecture for {bucket}"
+    last_errors: list[str] = []
 
     for attempt in range(3):
         print(f"[specialist] LLM attempt {attempt + 1}/3", file=sys.stderr)
@@ -208,17 +209,29 @@ def design_architecture(challenge: dict, client) -> dict:
             {"role": "user", "content": user_prompt},
         ]
 
-        if attempt > 0 and code:
-            messages.append({"role": "assistant", "content": f"```python\n{code}\n```"})
-            ok, errors = validation.validate(code, challenge)
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Validation errors:\n"
-                    + "\n".join(f"- {e}" for e in errors)
-                    + "\n\nFix these errors. Return corrected code."
-                ),
-            })
+        if attempt > 0:
+            if code:
+                messages.append({"role": "assistant", "content": f"```python\n{code}\n```"})
+                ok, errors = validation.validate(code, challenge)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Validation errors:\n"
+                        + "\n".join(f"- {e}" for e in errors)
+                        + "\n\nFix these errors. Return corrected code."
+                    ),
+                })
+            else:
+                error_detail = "; ".join(last_errors) if last_errors else "no code block found"
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Previous attempt failed: {error_detail}. "
+                        "You MUST respond with a single ```python code block containing "
+                        "def build_model(context_len, prediction_len, num_variates, quantiles) "
+                        "and def build_optimizer(model). No text outside the code block."
+                    ),
+                })
 
         try:
             response = llm.chat(client, llm_url, messages, temperature=0.7)
@@ -236,8 +249,10 @@ def design_architecture(challenge: dict, client) -> dict:
                       file=sys.stderr)
                 break
             else:
+                last_errors = errors
                 print(f"[specialist] Validation errors: {errors}", file=sys.stderr)
         except Exception as exc:
+            last_errors = [str(exc)]
             print(f"[specialist] LLM error: {exc}", file=sys.stderr)
 
     ok, errors = validation.validate(code, challenge)
