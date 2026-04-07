@@ -1,5 +1,6 @@
 """LLM client — uses GatedClient to call the validator-provided LLM endpoint."""
 
+import json
 import sys
 
 
@@ -52,6 +53,123 @@ def chat(client, llm_url: str, messages: list[dict], *,
                   file=sys.stderr)
 
     raise RuntimeError(f"LLM call failed after {MAX_RETRIES} attempts: {last_err}")
+
+
+def chat_with_tools(
+    client,
+    llm_url: str,
+    messages: list[dict],
+    tools: list[dict],
+    tool_handlers: dict,
+    *,
+    temperature: float = 0.7,
+    max_tokens: int = 4096,
+    max_rounds: int = 8,
+    model: str = DEFAULT_MODEL,
+) -> str:
+    """Multi-round tool-calling loop using the OpenAI chat completions format.
+
+    Sends ``tools`` definitions alongside messages. When the assistant responds
+    with ``tool_calls``, each call is dispatched to the matching handler in
+    *tool_handlers*, and the results are appended as ``role: tool`` messages
+    before the next request.  The loop continues until the model returns a plain
+    text response (``finish_reason == "stop"``) or *max_rounds* is exhausted.
+    """
+    if not llm_url:
+        raise RuntimeError("No llm_url provided in challenge")
+
+    url = f"{llm_url}/v1/chat/completions"
+
+    for round_idx in range(max_rounds):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        # On the final round, omit tools to force a text response.
+        if round_idx < max_rounds - 1 and tools:
+            payload["tools"] = tools
+
+        print(
+            f"[llm] tool-call round {round_idx + 1}/{max_rounds} "
+            f"msgs={len(messages)} temp={temperature}",
+            file=sys.stderr,
+        )
+
+        # Retry loop for transient HTTP failures within a single round.
+        last_err: Exception | None = None
+        resp = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = client.post_json(url, payload)
+                break
+            except Exception as exc:
+                last_err = exc
+                print(
+                    f"[llm] round {round_idx + 1} attempt {attempt + 1}/{MAX_RETRIES} "
+                    f"failed: {exc}",
+                    file=sys.stderr,
+                )
+
+        if resp is None:
+            raise RuntimeError(
+                f"LLM call failed after {MAX_RETRIES} attempts: {last_err}"
+            )
+
+        choice = resp["choices"][0]
+        assistant_msg = choice["message"]
+        finish_reason = choice.get("finish_reason", "")
+
+        tool_calls = assistant_msg.get("tool_calls")
+
+        # --- No tool calls → return text content ---
+        if not tool_calls or finish_reason == "stop":
+            content = assistant_msg.get("content") or ""
+            print(f"[llm] final response: {len(content)} chars", file=sys.stderr)
+            return content
+
+        # --- Process tool calls ---
+        # Append the full assistant message (with tool_calls) to history.
+        messages.append(assistant_msg)
+
+        for tc in tool_calls:
+            func = tc["function"]
+            fn_name = func["name"]
+            call_id = tc["id"]
+
+            # Parse arguments
+            try:
+                kwargs = json.loads(func.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                kwargs = {}
+
+            # Dispatch to handler
+            handler = tool_handlers.get(fn_name)
+            if handler is None:
+                result_str = f"Tool error: unknown tool '{fn_name}'"
+                print(f"[llm] unknown tool: {fn_name}", file=sys.stderr)
+            else:
+                try:
+                    result = handler(**kwargs)
+                    result_str = str(result)
+                except Exception as exc:
+                    result_str = f"Tool error: {exc}"
+                    print(
+                        f"[llm] tool '{fn_name}' raised: {exc}", file=sys.stderr
+                    )
+
+            print(
+                f"[llm] tool {fn_name} → {len(result_str)} chars",
+                file=sys.stderr,
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": call_id, "content": result_str}
+            )
+
+    # All rounds exhausted — return whatever content the last response had.
+    return assistant_msg.get("content") or ""
 
 
 def extract_code(text: str) -> str:
