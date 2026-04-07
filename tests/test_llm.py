@@ -24,9 +24,9 @@ class TestExtractCode:
         text = "```\nz = 0\n```"
         assert extract_code(text) == "z = 0"
 
-    def test_no_fence(self):
+    def test_no_fence_returns_empty(self):
         text = "x = 42"
-        assert extract_code(text) == "x = 42"
+        assert extract_code(text) == ""
 
     def test_multiline_code(self):
         text = "```python\ndef foo():\n    return 1\n```"
