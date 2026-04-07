@@ -54,16 +54,24 @@ def build_user_prompt(challenge: dict, *,
         f"- Hard gate: [{int(flops_min * 0.9):,}, {int(flops_max * 1.1):,}]"
     )
 
-    # Harness interface — always included (all tasks use the training harness)
+    # Harness interface — use actual challenge parameters when available
+    task = challenge.get("task", {})
+    ctx_len = task.get("context_len", 512)
+    pred_len = task.get("prediction_len", 96)
+    n_var = task.get("num_variates", 370)
+    q_list = task.get("quantiles", [0.1, 0.5, 0.9])
+    n_q = len(q_list)
     parts.append(
         "### Required Interface (Harness Task)\n"
         "Your code MUST define these two top-level functions (not inside a class):\n\n"
         "1. `def build_model(context_len, prediction_len, num_variates, quantiles):`\n"
-        "   - Called as: build_model(512, 96, 370, [0.1, 0.5, 0.9])\n"
+        f"   - Called as: build_model({ctx_len}, {pred_len}, {n_var}, {q_list})\n"
         "   - Must return an nn.Module\n"
-        "   - Forward input shape:  (batch, 512, 370)\n"
-        "   - Forward output shape: (batch, 96, 370, 3)  "
-        "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n\n"
+        f"   - Forward input shape:  (batch, {ctx_len}, {n_var})\n"
+        f"   - Forward output shape: (batch, {pred_len}, {n_var}, {n_q})  "
+        "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n"
+        f"   - Note: num_variates={n_var} serves as the sequence dimension for "
+        "FLOPs counting\n\n"
         "2. `def build_optimizer(model):`\n"
         "   - Takes the model returned by build_model()\n"
         "   - Must return a torch.optim.Optimizer\n\n"
