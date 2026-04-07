@@ -404,9 +404,9 @@ class TestLLMErrorHandling:
         ok, errors = validate_code(code)
         assert ok, f"LLM code failed validation: {errors}"
 
-    def test_max_llm_attempts_is_two(self):
-        """Max LLM attempts should be 2 (initial + 1 retry)."""
-        assert MAX_LLM_ATTEMPTS == 2
+    def test_max_llm_attempts_is_fifteen(self):
+        """Max LLM attempts should be 15 (half the 30-request rate limit)."""
+        assert MAX_LLM_ATTEMPTS == 15
 
     def test_reason_and_generate_no_llm_url(self):
         """No LLM URL — returns None immediately."""

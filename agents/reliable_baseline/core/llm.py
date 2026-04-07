@@ -1,7 +1,10 @@
 """LLM reasoning engine — uses GatedClient to call the validator-provided LLM.
 
 Key design decisions:
-  - Max 2 LLM calls per round (initial + 1 error-correction retry)
+  - Up to 15 LLM calls per round (uses half the 30-request rate limit,
+    leaving headroom for future enhancements)
+  - Multi-turn conversation: each retry feeds back validation errors so the
+    LLM can self-correct across turns
   - No internal retries within chat() — caller manages retry logic
   - Graceful degradation: returns None on failure, never raises
 """
@@ -12,7 +15,7 @@ from core.validation import validate_code
 from core.prompt_builder import build_system_prompt, build_user_prompt
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
-MAX_LLM_ATTEMPTS = 2  # initial + 1 retry — save rate limit budget
+MAX_LLM_ATTEMPTS = 15  # up to 15 turns — half the 30-request rate limit
 
 
 def chat(client, llm_url: str, messages: list[dict], *,
@@ -70,7 +73,9 @@ def reason_and_generate(client, challenge: dict,
     """Use the LLM to reason about architecture design and generate code.
 
     Returns (code, name, motivation) if LLM produced valid code, else None.
-    Uses at most 2 LLM calls (initial + 1 retry with error feedback).
+    Uses up to 15 LLM calls with multi-turn error correction. Each failed
+    attempt feeds validation errors back to the LLM so it can self-correct.
+    Returns as soon as valid code is produced.
     """
     llm_url = challenge.get("llm_url", "")
     if not llm_url:
