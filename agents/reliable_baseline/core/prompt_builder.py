@@ -157,6 +157,11 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
     if hist_text != "No previous submissions.":
         parts.append(f"## Your Previous Submissions\n{hist_text}")
 
+    # Tool-assisted research findings
+    tool_analysis = context.get("tool_analysis", "")
+    if tool_analysis:
+        parts.append(f"## Database Research Findings\n{tool_analysis}")
+
     # Strategy
     strategy = BUCKET_STRATEGIES.get(bucket, "")
     if strategy:

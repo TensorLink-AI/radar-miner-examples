@@ -16,7 +16,7 @@ Pipeline:
 import sys
 import tempfile
 
-from core import llm, db_client, validation, history, templates
+from core import llm, db_client, validation, history, templates, tools
 
 
 def _log(msg: str) -> None:
@@ -83,8 +83,38 @@ def design_architecture(challenge: dict, client) -> dict:
         "target_flops": target_flops,
     }
 
-    # ── STEP 3: LLM reasoning (primary path) ─────────────────────
+    # ── STEP 2b: Tool-assisted analysis (optional, best-effort) ──
     llm_url = challenge.get("llm_url", "")
+    tool_analysis = ""
+    if db_url and llm_url:
+        try:
+            tool_defs = tools.TOOLS
+            tool_handlers = tools.build_handlers(client, db_url)
+            analysis_messages = [
+                {"role": "system", "content": (
+                    "You are a research assistant. Use the provided tools to "
+                    "gather information about past experiments, then summarize "
+                    "what architectural patterns work well and what to avoid "
+                    f"for the '{bucket}' FLOPs bucket. Be concise."
+                )},
+                {"role": "user", "content": (
+                    "Check recent experiments, component stats, and dead ends. "
+                    "Summarize findings for code generation."
+                )},
+            ]
+            tool_analysis = llm.chat_with_tools(
+                client, llm_url, analysis_messages,
+                tools=tool_defs, tool_handlers=tool_handlers,
+                temperature=0.3, max_rounds=4,
+            )
+            _log(f"[agent] Tool analysis: {len(tool_analysis)} chars")
+        except Exception as exc:
+            _log(f"[agent] Tool analysis failed (non-fatal): {exc}")
+
+    if tool_analysis:
+        context["tool_analysis"] = tool_analysis
+
+    # ── STEP 3: LLM reasoning (primary path) ─────────────────────
     result = None
     source = "template_fallback"
 

@@ -3,7 +3,7 @@
 import sys
 import tempfile
 
-from core import llm, db_client, validation, prompt_builder, history
+from core import llm, db_client, validation, prompt_builder, history, tools
 
 STRATEGY_PREAMBLE = """You are optimizing for a specific compute budget. You have deep expertise \
 with models in this exact size range. You maintain a library of bucket-specific architectures \
@@ -194,6 +194,43 @@ def design_architecture(challenge: dict, client) -> dict:
         history_context=hist_ctx,
         strategy_instructions=strategy_instr,
     )
+
+    # --- Tool-assisted analysis phase (optional, best-effort) ---
+    tool_analysis = ""
+    if db_url and llm_url:
+        try:
+            tool_defs = tools.TOOLS
+            tool_handlers = tools.build_handlers(client, db_url)
+            analysis_messages = [
+                {"role": "system", "content": (
+                    "You are a research assistant. Use the provided tools to "
+                    "gather information about past experiments, then summarize "
+                    "what works best specifically for the "
+                    f"'{bucket}' FLOPs bucket "
+                    f"({flops_min:,}-{flops_max:,} FLOPs). "
+                    "Focus on bucket-specific architecture patterns, component "
+                    "choices, and hyperparameters. Be concise."
+                )},
+                {"role": "user", "content": (
+                    "Search for experiments in this bucket. Check component "
+                    "stats and dead ends. Summarize what works and what fails."
+                )},
+            ]
+            tool_analysis = llm.chat_with_tools(
+                client, llm_url, analysis_messages,
+                tools=tool_defs, tool_handlers=tool_handlers,
+                temperature=0.3, max_rounds=4,
+            )
+            print(f"[specialist] Tool analysis: {len(tool_analysis)} chars",
+                  file=sys.stderr)
+        except Exception as exc:
+            print(f"[specialist] Tool analysis failed (non-fatal): {exc}",
+                  file=sys.stderr)
+
+    if tool_analysis:
+        user_prompt += (
+            "\n\n### Database Research Findings\n" + tool_analysis
+        )
 
     # LLM call with validation loop
     code = ""
