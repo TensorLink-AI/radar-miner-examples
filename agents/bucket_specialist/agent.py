@@ -242,11 +242,9 @@ def design_architecture(challenge: dict, client) -> dict:
 
     ok, errors = validation.validate(code, challenge)
     if not ok:
-        print(f"[specialist] Final code invalid ({errors}), using fallback stub",
+        print(f"[specialist] Final code invalid ({errors}), skipping submission",
               file=sys.stderr)
-        code = validation.FALLBACK_CODE
-        name = "fallback_linear"
-        motivation = "Fallback — LLM failed to produce valid code"
+        return {"code": "", "name": name, "motivation": f"REJECTED: {errors}"}
 
     # Update scratchpad
     state = history.add_entry(
