@@ -232,7 +232,7 @@ def design_architecture(challenge: dict, client) -> dict:
     # ── Generate code ────────────────────────────────────────────
     code = _generate_code(cfg)
 
-    ok, errors = validation.validate_code(code)
+    ok, errors = validation.validate_code(code, challenge)
     if not ok:
         _log(f"[patch_decoder] BUG: generated code failed validation: {errors}")
 

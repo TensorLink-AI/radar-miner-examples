@@ -2,6 +2,9 @@
 
 import ast
 
+from core.flops_estimator import estimate_flops
+from core.history import extract_flops_budget
+
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
 
 REQUIRED_FUNCTIONS = {
@@ -10,7 +13,7 @@ REQUIRED_FUNCTIONS = {
 }
 
 
-def validate_code(code: str) -> tuple[bool, list[str]]:
+def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[str]]:
     """Validate generated code against the validator's requirements.
 
     Returns (ok, list_of_errors).
@@ -51,5 +54,26 @@ def validate_code(code: str) -> tuple[bool, list[str]]:
                 root = node.module.split(".")[0]
                 if root in FORBIDDEN_IMPORTS:
                     errors.append(f"Forbidden import: {node.module}")
+
+    # FLOPs bounds check — only if challenge provided and no structural errors
+    if not errors and challenge is not None:
+        flops_min, flops_max = extract_flops_budget(challenge)
+        if flops_min or flops_max:
+            gate_min = int(flops_min * 0.9)
+            gate_max = int(flops_max * 1.1)
+            estimated, err = estimate_flops(code, challenge)
+            if err:
+                errors.append(f"FLOPs estimation failed: {err}")
+            elif estimated is not None:
+                if estimated < gate_min:
+                    errors.append(
+                        f"Estimated FLOPs ({estimated:,}) below hard gate "
+                        f"minimum ({gate_min:,}). Increase model capacity."
+                    )
+                elif estimated > gate_max:
+                    errors.append(
+                        f"Estimated FLOPs ({estimated:,}) above hard gate "
+                        f"maximum ({gate_max:,}). Reduce model capacity."
+                    )
 
     return len(errors) == 0, errors

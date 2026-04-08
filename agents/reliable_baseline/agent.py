@@ -44,7 +44,7 @@ def design_architecture(challenge: dict, client) -> dict:
 
     # Generate fallback FIRST — this is instant and always valid
     fallback_code = templates.get_template(bucket)
-    fb_ok, fb_errors = validation.validate_code(fallback_code)
+    fb_ok, fb_errors = validation.validate_code(fallback_code, challenge)
     if not fb_ok:
         _log(f"[agent] WARNING: template validation failed: {fb_errors}")
         # This should never happen — templates are unit-tested
@@ -136,7 +136,7 @@ def design_architecture(challenge: dict, client) -> dict:
         _log(f"[agent] Using template fallback for {bucket}")
 
     # ── STEP 4: Final safety check (belt + suspenders) ────────────
-    ok, errors = validation.validate_code(code)
+    ok, errors = validation.validate_code(code, challenge)
     if not ok:
         _log(f"[agent] SAFETY: code from {source} failed validation: {errors}")
         _log(f"[agent] SAFETY: falling back to template")
