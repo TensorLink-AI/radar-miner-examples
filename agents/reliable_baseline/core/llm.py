@@ -228,7 +228,7 @@ def reason_and_generate(client, challenge: dict,
                 elif stripped.startswith("# Motivation:"):
                     motivation = stripped.split(":", 1)[1].strip()
 
-            ok, errors = validate_code(code)
+            ok, errors = validate_code(code, challenge)
             if ok:
                 print(f"[llm] validation passed on attempt {attempt + 1}",
                       file=sys.stderr)
