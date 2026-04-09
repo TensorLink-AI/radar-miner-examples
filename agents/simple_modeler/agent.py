@@ -167,6 +167,10 @@ def design_architecture(challenge: dict, client) -> dict:
     # LLM call with validation loop (up to 3 attempts)
     code = ""
     last_errors: list[str] = []
+
+    tp = challenge.get("task", {}).get("task_params", {})
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
+
     name = f"simple_modeler_{bucket}"
     motivation = f"Well-designed model for {bucket} bucket"
 
@@ -197,7 +201,7 @@ def design_architecture(challenge: dict, client) -> dict:
                     "content": (
                         "Your previous response did not contain a fenced Python code block. "
                         "You MUST respond with a single ```python ... ``` block containing "
-                        "top-level `def build_model(context_len, prediction_len, num_variates, quantiles)` "
+                        f"top-level `def build_model({param_str})` "
                         "and `def build_optimizer(model)` functions. Try again."
                     ),
                 })

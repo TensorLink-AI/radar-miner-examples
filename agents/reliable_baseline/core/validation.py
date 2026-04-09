@@ -7,10 +7,21 @@ from core.history import extract_flops_budget
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
 
-REQUIRED_FUNCTIONS = {
-    "build_model": ["context_len", "prediction_len", "num_variates", "quantiles"],
-    "build_optimizer": ["model"],
-}
+def _required_functions(challenge: dict | None) -> dict[str, list[str]]:
+    """Derive required function signatures from the challenge task_params.
+
+    Reads build_model params from challenge['task']['task_params'] keys
+    instead of hardcoding them — the CLAUDE.md spec requires this.
+    """
+    if challenge:
+        task_params = challenge.get("task", {}).get("task_params", {})
+        build_model_params = list(task_params.keys()) if task_params else []
+    else:
+        build_model_params = []
+    return {
+        "build_model": build_model_params,
+        "build_optimizer": ["model"],
+    }
 
 
 def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[str]]:
@@ -21,7 +32,7 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
       2. ast.parse() succeeds (no syntax errors)
       3. Top-level ``def build_model`` exists
       4. Top-level ``def build_optimizer`` exists
-      5. build_model has params: context_len, prediction_len, num_variates, quantiles
+      5. build_model has params derived from challenge task_params
       6. build_optimizer has param: model
       7. No forbidden imports (subprocess, socket, ftplib)
       8. FLOPs within budget bounds (if challenge provided)
@@ -38,14 +49,15 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
     except SyntaxError as exc:
         return False, [f"SyntaxError: {exc}"]
 
-    # 3-6. Check for required top-level functions with correct parameters
+    # 3-6. Check for required top-level functions — params from challenge task_params
     top_level_funcs: dict[str, list[str]] = {}
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             params = [a.arg for a in node.args.args if a.arg != "self"]
             top_level_funcs[node.name] = params
 
-    for fname, required_params in REQUIRED_FUNCTIONS.items():
+    required = _required_functions(challenge)
+    for fname, required_params in required.items():
         if fname not in top_level_funcs:
             errors.append(f"Missing required top-level function: {fname}")
         else:

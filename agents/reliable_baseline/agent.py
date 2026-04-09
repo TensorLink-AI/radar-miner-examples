@@ -32,7 +32,7 @@ def design_architecture(challenge: dict, client) -> dict:
             flops_max = int(fb.get("max", 0))
 
     bucket = history.identify_bucket(flops_min, flops_max)
-    target_flops = int(flops_max * 0.55) if flops_max else 0
+    target_flops = int(flops_max * 0.6) if flops_max else 0
 
     _log(f"[agent] Bucket: {bucket}, FLOPs: {flops_min:,}-{flops_max:,}, "
          f"target: {target_flops:,}")

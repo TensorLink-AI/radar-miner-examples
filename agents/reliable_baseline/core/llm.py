@@ -248,11 +248,12 @@ def reason_and_generate(client, challenge: dict,
                         "top-level def statements (not inside a class)."
                     )})
                 else:
+                    tp = challenge.get("task", {}).get("task_params", {})
+                    param_str = ", ".join(tp.keys()) if tp else "**task_params"
                     messages.append({"role": "user", "content": (
                         "Previous attempt failed: no Python code block found. "
                         "You MUST respond with a single ```python code block "
-                        "containing def build_model(context_len, prediction_len, "
-                        "num_variates, quantiles) and def build_optimizer(model)."
+                        f"containing def build_model({param_str}) and def build_optimizer(model)."
                     )})
 
         except Exception as exc:

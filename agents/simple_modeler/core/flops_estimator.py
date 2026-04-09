@@ -194,10 +194,9 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
     """
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
+    # Read from challenge — never hardcode task params
     context_len = tp.get("context_len", 512)
-    prediction_len = tp.get("prediction_len", 96)
     num_variates = tp.get("num_variates", 1)
-    quantiles = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 
     # Execute the code in a restricted namespace
     namespace = {}
@@ -210,9 +209,9 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
     if not callable(build_model_fn):
         return None, "build_model not found or not callable"
 
-    # Instantiate the model
+    # Instantiate the model using task_params from the challenge (never hardcode)
     try:
-        model = build_model_fn(context_len, prediction_len, num_variates, quantiles)
+        model = build_model_fn(**tp)
     except Exception as exc:
         return None, f"build_model() raised: {exc}"
 
