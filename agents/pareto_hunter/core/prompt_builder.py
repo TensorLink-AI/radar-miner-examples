@@ -12,10 +12,11 @@ def _compute_sizing_guidance(challenge: dict) -> str:
     specific architecture.
     """
     task = challenge.get("task", {})
-    ctx_len = task.get("context_len", 512)
-    pred_len = task.get("prediction_len", 96)
-    n_var = task.get("num_variates", 370)
-    q_list = task.get("quantiles", [0.1, 0.5, 0.9])
+    tp = task.get("task_params", {})
+    ctx_len = tp.get("context_len", 512)
+    pred_len = tp.get("prediction_len", 96)
+    n_var = tp.get("num_variates", 1)
+    q_list = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
     n_q = len(q_list)
 
     flops_min, flops_max = extract_flops_budget(challenge)
@@ -115,10 +116,11 @@ def build_user_prompt(challenge: dict, *,
 
     # Harness interface — use actual challenge parameters when available
     task = challenge.get("task", {})
-    ctx_len = task.get("context_len", 512)
-    pred_len = task.get("prediction_len", 96)
-    n_var = task.get("num_variates", 370)
-    q_list = task.get("quantiles", [0.1, 0.5, 0.9])
+    tp = task.get("task_params", {})
+    ctx_len = tp.get("context_len", 512)
+    pred_len = tp.get("prediction_len", 96)
+    n_var = tp.get("num_variates", 1)
+    q_list = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
     n_q = len(q_list)
     parts.append(
         "### Required Interface (Harness Task)\n"

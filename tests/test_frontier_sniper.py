@@ -112,7 +112,11 @@ class TestIntegration:
         from core.validation import validate
 
         challenge = {
-            "task": {"run_command": "python harness.py"},
+            "task": {"run_command": "python harness.py", "task_params": {
+                "context_len": 512, "prediction_len": 96,
+                "num_variates": 1,
+                "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+            }},
             "flops_budget": {"min": 500_000, "max": 2_000_000},
         }
 
@@ -125,13 +129,13 @@ class _Model(nn.Module):
         super().__init__()
         self.prediction_len = prediction_len
         self.n_quantiles = n_quantiles
-        # Small hidden dim to stay within the 500K-2M FLOPs bucket
-        self.proj = nn.Linear(context_len, 3)
-        self.out = nn.Linear(3, prediction_len * n_quantiles)
+        # Hidden dim sized for V=1, nq=9, 500K-2M FLOPs bucket
+        self.proj = nn.Linear(context_len, 300)
+        self.out = nn.Linear(300, prediction_len * n_quantiles)
 
     def forward(self, x):
         # x: (batch, context_len, num_variates)
-        h = self.proj(x.transpose(1, 2))  # (batch, num_variates, 3)
+        h = self.proj(x.transpose(1, 2))  # (batch, num_variates, 300)
         out = self.out(h)                 # (batch, num_variates, pred*q)
         b, v, _ = out.shape
         out = out.view(b, v, self.prediction_len, self.n_quantiles)

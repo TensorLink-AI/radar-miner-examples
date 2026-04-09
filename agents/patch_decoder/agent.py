@@ -19,10 +19,6 @@ import tempfile
 import textwrap
 
 from core import validation, history
-from core.flops_estimator import (
-    DEFAULT_CONTEXT_LEN, DEFAULT_PREDICTION_LEN,
-    DEFAULT_NUM_VARIATES, DEFAULT_QUANTILES,
-)
 
 
 def _log(msg: str) -> None:
@@ -59,10 +55,11 @@ def _compute_scaling(challenge: dict) -> dict:
     patch-based config fits.
     """
     task = challenge.get("task", {})
-    context_len = task.get("context_len", DEFAULT_CONTEXT_LEN)
-    prediction_len = task.get("prediction_len", DEFAULT_PREDICTION_LEN)
-    num_variates = task.get("num_variates", DEFAULT_NUM_VARIATES)
-    quantiles = task.get("quantiles", DEFAULT_QUANTILES)
+    tp = task.get("task_params", {})
+    context_len = tp.get("context_len", 512)
+    prediction_len = tp.get("prediction_len", 96)
+    num_variates = tp.get("num_variates", 1)
+    quantiles = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 
     flops_min, flops_max = history.extract_flops_budget(challenge)
     target = int(flops_max * 0.6)

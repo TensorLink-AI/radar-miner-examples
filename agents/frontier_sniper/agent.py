@@ -21,10 +21,11 @@ Key rules:
 def _make_bootstrap_instructions(challenge: dict, flops_max: int) -> str:
     """Build budget-aware bootstrap instructions from the challenge."""
     task = challenge.get("task", {})
-    ctx = task.get("context_len", 512)
-    pred = task.get("prediction_len", 96)
-    nvar = task.get("num_variates", 370)
-    nq = len(task.get("quantiles", [0.1, 0.5, 0.9]))
+    tp = task.get("task_params", {})
+    ctx = tp.get("context_len", 512)
+    pred = tp.get("prediction_len", 96)
+    nvar = tp.get("num_variates", 1)
+    nq = len(tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
     target = int(flops_max * 0.6)
 
     denom = 2 * nvar * (ctx + pred * nq)

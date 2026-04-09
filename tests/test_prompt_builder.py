@@ -24,6 +24,11 @@ SAMPLE_CHALLENGE = {
         "objectives": ["Minimize CRPS", "Minimize MASE"],
         "anti_patterns": ["Don't use RNNs for long sequences"],
         "example_hypotheses": ["Patch embeddings reduce sequence length"],
+        "task_params": {
+            "context_len": 512, "prediction_len": 96,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        },
     },
     "flops_budget": {"min": 500_000, "max": 2_000_000},
 }
@@ -33,6 +38,11 @@ FLAT_CHALLENGE = {
     "task": {
         "run_command": "python harness.py",
         "domain_system_prompt": "Time-series forecaster.",
+        "task_params": {
+            "context_len": 512, "prediction_len": 96,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        },
     },
     "min_flops_equivalent": 10_000_000,
     "max_flops_equivalent": 50_000_000,
@@ -112,10 +122,37 @@ class TestBuildUserPrompt:
 
     def test_harness_explicit_shapes(self):
         prompt = build_user_prompt(SAMPLE_CHALLENGE)
-        assert "(batch, 512, 370)" in prompt or "512" in prompt
+        assert "(batch, 512, 1)" in prompt or "512" in prompt
         assert "build_model" in prompt
         assert "build_optimizer" in prompt
         assert "REJECTED" in prompt or "CRITICAL" in prompt
+
+    def test_task_params_used_for_sizing(self):
+        """Prompt should use task_params for sizing guidance, not defaults."""
+        prompt = build_user_prompt(SAMPLE_CHALLENGE)
+        # With num_variates=1 and 9 quantiles, max_hidden should be much larger
+        # than with num_variates=370 and 3 quantiles
+        assert "num_variates=1" in prompt
+        assert "len(quantiles)=9" in prompt
+
+    def test_different_task_params_different_sizing(self):
+        """Two challenges with different task_params should produce different sizing."""
+        ch1 = {
+            "task": {"task_params": {"context_len": 512, "prediction_len": 96,
+                     "num_variates": 1, "quantiles": [0.1, 0.5, 0.9]}},
+            "flops_budget": {"min": 500_000, "max": 2_000_000},
+        }
+        ch2 = {
+            "task": {"task_params": {"context_len": 512, "prediction_len": 96,
+                     "num_variates": 370, "quantiles": [0.1, 0.5, 0.9]}},
+            "flops_budget": {"min": 500_000, "max": 2_000_000},
+        }
+        prompt1 = build_user_prompt(ch1)
+        prompt2 = build_user_prompt(ch2)
+        assert "num_variates=1" in prompt1
+        assert "num_variates=370" in prompt2
+        # Different num_variates should produce different max_hidden values
+        assert prompt1 != prompt2
 
 
 class TestFormatFrontier:

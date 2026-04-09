@@ -21,10 +21,11 @@ def _compute_bucket_guidance(bucket: str, flops_min: int, flops_max: int,
                              challenge: dict) -> dict:
     """Compute dynamic sizing guidance for a bucket from the challenge."""
     task = challenge.get("task", {})
-    ctx = task.get("context_len", 512)
-    pred = task.get("prediction_len", 96)
-    nvar = task.get("num_variates", 370)
-    quants = task.get("quantiles", [0.1, 0.5, 0.9])
+    tp = task.get("task_params", {})
+    ctx = tp.get("context_len", 512)
+    pred = tp.get("prediction_len", 96)
+    nvar = tp.get("num_variates", 1)
+    quants = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
     nq = len(quants)
     target = int(flops_max * 0.6)
 
