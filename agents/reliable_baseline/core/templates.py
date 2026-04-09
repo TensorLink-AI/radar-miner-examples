@@ -128,7 +128,7 @@ class SmallConvMixer(nn.Module):
         self.act = nn.GELU()
         self.norm1 = nn.LayerNorm(hidden)
         self.linear1 = nn.Linear(context_len, prediction_len)
-        self.norm2 = nn.LayerNorm(prediction_len)
+        self.norm2 = nn.LayerNorm(hidden)
         self.head = nn.Linear(hidden, num_variates * n_quantiles)
 
     def forward(self, x):

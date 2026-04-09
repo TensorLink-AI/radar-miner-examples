@@ -1,8 +1,9 @@
 """Patch Decoder — deterministic agent that emits a RevIN patch-MLP decoder
-scaled to the centre of the requested FLOPs bucket.
+scaled dynamically to fit the requested FLOPs budget.
 
-No LLM calls.  The architecture is fully parameterised by a per-bucket
-scaling table, so every run with the same challenge is perfectly reproducible.
+No LLM calls.  The architecture is fully parameterised by a scaling function
+that derives dimensions from the challenge, so it adapts to ANY budget and
+ANY harness parameters automatically.
 
 Architecture:
   1. RevIN normalisation (learnable affine)
@@ -10,7 +11,7 @@ Architecture:
   3. Learnable positional embedding
   4. N stacked MLP blocks (Linear -> LayerNorm -> GELU -> Linear residual)
   5. Flatten patches -> projection head -> (pred_len, num_variates, n_quantiles)
-  6. RevIN denormalisation
+  6. RevIN denormalisation (applied per-quantile to preserve last-dim = num_variates)
 """
 
 import sys
@@ -18,62 +19,110 @@ import tempfile
 import textwrap
 
 from core import validation, history
+from core.flops_estimator import (
+    DEFAULT_CONTEXT_LEN, DEFAULT_PREDICTION_LEN,
+    DEFAULT_NUM_VARIATES, DEFAULT_QUANTILES,
+)
 
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-# ── Scaling table ────────────────────────────────────────────────
-# Each entry targets the *centre* of its FLOPs bucket.
-# Keys: d_model, n_layers, ff_mult, patch_size, lr, batch_size, grad_accum
-_SCALING = {
-    "tiny": {
-        "d_model": 32,
-        "n_layers": 1,
-        "ff_mult": 2,
-        "patch_size": 16,
-        "lr": "5e-4",
-        "batch_size": 64,
-        "grad_accum": 1,
-    },
-    "small": {
-        "d_model": 48,
-        "n_layers": 1,
-        "ff_mult": 2,
-        "patch_size": 16,
-        "lr": "3e-4",
-        "batch_size": 64,
-        "grad_accum": 1,
-    },
-    "medium_small": {
-        "d_model": 64,
-        "n_layers": 2,
-        "ff_mult": 2,
-        "patch_size": 16,
-        "lr": "3e-4",
-        "batch_size": 32,
-        "grad_accum": 2,
-    },
-    "medium": {
-        "d_model": 128,
-        "n_layers": 3,
-        "ff_mult": 2,
-        "patch_size": 16,
-        "lr": "2e-4",
-        "batch_size": 32,
-        "grad_accum": 2,
-    },
-    "large": {
-        "d_model": 192,
-        "n_layers": 4,
-        "ff_mult": 2,
-        "patch_size": 16,
-        "lr": "1e-4",
-        "batch_size": 16,
-        "grad_accum": 4,
-    },
-}
+# ── Dynamic scaling ─────────────────────────────────────────────
+
+
+def _analytical_flops(V, n_patches, patch_size, d_model, ff_mult,
+                      n_layers, prediction_len, nq):
+    """Analytical FLOPs estimate for the patch-decoder architecture.
+
+    Matches what the forward-pass hook estimator would measure at batch=1
+    with V folded into the batch dimension.
+    """
+    ff_dim = d_model * ff_mult
+    # Patch embedding: Linear(patch_size, d_model) on (V, n_patches, patch_size)
+    patch_embed = V * n_patches * 2 * patch_size * d_model
+    # MLP blocks: fc1 + fc2 per block
+    mlp_total = n_layers * V * n_patches * 2 * 2 * d_model * ff_dim
+    # Output norm
+    norms = (n_layers + 1) * 2 * d_model * V * n_patches
+    # Head: Linear(d_model * n_patches, prediction_len * nq) on (V, flat)
+    head = V * 2 * (d_model * n_patches) * (prediction_len * nq)
+    return patch_embed + mlp_total + norms + head
+
+
+def _compute_scaling(challenge: dict) -> dict:
+    """Derive (d_model, n_layers, patch_size) from the challenge budget.
+
+    Grid-searches combinations and picks the one closest to 60% of
+    flops_max.  Falls back to a minimal direct-linear config if no
+    patch-based config fits.
+    """
+    task = challenge.get("task", {})
+    context_len = task.get("context_len", DEFAULT_CONTEXT_LEN)
+    prediction_len = task.get("prediction_len", DEFAULT_PREDICTION_LEN)
+    num_variates = task.get("num_variates", DEFAULT_NUM_VARIATES)
+    quantiles = task.get("quantiles", DEFAULT_QUANTILES)
+
+    flops_min, flops_max = history.extract_flops_budget(challenge)
+    target = int(flops_max * 0.6)
+
+    V = num_variates
+    nq = len(quantiles)
+    ff_mult = 2
+
+    best = None
+    best_diff = float("inf")
+
+    for patch_size in [64, 32, 16, 8, 4]:
+        if patch_size > context_len:
+            continue
+        n_patches = context_len // patch_size
+        if n_patches < 1:
+            continue
+
+        for n_layers in [1, 2, 3, 4, 6]:
+            # Scan d_model in steps of 4
+            for d_model in range(4, 513, 4):
+                total = _analytical_flops(
+                    V, n_patches, patch_size, d_model, ff_mult,
+                    n_layers, prediction_len, nq,
+                )
+                diff = abs(total - target)
+                if diff < best_diff:
+                    best_diff = diff
+                    best = {
+                        "d_model": d_model,
+                        "n_layers": n_layers,
+                        "ff_mult": ff_mult,
+                        "patch_size": patch_size,
+                    }
+                if total > target * 1.5:
+                    break  # d_model too large, stop scanning
+
+    if best is None or best["d_model"] < 4:
+        # Fallback: minimal direct-linear config
+        best = {
+            "d_model": 4,
+            "n_layers": 1,
+            "ff_mult": 1,
+            "patch_size": min(context_len, 16),
+        }
+
+    # Training hyperparameters scaled by model size
+    d = best["d_model"]
+    if d <= 32:
+        best.update(lr="5e-4", batch_size=64, grad_accum=1)
+    elif d <= 64:
+        best.update(lr="3e-4", batch_size=64, grad_accum=1)
+    elif d <= 128:
+        best.update(lr="3e-4", batch_size=32, grad_accum=2)
+    elif d <= 256:
+        best.update(lr="2e-4", batch_size=32, grad_accum=2)
+    else:
+        best.update(lr="1e-4", batch_size=16, grad_accum=4)
+
+    return best
 
 
 def _generate_code(cfg: dict) -> str:
@@ -177,11 +226,16 @@ def _generate_code(cfg: dict) -> str:
                 x = x.reshape(b * V, -1)
                 x = self.head(x)
 
+                # Reshape: (b*V, pred*nq) -> (b, V, pred, nq) -> (b, pred, V, nq)
                 x = x.reshape(b, V, self.prediction_len, self.n_quantiles)
-                x = x.permute(0, 2, 1, 3)  # (batch, pred, V, n_q)
-                x_flat = x.reshape(b, self.prediction_len, V * self.n_quantiles)
-                x_flat = self.revin(x_flat, "denorm")
-                return x_flat.view(b, self.prediction_len, V, self.n_quantiles)
+                x = x.permute(0, 2, 1, 3)  # (b, pred, V, nq)
+
+                # RevIN denorm per-quantile slice (last dim must be num_variates)
+                denormed = []
+                for q_idx in range(self.n_quantiles):
+                    slice_q = x[:, :, :, q_idx]  # (b, pred, V)
+                    denormed.append(self.revin(slice_q, "denorm"))
+                return torch.stack(denormed, dim=3)  # (b, pred, V, nq)
 
 
         def build_model(context_len, prediction_len, num_variates, quantiles):
@@ -221,26 +275,41 @@ def design_architecture(challenge: dict, client) -> dict:
     # ── Identify bucket ──────────────────────────────────────────
     flops_min, flops_max = history.extract_flops_budget(challenge)
     bucket = history.identify_bucket(flops_min, flops_max)
-    center_flops = (flops_min + flops_max) // 2
+    target_flops = int(flops_max * 0.6)
 
     _log(f"[patch_decoder] Bucket: {bucket}, FLOPs range: {flops_min:,}-{flops_max:,}, "
-         f"center: {center_flops:,}")
+         f"target: {target_flops:,}")
 
-    # ── Select scaling config ────────────────────────────────────
-    cfg = _SCALING.get(bucket, _SCALING["medium"])
+    # ── Compute scaling dynamically from budget ──────────────────
+    cfg = _compute_scaling(challenge)
+
+    _log(f"[patch_decoder] Dynamic config: d_model={cfg['d_model']}, "
+         f"layers={cfg['n_layers']}, patch_size={cfg['patch_size']}")
 
     # ── Generate code ────────────────────────────────────────────
     code = _generate_code(cfg)
 
     ok, errors = validation.validate_code(code, challenge)
     if not ok:
-        _log(f"[patch_decoder] BUG: generated code failed validation: {errors}")
+        _log(f"[patch_decoder] Validation failed: {errors}")
+        # Try adjusting d_model +-4 a few times
+        for delta in [-4, 4, -8, 8, -12, 12]:
+            adj = dict(cfg)
+            adj["d_model"] = max(4, cfg["d_model"] + delta)
+            code = _generate_code(adj)
+            ok, errors = validation.validate_code(code, challenge)
+            if ok:
+                cfg = adj
+                _log(f"[patch_decoder] Adjusted d_model to {cfg['d_model']}, now valid")
+                break
+        else:
+            _log(f"[patch_decoder] BUG: generated code failed validation: {errors}")
 
     name = f"patch_decoder_{bucket}"
     motivation = (
         f"Deterministic RevIN patch-MLP decoder for {bucket} bucket "
         f"(d_model={cfg['d_model']}, layers={cfg['n_layers']}, "
-        f"target ~{center_flops:,} FLOPs)"
+        f"patch_size={cfg['patch_size']}, target ~{target_flops:,} FLOPs)"
     )
 
     # ── Update scratchpad ────────────────────────────────────────
@@ -253,7 +322,7 @@ def design_architecture(challenge: dict, client) -> dict:
     state = history.load_state(scratch_dir) if scratch_dir else {}
     state = history.add_entry(
         state, name=name, code=code, motivation=motivation,
-        bucket=bucket, flops=center_flops, strategy="deterministic",
+        bucket=bucket, flops=target_flops, strategy="deterministic",
     )
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)

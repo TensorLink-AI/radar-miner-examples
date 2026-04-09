@@ -11,6 +11,11 @@ import tempfile
 _agent_dir = os.path.join(os.path.dirname(__file__), "..", "agents", "reliable_baseline")
 sys.path.insert(0, _agent_dir)
 
+# Clear cached core modules so we pick up reliable_baseline's core
+for _k in list(sys.modules.keys()):
+    if _k == "core" or _k.startswith("core."):
+        del sys.modules[_k]
+
 _spec = importlib.util.spec_from_file_location(
     "reliable_baseline_agent", os.path.join(_agent_dir, "agent.py"))
 _mod = importlib.util.module_from_spec(_spec)
@@ -22,7 +27,7 @@ from core.validation import validate_code
 from core.templates import get_template, _TEMPLATES
 from core.llm import extract_code, reason_and_generate, MAX_LLM_ATTEMPTS
 from core.prompt_builder import (
-    build_system_prompt, build_user_prompt, NUM_VARIATES, QUANTILES, N_QUANTILES,
+    build_system_prompt, build_user_prompt, _get_harness_params,
 )
 from core.history import (
     identify_bucket, extract_flops_budget, load_state, save_state,
@@ -394,7 +399,16 @@ class TestLLMErrorHandling:
                 "choices": [{"message": {"content": f"```python\n{VALID_CODE}\n```"}}]
             }
         })
-        challenge = _make_challenge("small", llm_url="http://llm")
+        # Use challenge without FLOPs budget so VALID_CODE passes structural
+        # validation (this test is about LLM error handling, not FLOPs sizing)
+        challenge = {
+            "task": {"run_command": "python harness.py"},
+            "feasible_frontier": [],
+            "db_url": "",
+            "llm_url": "http://llm",
+            "seed": 42,
+            "round_id": 1,
+        }
         context = {"frontier": [], "recent_experiments": {}, "failures": {},
                    "component_stats": {}, "dead_ends": {}, "history": [],
                    "bucket": "small", "target_flops": 1_100_000}
@@ -424,33 +438,39 @@ class TestLLMErrorHandling:
 # ══════════════════════════════════════════════════════════════════
 
 class TestPromptBuilding:
-    def test_correct_num_variates(self):
-        """Prompt must use num_variates=1, NOT 370."""
-        assert NUM_VARIATES == 1
+    def test_harness_params_from_challenge(self):
+        """Params come from challenge, with sensible defaults."""
+        challenge = {"task": {"num_variates": 1, "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}}
+        ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
+        assert nvar == 1
+        assert nq == 9
+        assert quants == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
-    def test_correct_quantiles(self):
-        """Prompt must use 9 quantiles, NOT 3."""
-        assert N_QUANTILES == 9
-        assert QUANTILES == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    def test_harness_params_defaults(self):
+        """When challenge has no task fields, use defaults from flops_estimator."""
+        ctx, pred, nvar, quants, nq = _get_harness_params({"task": {}})
+        assert ctx == 512
+        assert pred == 96
+        assert nvar == 370
+        assert nq == 3
 
-    def test_system_prompt_contains_correct_values(self):
+    def test_system_prompt_contains_harness_values(self):
         challenge = _make_challenge("small")
         prompt = build_system_prompt(challenge)
         assert "512" in prompt  # context_len
         assert "96" in prompt   # prediction_len
-        assert "1," in prompt or "(batch, 512, 1)" in prompt  # num_variates=1
-        # Must NOT contain 370
-        assert "370" not in prompt
+        assert "build_model" in prompt
+        assert "build_optimizer" in prompt
 
-    def test_user_prompt_contains_correct_shape(self):
+    def test_user_prompt_contains_dynamic_values(self):
         challenge = _make_challenge("small")
+        challenge["task"] = {"num_variates": 1, "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}
         context = {"frontier": [], "recent_experiments": {}, "failures": {},
                    "component_stats": {}, "dead_ends": {}, "history": [],
                    "bucket": "small", "target_flops": 1_100_000}
         prompt = build_user_prompt(challenge, context)
-        assert "(batch, 96, 1, 9)" in prompt or "num_variates=1" in prompt
-        assert "370" not in prompt
-        assert "0.1, 0.2, 0.3" in prompt  # 9 quantiles
+        assert "num_variates=1" in prompt
+        assert "0.1, 0.2, 0.3" in prompt
 
     def test_user_prompt_contains_flops_budget(self):
         challenge = _make_challenge("medium")
@@ -477,6 +497,15 @@ class TestPromptBuilding:
         prompt = build_user_prompt(challenge, context)
         assert "0.42" in prompt
         assert "frontier" in prompt.lower() or "Frontier" in prompt
+
+    def test_user_prompt_contains_sizing_guidance(self):
+        """User prompt should include computed max_hidden value."""
+        challenge = _make_challenge("small")
+        context = {"frontier": [], "recent_experiments": {}, "failures": {},
+                   "component_stats": {}, "dead_ends": {}, "history": [],
+                   "bucket": "small", "target_flops": 1_100_000}
+        prompt = build_user_prompt(challenge, context)
+        assert "max hidden" in prompt.lower()
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -17,61 +17,46 @@ Key rules:
 - If you're already on the frontier for this bucket, optimize secondary objectives for the 1.5x Pareto bonus.
 - Track what works per-bucket obsessively — this is your competitive advantage."""
 
-BUCKET_TEMPLATES = {
-    "tiny": {
-        "description": "100K-500K FLOPs. Use lightweight linear mixers, small MLPs, or patch-based models.",
+def _compute_bucket_guidance(bucket: str, flops_min: int, flops_max: int,
+                             challenge: dict) -> dict:
+    """Compute dynamic sizing guidance for a bucket from the challenge."""
+    task = challenge.get("task", {})
+    ctx = task.get("context_len", 512)
+    pred = task.get("prediction_len", 96)
+    nvar = task.get("num_variates", 370)
+    quants = task.get("quantiles", [0.1, 0.5, 0.9])
+    nq = len(quants)
+    target = int(flops_max * 0.6)
+
+    # Max hidden for a simple 2-layer channel-independent model
+    denom = 2 * nvar * (ctx + pred * nq)
+    max_hidden = target // denom if denom > 0 else 0
+
+    return {
+        "description": (
+            f"{flops_min:,}-{flops_max:,} FLOPs. Target ~{target:,} FLOPs. "
+            f"A 2-layer channel-independent model can afford max hidden ~ {max_hidden}."
+        ),
         "tips": [
-            "Avoid attention — too expensive for this range",
-            "Depthwise separable convolutions are efficient here",
-            "Single-layer models with good feature engineering",
-            "Patch embeddings to reduce sequence length",
+            f"Budget your FLOPs: nn.Linear(in, out) on (batch, seq, in) costs 2*in*out*seq",
+            f"If channel-independent (batch*V reshape), V={nvar} is already in the batch",
+            f"Self-attention costs 8*S*d^2 + 2*S^2*d — check if it fits your budget",
+            "Focus on training dynamics (LR schedule, warmup, init) as much as architecture",
         ],
-    },
-    "small": {
-        "description": "500K-2M FLOPs. Small transformers or efficient conv models.",
-        "tips": [
-            "1-2 layer transformers with small hidden dim (32-64)",
-            "Linear attention variants",
-            "Conv1d + MLP mixer architectures",
-            "Careful: self-attention FLOPs scale quadratically",
-        ],
-    },
-    "medium_small": {
-        "description": "2M-10M FLOPs. Mid-size models with room for architectural tricks.",
-        "tips": [
-            "2-4 layer transformers with hidden dim 64-128",
-            "Can afford multi-head attention (2-4 heads)",
-            "Residual connections become important here",
-            "Consider patch-based approaches to reduce sequence length",
-        ],
-    },
-    "medium": {
-        "description": "10M-50M FLOPs. Full architectures possible.",
-        "tips": [
-            "4-8 layer transformers, hidden dim 128-256",
-            "Multi-head attention with 4-8 heads",
-            "Can include normalization layers and dropout",
-            "Consider mixture-of-experts for efficiency",
-        ],
-    },
-    "large": {
-        "description": "50M-125M FLOPs. Complex architectures viable.",
-        "tips": [
-            "6-12 layer transformers, hidden dim 256-512",
-            "Full attention mechanisms affordable",
-            "Can stack more sophisticated blocks",
-            "Focus on training dynamics (LR schedule, warmup) over architecture size",
-        ],
-    },
-}
+    }
 
 
-def get_bucket_template_prompt(bucket: str, state: dict) -> str:
+def get_bucket_template_prompt(bucket: str, state: dict,
+                               flops_min: int = 0, flops_max: int = 0,
+                               challenge: dict | None = None) -> str:
     """Get the bucket-specific template info and any saved templates."""
     parts = []
 
-    # Static template guidance
-    template = BUCKET_TEMPLATES.get(bucket, {})
+    # Dynamic template guidance computed from the challenge
+    if challenge:
+        template = _compute_bucket_guidance(bucket, flops_min, flops_max, challenge)
+    else:
+        template = {}
     if template:
         parts.append(f"**Bucket Profile**: {template.get('description', '')}")
         tips = template.get("tips", [])
@@ -94,7 +79,8 @@ def get_bucket_template_prompt(bucket: str, state: dict) -> str:
 
 def build_strategy_instructions(frontier: list[dict], state: dict,
                                 bucket: str, flops_min: int,
-                                flops_max: int) -> str:
+                                flops_max: int,
+                                challenge: dict | None = None) -> str:
     """Build bucket-specialist strategy instructions."""
     parts = []
 
@@ -105,8 +91,11 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
         f"Target exactly {target:,} FLOPs."
     )
 
-    # Bucket template
-    template_info = get_bucket_template_prompt(bucket, state)
+    # Bucket template — dynamic sizing from challenge
+    template_info = get_bucket_template_prompt(
+        bucket, state, flops_min=flops_min, flops_max=flops_max,
+        challenge=challenge,
+    )
     if template_info:
         parts.append(template_info)
 
@@ -178,7 +167,8 @@ def design_architecture(challenge: dict, client) -> dict:
     # Build prompts
     llm_url = challenge.get("llm_url", "")
     strategy_instr = build_strategy_instructions(
-        frontier, state, bucket, flops_min, flops_max
+        frontier, state, bucket, flops_min, flops_max,
+        challenge=challenge,
     )
     frontier_ctx = prompt_builder.format_frontier(frontier, max_entries=3)
     db_ctx = prompt_builder.format_db_context(recent, failures, comp_stats, dead)
