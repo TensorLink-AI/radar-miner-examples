@@ -74,6 +74,26 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "**Quick sizing:**",
         f"- A simple 2-layer model can afford max hidden ~ {max_hidden}.",
         "- ALWAYS verify your total FLOPs against the gate range.",
+        "",
+        "## Self-Sizing Pattern (IMPORTANT — use this in your build_model)",
+        "",
+        "Your `build_model()` MUST compute layer dimensions dynamically from an embedded "
+        "FLOPs budget constant. Do NOT hardcode hidden dims — derive them from the budget:",
+        "",
+        "```python",
+        "def build_model(context_len, prediction_len, num_variates, quantiles):",
+        "    n_quantiles = len(quantiles)",
+        f"    TARGET_FLOPS = {target}  # 55% of max budget",
+        "",
+        "    out_features = prediction_len * n_quantiles",
+        "    flops_per_hidden = max(1, 2 * num_variates * (context_len + out_features))",
+        "    hidden_dim = max(4, TARGET_FLOPS // flops_per_hidden)",
+        "",
+        "    return MyModel(context_len, prediction_len, num_variates, n_quantiles, hidden_dim)",
+        "```",
+        "",
+        "This ensures the model adapts to any task parameters and budget automatically. "
+        "For multi-layer models, divide the budget across layers accordingly.",
     ]
     return "\n".join(lines)
 

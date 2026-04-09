@@ -1,22 +1,17 @@
-"""Reliable Baseline — LLM-driven architecture design that never fails to submit.
-
-Core philosophy: Always use the LLM for reasoning, but never let it be a single
-point of failure.  A round where you submit a decent template is infinitely
-better than a round where you submit nothing.
+"""Reliable Baseline — LLM-driven architecture design with self-sizing models.
 
 Pipeline:
-  1. Prepare a guaranteed-valid template fallback BEFORE any external calls
-  2. Gather context (DB queries, frontier analysis)
-  3. Call the LLM with rich context — this is the primary path
-  4. Validate LLM output -> if valid, use it
-  5. If LLM fails or returns invalid code -> retry ONCE with error feedback
-  6. If retry fails -> return the template fallback (never return empty code)
+  1. Gather context (DB queries, frontier analysis)
+  2. Call the LLM with rich context + self-sizing guidance
+  3. Validate LLM output -> if valid, use it
+  4. If LLM fails or returns invalid code -> retry ONCE with error feedback
+  5. If retry fails -> skip submission (better than wrong-sized model)
 """
 
 import sys
 import tempfile
 
-from core import llm, db_client, validation, history, templates, tools
+from core import llm, db_client, validation, history, tools
 
 
 def _log(msg: str) -> None:
@@ -41,13 +36,6 @@ def design_architecture(challenge: dict, client) -> dict:
 
     _log(f"[agent] Bucket: {bucket}, FLOPs: {flops_min:,}-{flops_max:,}, "
          f"target: {target_flops:,}")
-
-    # Generate fallback FIRST — this is instant and always valid
-    fallback_code = templates.get_template(bucket)
-    fb_ok, fb_errors = validation.validate_code(fallback_code, challenge)
-    if not fb_ok:
-        _log(f"[agent] WARNING: template validation failed: {fb_errors}")
-        # This should never happen — templates are unit-tested
 
     # ── STEP 1: Load scratchpad state ─────────────────────────────
     scratch_dir = None
@@ -116,7 +104,6 @@ def design_architecture(challenge: dict, client) -> dict:
 
     # ── STEP 3: LLM reasoning (primary path) ─────────────────────
     result = None
-    source = "template_fallback"
 
     if llm_url:
         try:
@@ -126,28 +113,27 @@ def design_architecture(challenge: dict, client) -> dict:
 
     if result:
         code, name, motivation = result
-        source = "llm"
         _log(f"[agent] LLM produced valid code: {name}")
     else:
-        # LLM failed or unavailable — use the template
-        code = fallback_code
-        name = f"template_{bucket}"
-        motivation = f"LLM unavailable — reliable {bucket} baseline"
-        _log(f"[agent] Using template fallback for {bucket}")
+        # LLM failed or unavailable — skip submission
+        code = ""
+        name = f"skipped_{bucket}"
+        motivation = "LLM unavailable or returned invalid code"
+        _log(f"[agent] LLM unavailable, skipping submission for {bucket}")
 
-    # ── STEP 4: Final safety check (belt + suspenders) ────────────
-    ok, errors = validation.validate_code(code, challenge)
-    if not ok:
-        _log(f"[agent] SAFETY: code from {source} failed validation: {errors}")
-        _log(f"[agent] SAFETY: falling back to template")
-        code = fallback_code
-        name = f"template_{bucket}"
-        motivation = f"Safety fallback — {source} code failed: {errors}"
+    # ── STEP 4: Final validation ──────────────────────────────────
+    if code:
+        ok, errors = validation.validate_code(code, challenge)
+        if not ok:
+            _log(f"[agent] Final validation failed: {errors}")
+            code = ""
+            name = f"skipped_{bucket}"
+            motivation = f"Code failed validation: {errors}"
 
     # ── STEP 5: Update scratchpad ─────────────────────────────────
     state = history.add_entry(
         state, name=name, code=code, motivation=motivation,
-        bucket=bucket, flops=target_flops, strategy=source,
+        bucket=bucket, flops=target_flops, strategy="reliable_baseline",
     )
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)

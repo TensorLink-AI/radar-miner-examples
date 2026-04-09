@@ -135,6 +135,13 @@ class TestBuildUserPrompt:
         assert "num_variates=1" in prompt
         assert "len(quantiles)=9" in prompt
 
+    def test_includes_self_sizing_pattern(self):
+        """Prompt should include the self-sizing pattern with TARGET_FLOPS."""
+        prompt = build_user_prompt(SAMPLE_CHALLENGE)
+        assert "TARGET_FLOPS" in prompt
+        assert "flops_per_hidden" in prompt
+        assert "hidden_dim" in prompt
+
     def test_different_task_params_different_sizing(self):
         """Two challenges with different task_params should produce different sizing."""
         ch1 = {

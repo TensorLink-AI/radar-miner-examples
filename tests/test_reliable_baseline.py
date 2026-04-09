@@ -24,7 +24,6 @@ _spec.loader.exec_module(_mod)
 design_architecture = _mod.design_architecture
 
 from core.validation import validate_code
-from core.templates import get_template, _TEMPLATES
 from core.llm import extract_code, reason_and_generate, MAX_LLM_ATTEMPTS
 from core.prompt_builder import (
     build_system_prompt, build_user_prompt, _get_harness_params,
@@ -104,93 +103,35 @@ def build_optimizer(model):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  1. Template validity — every template passes validate_code()
+#  1. Templates removed — agent uses LLM only, no template fallback
 # ══════════════════════════════════════════════════════════════════
 
-class TestTemplateValidity:
-    def test_all_templates_pass_validation(self):
-        """Every template in templates.py must pass AST validation."""
-        for bucket, code in _TEMPLATES.items():
-            ok, errors = validate_code(code)
-            assert ok, f"Template '{bucket}' failed validation: {errors}"
-
-    def test_all_buckets_have_templates(self):
-        """Every size bucket has a corresponding template."""
-        from core.history import SIZE_BUCKETS
-        for bucket in SIZE_BUCKETS:
-            code = get_template(bucket)
-            assert code, f"No template for bucket '{bucket}'"
-            assert "def build_model" in code
-            assert "def build_optimizer" in code
-
-    def test_unknown_bucket_returns_default(self):
-        """Unknown bucket falls back to the default template."""
-        code = get_template("nonexistent_bucket")
-        ok, errors = validate_code(code)
-        assert ok, f"Default template failed validation: {errors}"
-
-    def test_templates_have_optional_hooks(self):
-        """Templates include beneficial optional hooks."""
-        for bucket, code in _TEMPLATES.items():
-            assert "def training_config" in code, f"{bucket} missing training_config"
-            assert "def build_scheduler" in code, f"{bucket} missing build_scheduler"
-            assert "def init_weights" in code, f"{bucket} missing init_weights"
-
-    def test_templates_have_revin(self):
-        """Templates include RevIN for cross-domain robustness."""
-        for bucket, code in _TEMPLATES.items():
-            assert "RevIN" in code, f"{bucket} missing RevIN"
+class TestNoTemplates:
+    def test_templates_module_has_no_get_template(self):
+        """templates.py should not export get_template or _TEMPLATES."""
+        import importlib
+        # Force reimport to get the current module state
+        tmpl_path = os.path.join(_agent_dir, "core", "templates.py")
+        spec = importlib.util.spec_from_file_location("core.templates_check", tmpl_path)
+        tmpl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tmpl)
+        assert not hasattr(tmpl, "get_template"), "get_template should be removed"
+        assert not hasattr(tmpl, "_TEMPLATES"), "_TEMPLATES should be removed"
+        assert not hasattr(tmpl, "_TINY_TEMPLATE"), "_TINY_TEMPLATE should be removed"
+        assert not hasattr(tmpl, "_SMALL_TEMPLATE"), "_SMALL_TEMPLATE should be removed"
 
 
 # ══════════════════════════════════════════════════════════════════
-#  2. Template shapes (if torch available)
+#  2. Graceful degradation — design_architecture does not crash without LLM
 # ══════════════════════════════════════════════════════════════════
 
-class TestTemplateShapes:
-    def _check_shape(self, bucket):
-        code = get_template(bucket)
-        try:
-            import torch
-        except ImportError:
-            return  # skip if torch not available
-        ns = {}
-        exec(compile(code, f"<{bucket}_template>", "exec"), ns)
-        quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-        model = ns["build_model"](512, 96, 1, quantiles)
-        x = torch.randn(2, 512, 1)
-        out = model(x)
-        assert out.shape == (2, 96, 1, 9), \
-            f"Template '{bucket}' output shape {out.shape} != (2, 96, 1, 9)"
-
-    def test_tiny_shape(self):
-        self._check_shape("tiny")
-
-    def test_small_shape(self):
-        self._check_shape("small")
-
-    def test_medium_small_shape(self):
-        self._check_shape("medium_small")
-
-    def test_medium_shape(self):
-        self._check_shape("medium")
-
-    def test_large_shape(self):
-        self._check_shape("large")
-
-
-# ══════════════════════════════════════════════════════════════════
-#  3. Never-empty guarantee — design_architecture always returns valid code
-# ══════════════════════════════════════════════════════════════════
-
-class TestNeverEmpty:
-    """design_architecture must NEVER return empty code."""
+class TestGracefulDegradation:
+    """Without LLM, design_architecture returns empty code (skips submission)."""
 
     def _run(self, challenge, client):
         """Run design_architecture with injected globals."""
-        # Inject load_scratchpad and save_scratchpad into the agent module
         _mod.load_scratchpad = lambda c: None
         _mod.save_scratchpad = lambda c, d: None
-        # Also inject into builtins for the agent's global scope
         import builtins
         builtins.load_scratchpad = lambda c: None
         builtins.save_scratchpad = lambda c, d: None
@@ -200,54 +141,47 @@ class TestNeverEmpty:
             del builtins.load_scratchpad
             del builtins.save_scratchpad
 
-    def test_all_calls_fail_no_llm(self):
-        """Client raises on all calls, no LLM URL — must return template."""
+    def test_no_llm_returns_empty_code(self):
+        """No LLM URL — returns empty code (skip submission)."""
         challenge = _make_challenge("small", llm_url="", db_url="")
         client = MockClient(raise_on_call=True)
         result = self._run(challenge, client)
-        assert result["code"], "Code must not be empty"
-        ok, errors = validate_code(result["code"])
-        assert ok, f"Returned invalid code: {errors}"
+        assert result["code"] == ""
 
-    def test_all_calls_fail_with_llm(self):
-        """Client raises on all calls including LLM — must return template."""
+    def test_llm_failure_returns_empty_code(self):
+        """LLM raises — returns empty code (skip submission)."""
         challenge = _make_challenge("small", llm_url="http://fake-llm",
                                     db_url="http://fake-db")
         client = MockClient(raise_on_call=True)
         result = self._run(challenge, client)
-        assert result["code"], "Code must not be empty"
-        ok, errors = validate_code(result["code"])
-        assert ok, f"Returned invalid code: {errors}"
+        assert result["code"] == ""
 
-    def test_empty_frontier(self):
-        """Empty frontier — must still return valid code."""
+    def test_does_not_crash_without_llm(self):
+        """Agent returns a dict even when everything fails."""
         challenge = _make_challenge("medium", llm_url="", frontier=[])
         client = MockClient()
         result = self._run(challenge, client)
-        assert result["code"]
-        ok, _ = validate_code(result["code"])
-        assert ok
+        assert isinstance(result, dict)
+        assert "code" in result
+        assert "name" in result
 
-    def test_with_frontier(self):
-        """Frontier has members — must still return valid code."""
+    def test_does_not_crash_with_frontier(self):
+        """Agent handles frontier context without LLM gracefully."""
         frontier = [{"objectives": {"crps": 0.4}, "code": "x=1"}]
         challenge = _make_challenge("large", llm_url="", frontier=frontier)
         client = MockClient()
         result = self._run(challenge, client)
-        assert result["code"]
-        ok, _ = validate_code(result["code"])
-        assert ok
+        assert isinstance(result, dict)
 
-    def test_every_bucket_fallback(self):
-        """Each bucket produces valid fallback code when LLM is unavailable."""
+    def test_every_bucket_no_crash(self):
+        """Every bucket produces a result dict when LLM is unavailable."""
         from core.history import SIZE_BUCKETS
         for bucket in SIZE_BUCKETS:
             challenge = _make_challenge(bucket, llm_url="")
             client = MockClient()
             result = self._run(challenge, client)
-            assert result["code"], f"Empty code for bucket {bucket}"
-            ok, errors = validate_code(result["code"])
-            assert ok, f"Invalid code for bucket {bucket}: {errors}"
+            assert isinstance(result, dict), f"Non-dict result for bucket {bucket}"
+            assert "code" in result
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -616,9 +550,7 @@ class TestIntegration:
         ok, errors = validate_code(code)
         assert ok, f"Pipeline failed: {errors}"
 
-    def test_template_extract_validate(self):
-        """Templates pass through the full validation pipeline."""
-        for bucket in _TEMPLATES:
-            code = get_template(bucket)
-            ok, errors = validate_code(code)
-            assert ok, f"Template {bucket} pipeline failed: {errors}"
+    def test_valid_code_extract_validate(self):
+        """Valid code passes through the full validation pipeline."""
+        ok, errors = validate_code(VALID_CODE)
+        assert ok, f"Valid code pipeline failed: {errors}"

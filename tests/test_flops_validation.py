@@ -162,3 +162,35 @@ class TestValidateFlops:
         assert any("subprocess" in e for e in errors)
         # Should NOT also have FLOPs errors (structural errors skip FLOPs)
         assert not any("FLOPs" in e for e in errors)
+
+    def test_estimator_reads_task_params(self):
+        """Estimator uses task_params, not hardcoded defaults."""
+        challenge = {
+            "task": {"task_params": {"context_len": 512, "prediction_len": 96,
+                     "num_variates": 1,
+                     "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}},
+            "min_flops_equivalent": 500_000,
+            "max_flops_equivalent": 2_000_000,
+        }
+        flops, err = estimate_flops(SMALL_MODEL_CODE, challenge)
+        assert err == ""
+        assert flops is not None
+        # With V=1, nq=9, this should be well under 2M (not 109M as with V=370)
+        assert flops < 2_000_000, f"FLOPs {flops} should be < 2M with V=1, nq=9"
+
+    def test_different_variates_different_flops(self):
+        """Different num_variates in task_params produce different FLOPs."""
+        ch1 = {
+            "task": {"task_params": {"context_len": 512, "prediction_len": 96,
+                     "num_variates": 1,
+                     "quantiles": [0.1, 0.5, 0.9]}},
+        }
+        ch2 = {
+            "task": {"task_params": {"context_len": 512, "prediction_len": 96,
+                     "num_variates": 10,
+                     "quantiles": [0.1, 0.5, 0.9]}},
+        }
+        flops1, _ = estimate_flops(SMALL_MODEL_CODE, ch1)
+        flops2, _ = estimate_flops(SMALL_MODEL_CODE, ch2)
+        # More variates means more FLOPs (model processes each variate)
+        assert flops2 > flops1, f"V=10 ({flops2}) should have more FLOPs than V=1 ({flops1})"
