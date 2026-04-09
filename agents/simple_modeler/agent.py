@@ -7,13 +7,13 @@ from core import llm, db_client, validation, prompt_builder, history, tools
 
 STRATEGY_PREAMBLE = """\
 You are a pragmatic ML engineer. Your goal is simple: build a well-designed PyTorch model \
-for time-series forecasting that fits within the given FLOPs budget and produces good predictions.
+that fits within the given FLOPs budget and produces good predictions for the task described below.
 
 Do NOT overthink strategy. Do NOT try to game scoring. Just build a solid model:
-- Pick an appropriate architecture for the FLOPs budget
+- Pick an appropriate architecture for the FLOPs budget and task
 - Use standard best practices (LayerNorm, residual connections, proper init)
 - Set reasonable training hyperparameters (learning rate, batch size, epochs)
-- Make sure the output shape is exactly right
+- Make sure the output shape matches the task requirements exactly
 - Keep it clean and correct — a working simple model beats a broken clever one"""
 
 
@@ -39,22 +39,22 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
         f"Target around {target:,} FLOPs."
     )
 
-    # Dynamic sizing guidance from challenge parameters
+    # Generic sizing guidance from challenge parameters
     task = (challenge or {}).get("task", {})
     tp = task.get("task_params", {})
-    ctx = tp.get("context_len", 512)
-    pred = tp.get("prediction_len", 96)
-    nvar = tp.get("num_variates", 1)
-    nq = len(tp.get("quantiles", []))
 
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
-
-    parts.append(
-        f"A simple 2-layer channel-independent model can afford max hidden ~ {max_hidden}. "
-        f"More complex architectures must budget FLOPs across layers. "
-        f"Use the FLOPs formulas in the calculator section to verify your design fits."
-    )
+    if tp:
+        param_summary = ", ".join(f"{k}={v}" for k, v in tp.items())
+        parts.append(
+            f"Task parameters: {param_summary}.\n"
+            f"Size your model to fit within ~{target:,} FLOPs. "
+            f"Use the FLOPs formulas in the calculator section to verify your design fits."
+        )
+    else:
+        parts.append(
+            f"Size your model to fit within ~{target:,} FLOPs. "
+            f"Use the FLOPs formulas in the calculator section to verify your design fits."
+        )
 
     if frontier:
         # Just show what exists — don't tell the LLM to game anything

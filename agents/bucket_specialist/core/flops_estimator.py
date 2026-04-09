@@ -90,18 +90,34 @@ def _walk_flops(model: nn.Module, seq_len: int) -> int:
     return total
 
 
+# ── Input shape inference ──────────────────────────────────────
+
+
+def _infer_input_shape(tp: dict) -> list[int] | None:
+    """Try to determine model input shape from task_params."""
+    # Known task patterns
+    if "context_len" in tp and "num_variates" in tp:
+        return [1, int(tp["context_len"]), int(tp["num_variates"])]
+    # Generic fallback: use first two integer params
+    int_vals = [(k, v) for k, v in tp.items() if isinstance(v, int)]
+    if len(int_vals) >= 2:
+        return [1, int_vals[0][1], int_vals[1][1]]
+    elif len(int_vals) == 1:
+        return [1, int_vals[0][1]]
+    return None
+
+
 # ── Forward-pass hook estimation (primary path) ─────────────────
 
 
-def _forward_pass_flops(model: nn.Module, context_len: int,
-                        num_variates: int) -> tuple[int, str]:
+def _forward_pass_flops(model: nn.Module, input_shape: list[int]) -> tuple[int, str]:
     """Estimate FLOPs by running a forward pass with hooks.
 
     Registers hooks on compute-heavy leaf modules, runs the model with
-    batch_size=1, and sums the FLOPs each hook records from the *actual*
-    input tensor shape it receives.  This correctly handles internal
-    reshapes (e.g. channel-independent models that fold num_variates
-    into the batch dimension).
+    the given *input_shape* (including batch dim), and sums the FLOPs
+    each hook records from the *actual* input tensor shape it receives.
+    This correctly handles internal reshapes (e.g. channel-independent
+    models that fold variates into the batch dimension).
 
     Returns (total_flops, error_message).  error_message is empty on
     success.
@@ -171,7 +187,7 @@ def _forward_pass_flops(model: nn.Module, context_len: int,
     try:
         model.eval()
         with torch.no_grad():
-            dummy = torch.randn(1, context_len, num_variates)
+            dummy = torch.randn(*input_shape)
             model(dummy)
         return sum(flop_counts), ""
     except Exception as exc:
@@ -194,9 +210,6 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
     """
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    # Read from challenge — never hardcode task params
-    context_len = tp.get("context_len", 512)
-    num_variates = tp.get("num_variates", 1)
 
     # Execute the code in a restricted namespace
     namespace = {}
@@ -228,13 +241,16 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
         )
 
     # Primary: forward-pass hooks (accurate for models that reshape internally)
-    total_flops, fwd_err = _forward_pass_flops(model, context_len, num_variates)
-    if not fwd_err and total_flops >= 0:
-        del model
-        return total_flops, ""
+    input_shape = _infer_input_shape(tp)
+    if input_shape is not None:
+        total_flops, fwd_err = _forward_pass_flops(model, input_shape)
+        if not fwd_err and total_flops >= 0:
+            del model
+            return total_flops, ""
 
     # Fallback: static module-tree walk
-    seq_len = num_variates
+    int_vals = [v for v in tp.values() if isinstance(v, int)]
+    seq_len = int_vals[1] if len(int_vals) > 1 else max(int_vals[0], 1) if int_vals else 1
     total_flops = _walk_flops(model, seq_len)
 
     del model

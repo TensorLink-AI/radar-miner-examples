@@ -22,27 +22,20 @@ def _compute_bucket_guidance(bucket: str, flops_min: int, flops_max: int,
     """Compute dynamic sizing guidance for a bucket from the challenge."""
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    ctx = tp.get("context_len", 512)
-    pred = tp.get("prediction_len", 96)
-    nvar = tp.get("num_variates", 1)
-    quants = tp.get("quantiles", [])
-    nq = len(quants)
     target = int(flops_max * 0.6)
 
-    # Max hidden for a simple 2-layer channel-independent model
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
+    description = f"{flops_min:,}-{flops_max:,} FLOPs. Target ~{target:,} FLOPs."
+    if tp:
+        param_summary = ", ".join(f"{k}={v}" for k, v in tp.items())
+        description += f" Task parameters: {param_summary}."
 
     return {
-        "description": (
-            f"{flops_min:,}-{flops_max:,} FLOPs. Target ~{target:,} FLOPs. "
-            f"A 2-layer channel-independent model can afford max hidden ~ {max_hidden}."
-        ),
+        "description": description,
         "tips": [
-            f"Budget your FLOPs: nn.Linear(in, out) on (batch, seq, in) costs 2*in*out*seq",
-            f"If channel-independent (batch*V reshape), V={nvar} is already in the batch",
-            f"Self-attention costs 8*S*d^2 + 2*S^2*d — check if it fits your budget",
+            "Budget your FLOPs: nn.Linear(in, out) on (batch, seq, in) costs 2*in*out*seq",
+            "Self-attention costs 8*S*d^2 + 2*S^2*d -- check if it fits your budget",
             "Focus on training dynamics (LR schedule, warmup, init) as much as architecture",
+            f"Target ~{target:,} FLOPs -- size hidden dims and layer count accordingly",
         ],
     }
 

@@ -22,23 +22,21 @@ def _make_bootstrap_instructions(challenge: dict, flops_max: int) -> str:
     """Build budget-aware bootstrap instructions from the challenge."""
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    ctx = tp.get("context_len", 512)
-    pred = tp.get("prediction_len", 96)
-    nvar = tp.get("num_variates", 1)
-    nq = len(tp.get("quantiles", []))
     target = int(flops_max * 0.6)
 
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
-
-    return (
-        f"No frontier exists yet. Submit a strong, proven baseline:\n"
-        f"- Target {target:,} FLOPs (60% of max). "
-        f"A 2-layer channel-independent model can afford max hidden ~ {max_hidden}.\n"
-        f"- Use standard best practices: LayerNorm, residual connections, cosine LR schedule\n"
-        f"- Use the FLOPs formulas in the calculator section to self-check your design\n"
-        f"- Focus on reliability over novelty — be the baseline others must beat"
-    )
+    lines = [
+        f"No frontier exists yet. Submit a strong, proven baseline:",
+        f"- Target {target:,} FLOPs (60% of max).",
+    ]
+    if tp:
+        param_summary = ", ".join(f"{k}={v}" for k, v in tp.items())
+        lines.append(f"- Task parameters: {param_summary}. Size your model accordingly.")
+    lines += [
+        f"- Use standard best practices: LayerNorm, residual connections, cosine LR schedule",
+        f"- Use the FLOPs formulas in the calculator section to self-check your design",
+        f"- Focus on reliability over novelty — be the baseline others must beat",
+    ]
+    return "\n".join(lines)
 
 
 def get_frontier_for_bucket(challenge: dict) -> list[dict]:
