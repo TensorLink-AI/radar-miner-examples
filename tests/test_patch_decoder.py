@@ -38,7 +38,10 @@ def _scaling_for_bucket(bucket, num_variates=1,
         quantiles = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     bmin, bmax = SIZE_BUCKETS[bucket]
     challenge = {
-        "task": {"num_variates": num_variates, "quantiles": quantiles},
+        "task": {"task_params": {
+            "context_len": 512, "prediction_len": 96,
+            "num_variates": num_variates, "quantiles": quantiles,
+        }},
         "flops_budget": {"min": bmin, "max": bmax},
     }
     return _compute_scaling(challenge)
@@ -71,7 +74,11 @@ def _make_challenge(bucket="small"):
         "min_flops_equivalent": flops_min,
         "max_flops_equivalent": flops_max,
         "feasible_frontier": [],
-        "task": {},
+        "task": {"task_params": {
+            "context_len": 512, "prediction_len": 96,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        }},
         "db_url": "",
         "llm_url": "",
         "seed": 42,

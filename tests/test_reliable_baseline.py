@@ -66,7 +66,11 @@ def _make_challenge(bucket="small", llm_url="", db_url="", frontier=None):
         "min_flops_equivalent": flops_min,
         "max_flops_equivalent": flops_max,
         "feasible_frontier": frontier or [],
-        "task": {},
+        "task": {"task_params": {
+            "context_len": 512, "prediction_len": 96,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+        }},
         "db_url": db_url,
         "llm_url": llm_url,
         "seed": 42,
@@ -440,19 +444,19 @@ class TestLLMErrorHandling:
 class TestPromptBuilding:
     def test_harness_params_from_challenge(self):
         """Params come from challenge, with sensible defaults."""
-        challenge = {"task": {"num_variates": 1, "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}}
+        challenge = {"task": {"task_params": {"num_variates": 1, "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}}}
         ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
         assert nvar == 1
         assert nq == 9
         assert quants == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
     def test_harness_params_defaults(self):
-        """When challenge has no task fields, use defaults from flops_estimator."""
+        """When challenge has no task_params, use sensible defaults."""
         ctx, pred, nvar, quants, nq = _get_harness_params({"task": {}})
         assert ctx == 512
         assert pred == 96
-        assert nvar == 370
-        assert nq == 3
+        assert nvar == 1
+        assert nq == 9
 
     def test_system_prompt_contains_harness_values(self):
         challenge = _make_challenge("small")
@@ -464,7 +468,7 @@ class TestPromptBuilding:
 
     def test_user_prompt_contains_dynamic_values(self):
         challenge = _make_challenge("small")
-        challenge["task"] = {"num_variates": 1, "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}
+        challenge["task"] = {"task_params": {"num_variates": 1, "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}}
         context = {"frontier": [], "recent_experiments": {}, "failures": {},
                    "component_stats": {}, "dead_ends": {}, "history": [],
                    "bucket": "small", "target_flops": 1_100_000}

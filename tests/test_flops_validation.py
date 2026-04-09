@@ -14,28 +14,36 @@ from core.flops_estimator import estimate_flops
 from core.validation import validate
 
 
+# Standard task_params matching GIFT-Eval production
+_DEFAULT_TASK_PARAMS = {
+    "context_len": 512,
+    "prediction_len": 96,
+    "num_variates": 1,
+    "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+}
+
 # Challenge with a "small" bucket (500K-2M FLOPs)
 SMALL_BUCKET_CHALLENGE = {
-    "task": {"run_command": "python harness.py"},
+    "task": {"run_command": "python harness.py", "task_params": _DEFAULT_TASK_PARAMS},
     "flops_budget": {"min": 500_000, "max": 2_000_000},
 }
 
 # Challenge with a "tiny" bucket (100K-500K FLOPs)
 TINY_BUCKET_CHALLENGE = {
-    "task": {"run_command": "python harness.py"},
+    "task": {"run_command": "python harness.py", "task_params": _DEFAULT_TASK_PARAMS},
     "flops_budget": {"min": 100_000, "max": 500_000},
 }
 
 # Challenge with flat FLOPs fields
 FLAT_FLOPS_CHALLENGE = {
-    "task": {"run_command": "python harness.py"},
+    "task": {"run_command": "python harness.py", "task_params": _DEFAULT_TASK_PARAMS},
     "min_flops_equivalent": 500_000,
     "max_flops_equivalent": 2_000_000,
 }
 
 # Challenge with no FLOPs budget (validation should skip FLOPs check)
 NO_FLOPS_CHALLENGE = {
-    "task": {"run_command": "python harness.py"},
+    "task": {"run_command": "python harness.py", "task_params": _DEFAULT_TASK_PARAMS},
 }
 
 # A model that fits within the small bucket (~1M FLOPs)

@@ -7,12 +7,6 @@ Fallback: static module-tree walk (approximate but safe).
 import torch
 import torch.nn as nn
 
-# Default harness parameters (match the validator's documented interface)
-DEFAULT_CONTEXT_LEN = 512
-DEFAULT_PREDICTION_LEN = 96
-DEFAULT_NUM_VARIATES = 370
-DEFAULT_QUANTILES = [0.1, 0.5, 0.9]
-
 # Maximum parameter memory (bytes) we'll allow build_model to allocate.
 # 512 MB covers even the largest bucket (125M FLOPs) with headroom.
 _MAX_PARAM_BYTES = 512 * 1024 * 1024
@@ -199,10 +193,11 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
     On success error_message is empty. On failure estimated_flops is None.
     """
     task = challenge.get("task", {})
-    context_len = task.get("context_len", DEFAULT_CONTEXT_LEN)
-    prediction_len = task.get("prediction_len", DEFAULT_PREDICTION_LEN)
-    num_variates = task.get("num_variates", DEFAULT_NUM_VARIATES)
-    quantiles = task.get("quantiles", DEFAULT_QUANTILES)
+    tp = task.get("task_params", {})
+    context_len = tp.get("context_len", 512)
+    prediction_len = tp.get("prediction_len", 96)
+    num_variates = tp.get("num_variates", 1)
+    quantiles = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 
     # Execute the code in a restricted namespace
     namespace = {}

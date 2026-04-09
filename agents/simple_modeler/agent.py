@@ -41,10 +41,11 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
 
     # Dynamic sizing guidance from challenge parameters
     task = (challenge or {}).get("task", {})
-    ctx = task.get("context_len", 512)
-    pred = task.get("prediction_len", 96)
-    nvar = task.get("num_variates", 370)
-    nq = len(task.get("quantiles", [0.1, 0.5, 0.9]))
+    tp = task.get("task_params", {})
+    ctx = tp.get("context_len", 512)
+    pred = tp.get("prediction_len", 96)
+    nvar = tp.get("num_variates", 1)
+    nq = len(tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
 
     denom = 2 * nvar * (ctx + pred * nq)
     max_hidden = target // denom if denom > 0 else 0

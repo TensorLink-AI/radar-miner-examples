@@ -6,20 +6,15 @@ defaults matching flops_estimator.py.  Nothing is hardcoded.
 
 from core.history import extract_flops_budget, format_history
 
-# Defaults matching flops_estimator.py — only used when challenge omits a field
-_DEFAULT_CONTEXT_LEN = 512
-_DEFAULT_PREDICTION_LEN = 96
-_DEFAULT_NUM_VARIATES = 370
-_DEFAULT_QUANTILES = [0.1, 0.5, 0.9]
-
 
 def _get_harness_params(challenge: dict) -> tuple[int, int, int, list, int]:
     """Extract harness parameters from the challenge, with defaults."""
     task = challenge.get("task", {})
-    ctx = task.get("context_len", _DEFAULT_CONTEXT_LEN)
-    pred = task.get("prediction_len", _DEFAULT_PREDICTION_LEN)
-    nvar = task.get("num_variates", _DEFAULT_NUM_VARIATES)
-    quants = task.get("quantiles", _DEFAULT_QUANTILES)
+    tp = task.get("task_params", {})
+    ctx = tp.get("context_len", 512)
+    pred = tp.get("prediction_len", 96)
+    nvar = tp.get("num_variates", 1)
+    quants = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
     nq = len(quants)
     return ctx, pred, nvar, quants, nq
 
