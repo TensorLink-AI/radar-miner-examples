@@ -59,7 +59,7 @@ def _compute_scaling(challenge: dict) -> dict:
     context_len = tp.get("context_len", 512)
     prediction_len = tp.get("prediction_len", 96)
     num_variates = tp.get("num_variates", 1)
-    quantiles = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    quantiles = tp.get("quantiles", [])
 
     flops_min, flops_max = history.extract_flops_budget(challenge)
     target = int(flops_max * 0.6)
@@ -132,7 +132,7 @@ def _generate_code(cfg: dict, task_params: dict | None = None) -> str:
     bs = cfg["batch_size"]
     ga = cfg["grad_accum"]
 
-    param_str = ", ".join(task_params.keys()) if task_params else "context_len, prediction_len, num_variates, quantiles"
+    param_str = ", ".join(task_params.keys()) if task_params else "**task_params"
 
     return textwrap.dedent(f"""\
         import torch

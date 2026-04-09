@@ -45,7 +45,7 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
     ctx = tp.get("context_len", 512)
     pred = tp.get("prediction_len", 96)
     nvar = tp.get("num_variates", 1)
-    nq = len(tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
+    nq = len(tp.get("quantiles", []))
 
     denom = 2 * nvar * (ctx + pred * nq)
     max_hidden = target // denom if denom > 0 else 0
@@ -91,7 +91,11 @@ def design_architecture(challenge: dict, client) -> dict:
           f"target: {target_flops:,}", file=sys.stderr)
 
     # Load scratchpad
-    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    scratch_dir = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    except Exception as exc:
+        print(f"[simple] scratchpad load failed: {exc}", file=sys.stderr)
     state = history.load_state(scratch_dir) if scratch_dir else {}
 
     # Get frontier
@@ -241,7 +245,10 @@ def design_architecture(challenge: dict, client) -> dict:
     )
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)
-    save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    try:
+        save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    except Exception as exc:
+        print(f"[simple] scratchpad save failed: {exc}", file=sys.stderr)
 
     return {
         "code": code,

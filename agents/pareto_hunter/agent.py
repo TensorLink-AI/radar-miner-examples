@@ -152,11 +152,17 @@ def design_architecture(challenge: dict, client) -> dict:
           f"target: {target_flops:,}", file=sys.stderr)
 
     # Load scratchpad state (load_scratchpad is injected by harness)
-    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    scratch_dir = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    except Exception as exc:
+        print(f"[pareto] scratchpad load failed: {exc}", file=sys.stderr)
     state = history.load_state(scratch_dir) if scratch_dir else {}
     print(f"[pareto] Scratchpad loaded: {len(state)} keys", file=sys.stderr)
 
     frontier = challenge.get("feasible_frontier", [])
+    if not frontier:
+        frontier = challenge.get("pareto_frontier", [])
     if not isinstance(frontier, list):
         frontier = []
     print(f"[pareto] Frontier members: {len(frontier)}", file=sys.stderr)
@@ -310,7 +316,10 @@ def design_architecture(challenge: dict, client) -> dict:
     )
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)
-    save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    try:
+        save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    except Exception as exc:
+        print(f"[pareto] scratchpad save failed: {exc}", file=sys.stderr)
 
     return {
         "code": code,

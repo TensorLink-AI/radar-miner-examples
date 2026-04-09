@@ -14,7 +14,7 @@ def _get_harness_params(challenge: dict) -> tuple[int, int, int, list, int]:
     ctx = tp.get("context_len", 512)
     pred = tp.get("prediction_len", 96)
     nvar = tp.get("num_variates", 1)
-    quants = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    quants = tp.get("quantiles", [])
     nq = len(quants)
     return ctx, pred, nvar, quants, nq
 

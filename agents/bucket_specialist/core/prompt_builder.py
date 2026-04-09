@@ -16,7 +16,7 @@ def _compute_sizing_guidance(challenge: dict) -> str:
     ctx_len = tp.get("context_len", 512)
     pred_len = tp.get("prediction_len", 96)
     n_var = tp.get("num_variates", 1)
-    q_list = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    q_list = tp.get("quantiles", [])
     n_q = len(q_list)
 
     flops_min, flops_max = extract_flops_budget(challenge)
@@ -142,7 +142,7 @@ def build_user_prompt(challenge: dict, *,
     ctx_len = tp.get("context_len", 512)
     pred_len = tp.get("prediction_len", 96)
     n_var = tp.get("num_variates", 1)
-    q_list = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+    q_list = tp.get("quantiles", [])
     n_q = len(q_list)
     param_str = ", ".join(tp.keys()) if tp else "**task_params"
     parts.append(
