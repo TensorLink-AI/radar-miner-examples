@@ -4,6 +4,56 @@ import json
 from core.history import extract_flops_budget
 
 
+def _compute_sizing_guidance(challenge: dict) -> str:
+    """Build architecture-agnostic FLOPs calculator section from the challenge.
+
+    Teaches the LLM how to estimate FLOPs for common PyTorch primitives and
+    provides budget-derived sizing constraints.  Does NOT prescribe any
+    specific architecture.
+    """
+    task = challenge.get("task", {})
+    ctx_len = task.get("context_len", 512)
+    pred_len = task.get("prediction_len", 96)
+    n_var = task.get("num_variates", 370)
+    q_list = task.get("quantiles", [0.1, 0.5, 0.9])
+    n_q = len(q_list)
+
+    flops_min, flops_max = extract_flops_budget(challenge)
+    target = int(flops_max * 0.6) if flops_max else 0
+    gate_min = int(flops_min * 0.9) if flops_min else 0
+    gate_max = int(flops_max * 1.1) if flops_max else 0
+
+    # Compute max_hidden for a simple 2-layer channel-independent model
+    # Linear(ctx_len, H) + Linear(H, pred*nq) per variate
+    # FLOPs = V * 2 * (ctx_len * H + H * pred * nq) ≈ V * 2 * H * (ctx_len + pred*nq)
+    denom = 2 * n_var * (ctx_len + pred_len * n_q)
+    max_hidden = target // denom if denom > 0 else 0
+
+    lines = [
+        "### FLOPs Calculator (use this to self-check your design)",
+        "",
+        "**FLOPs formulas for common ops** (multiply-accumulate = 2 FLOPs per MAC):",
+        f"- `nn.Linear(in, out)` on input `(batch, seq, in)` -> `2 * in * out * seq` FLOPs",
+        f"- `nn.Conv1d(C_in, C_out, K)` on length L -> `2 * C_in * K * C_out * L_out` FLOPs",
+        f"- `nn.MultiheadAttention(d, heads)` on seq S -> `8 * S * d^2 + 2 * S^2 * d` FLOPs",
+        "- Note: if your model reshapes to `(batch * V, ...)`, the V factor is already in "
+        "the batch -- do NOT double-count V in the per-layer formula",
+        "",
+        "**Budget summary:**",
+        f"- Target FLOPs: {target:,} (60% of max)",
+        f"- Hard gate: [{gate_min:,}, {gate_max:,}] (10% tolerance of [{flops_min:,}, {flops_max:,}])",
+        f"- context_len={ctx_len}, num_variates={n_var}, prediction_len={pred_len}, "
+        f"len(quantiles)={n_q}",
+        "",
+        "**Quick sizing reference** (computed from this budget):",
+        f"- A simple 2-layer channel-independent model (Linear->ReLU->Linear) can afford "
+        f"max hidden ~ {max_hidden}.",
+        "- More complex architectures must budget FLOPs across their layers accordingly.",
+        "- ALWAYS verify your total FLOPs against the gate range before finalizing.",
+    ]
+    return "\n".join(lines)
+
+
 def build_system_prompt(challenge: dict, strategy_preamble: str = "") -> str:
     """Build system prompt from challenge task fields + strategy overlay."""
     task = challenge.get("task", {})
@@ -78,9 +128,7 @@ def build_user_prompt(challenge: dict, *,
         "   - Must return an nn.Module\n"
         f"   - Forward input shape:  (batch, {ctx_len}, {n_var})\n"
         f"   - Forward output shape: (batch, {pred_len}, {n_var}, {n_q})  "
-        "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n"
-        f"   - Note: num_variates={n_var} serves as the sequence dimension for "
-        "FLOPs counting\n\n"
+        "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n\n"
         "2. `def build_optimizer(model):`\n"
         "   - Takes the model returned by build_model()\n"
         "   - Must return a torch.optim.Optimizer\n\n"
@@ -106,6 +154,10 @@ def build_user_prompt(challenge: dict, *,
         "    return torch.optim.Adam(model.parameters(), lr=1e-3)\n"
         "```"
     )
+
+    # Dynamic FLOPs calculator section
+    sizing = _compute_sizing_guidance(challenge)
+    parts.append(sizing)
 
     if strategy_instructions:
         parts.append(f"### Strategy\n{strategy_instructions}")

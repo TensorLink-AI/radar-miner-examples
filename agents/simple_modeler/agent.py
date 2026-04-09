@@ -27,7 +27,8 @@ def get_frontier(challenge: dict) -> list[dict]:
 
 def build_strategy_instructions(frontier: list[dict], state: dict,
                                 bucket: str, flops_min: int,
-                                flops_max: int) -> str:
+                                flops_max: int,
+                                challenge: dict | None = None) -> str:
     """Build simple, direct instructions — no over-strategising."""
     target = int(flops_max * 0.6)
     parts = []
@@ -38,29 +39,21 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
         f"Target around {target:,} FLOPs."
     )
 
-    # Simple size-based guidance
-    if bucket == "tiny":
-        parts.append(
-            "This is a very small budget. Use a lightweight model: "
-            "linear layers, small MLPs, or simple conv layers. "
-            "Avoid attention — it's too expensive here."
-        )
-    elif bucket == "small":
-        parts.append(
-            "Small budget. A 1-2 layer model with small hidden dims (32-64) works well. "
-            "Linear attention or conv+MLP mixers are good choices."
-        )
-    elif bucket in ("medium_small", "medium"):
-        parts.append(
-            "Medium budget. You can use a multi-layer transformer with attention, "
-            "residual connections, and normalization. 2-6 layers, hidden dim 64-256."
-        )
-    elif bucket == "large":
-        parts.append(
-            "Large budget. Full transformer architectures work well. "
-            "6-12 layers, hidden dim 256-512, multi-head attention. "
-            "Focus on training dynamics (LR schedule, warmup)."
-        )
+    # Dynamic sizing guidance from challenge parameters
+    task = (challenge or {}).get("task", {})
+    ctx = task.get("context_len", 512)
+    pred = task.get("prediction_len", 96)
+    nvar = task.get("num_variates", 370)
+    nq = len(task.get("quantiles", [0.1, 0.5, 0.9]))
+
+    denom = 2 * nvar * (ctx + pred * nq)
+    max_hidden = target // denom if denom > 0 else 0
+
+    parts.append(
+        f"A simple 2-layer channel-independent model can afford max hidden ~ {max_hidden}. "
+        f"More complex architectures must budget FLOPs across layers. "
+        f"Use the FLOPs formulas in the calculator section to verify your design fits."
+    )
 
     if frontier:
         # Just show what exists — don't tell the LLM to game anything
@@ -114,7 +107,8 @@ def design_architecture(challenge: dict, client) -> dict:
     # Build prompts
     llm_url = challenge.get("llm_url", "")
     strategy_instr = build_strategy_instructions(
-        frontier, state, bucket, flops_min, flops_max
+        frontier, state, bucket, flops_min, flops_max,
+        challenge=challenge,
     )
     frontier_ctx = prompt_builder.format_frontier(frontier, max_entries=3)
     db_ctx = prompt_builder.format_db_context(recent, failures, comp_stats, dead)

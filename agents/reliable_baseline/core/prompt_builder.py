@@ -1,52 +1,92 @@
 """Build rich context prompts for the LLM.
 
-CRITICAL: Hardcode correct values for num_variates=1 and
-quantiles=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9].
-Do NOT trust challenge["task"].get() with wrong defaults.
+All harness parameters are read from the challenge dict, with sensible
+defaults matching flops_estimator.py.  Nothing is hardcoded.
 """
 
 from core.history import extract_flops_budget, format_history
 
-# Correct harness values — hardcoded, not from task.get() with wrong defaults
-CONTEXT_LEN = 512
-PREDICTION_LEN = 96
-NUM_VARIATES = 1
-QUANTILES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-N_QUANTILES = len(QUANTILES)  # 9
+# Defaults matching flops_estimator.py — only used when challenge omits a field
+_DEFAULT_CONTEXT_LEN = 512
+_DEFAULT_PREDICTION_LEN = 96
+_DEFAULT_NUM_VARIATES = 370
+_DEFAULT_QUANTILES = [0.1, 0.5, 0.9]
 
-BUCKET_STRATEGIES = {
-    "tiny": (
-        "For this TINY bucket (~275K FLOPs), use a simple linear mixer or MLP. "
-        "No attention — it is too expensive. Focus on: efficient linear projections, "
-        "RevIN normalization, good weight init. A 2-layer MLP with small hidden dim "
-        "(16-32) works well."
-    ),
-    "small": (
-        "For this SMALL bucket (~1.1M FLOPs), use lightweight conv + linear. "
-        "A 1D conv for local patterns plus a linear mixer for global patterns. "
-        "Hidden dim 32-48, kernel size 5-9. Include RevIN."
-    ),
-    "medium_small": (
-        "For this MEDIUM_SMALL bucket (~5.5M FLOPs), PatchTST-style architecture "
-        "works well: patch the input into segments, apply a small transformer "
-        "(2-3 layers, d_model=64, 4 heads). Include RevIN and cosine LR warmup."
-    ),
-    "medium": (
-        "For this MEDIUM bucket (~27M FLOPs), use a multi-layer transformer with "
-        "patching (3-4 layers, d_model=128, 4 heads, ff=256). Include RevIN, "
-        "warmup + cosine schedule, and Xavier init."
-    ),
-    "large": (
-        "For this LARGE bucket (~69M FLOPs), use a full transformer (4-6 layers, "
-        "d_model=192-256, 8 heads). Include RevIN, warmup + cosine schedule, "
-        "gradient clipping, and Xavier init. Consider adding a projection head."
-    ),
-}
+
+def _get_harness_params(challenge: dict) -> tuple[int, int, int, list, int]:
+    """Extract harness parameters from the challenge, with defaults."""
+    task = challenge.get("task", {})
+    ctx = task.get("context_len", _DEFAULT_CONTEXT_LEN)
+    pred = task.get("prediction_len", _DEFAULT_PREDICTION_LEN)
+    nvar = task.get("num_variates", _DEFAULT_NUM_VARIATES)
+    quants = task.get("quantiles", _DEFAULT_QUANTILES)
+    nq = len(quants)
+    return ctx, pred, nvar, quants, nq
+
+
+def _compute_bucket_strategy(challenge: dict, bucket: str) -> str:
+    """Generate architecture-agnostic sizing guidance from the challenge budget.
+
+    Instead of prescribing specific architectures, computes budget-derived
+    constraints the LLM can use to size whatever model it builds.
+    """
+    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
+    flops_min, flops_max = extract_flops_budget(challenge)
+    target = int(flops_max * 0.55) if flops_max else 0
+
+    # Max hidden for a simple 2-layer channel-independent model:
+    # FLOPs = V * 2 * H * (ctx + pred * nq)
+    denom = 2 * nvar * (ctx + pred * nq)
+    max_hidden = target // denom if denom > 0 else 0
+
+    return (
+        f"For this '{bucket}' bucket ({flops_min:,}-{flops_max:,} FLOPs), "
+        f"target ~{target:,} FLOPs (55% of max). "
+        f"A simple 2-layer channel-independent model can afford max hidden ~ {max_hidden}. "
+        f"More complex architectures must budget FLOPs across their layers. "
+        f"Choose whatever architecture best fits this budget — the estimator "
+        f"measures actual forward-pass FLOPs, so any standard PyTorch ops work."
+    )
+
+
+def _compute_sizing_guidance(challenge: dict) -> str:
+    """Build architecture-agnostic FLOPs calculator section."""
+    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
+    flops_min, flops_max = extract_flops_budget(challenge)
+    target = int(flops_max * 0.55) if flops_max else 0
+    gate_min = int(flops_min * 0.9) if flops_min else 0
+    gate_max = int(flops_max * 1.1) if flops_max else 0
+
+    denom = 2 * nvar * (ctx + pred * nq)
+    max_hidden = target // denom if denom > 0 else 0
+
+    lines = [
+        "## FLOPs Calculator",
+        "",
+        "**FLOPs formulas for common ops:**",
+        "- `nn.Linear(in, out)` on input `(batch, seq, in)` -> `2 * in * out * seq` FLOPs",
+        "- `nn.Conv1d(C_in, C_out, K)` on length L -> `2 * C_in * K * C_out * L_out` FLOPs",
+        "- `nn.MultiheadAttention(d, heads)` on seq S -> `8 * S * d^2 + 2 * S^2 * d` FLOPs",
+        "- Note: if your model reshapes to `(batch * V, ...)`, V is already in the batch "
+        "-- do NOT double-count",
+        "",
+        "**Budget summary:**",
+        f"- Target FLOPs: {target:,} (55% of max)",
+        f"- Hard gate: [{gate_min:,}, {gate_max:,}]",
+        f"- context_len={ctx}, num_variates={nvar}, prediction_len={pred}, "
+        f"len(quantiles)={nq}",
+        "",
+        "**Quick sizing:**",
+        f"- A simple 2-layer model can afford max hidden ~ {max_hidden}.",
+        "- ALWAYS verify your total FLOPs against the gate range.",
+    ]
+    return "\n".join(lines)
 
 
 def build_system_prompt(challenge: dict) -> str:
     """Build system prompt with domain context and hard constraints."""
     task = challenge.get("task", {})
+    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
     parts: list[str] = []
 
     parts.append(
@@ -55,10 +95,10 @@ def build_system_prompt(challenge: dict) -> str:
         "Your code runs inside a frozen training harness. You MUST define:\n"
         "- def build_model(context_len, prediction_len, num_variates, quantiles) -> nn.Module\n"
         "- def build_optimizer(model) -> Optimizer\n\n"
-        f"The harness calls build_model({CONTEXT_LEN}, {PREDICTION_LEN}, "
-        f"{NUM_VARIATES}, {QUANTILES}).\n"
-        f"Input shape: (batch, {CONTEXT_LEN}, {NUM_VARIATES}). "
-        f"Output shape: (batch, {PREDICTION_LEN}, {NUM_VARIATES}, {N_QUANTILES})."
+        f"The harness calls build_model({ctx}, {pred}, "
+        f"{nvar}, {quants}).\n"
+        f"Input shape: (batch, {ctx}, {nvar}). "
+        f"Output shape: (batch, {pred}, {nvar}, {nq})."
     )
 
     domain = task.get("domain_system_prompt", "")
@@ -97,6 +137,7 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
     """Build the user prompt with budget, frontier, DB context, and history."""
     parts: list[str] = []
 
+    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = context.get("bucket", "unknown")
     target = context.get("target_flops", int(flops_max * 0.55))
@@ -110,7 +151,7 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
         f"Hard gate: [{gate_min:,}, {gate_max:,}] (10% tolerance)"
     )
 
-    # Required interface with CORRECT values
+    # Required interface with values from the challenge
     parts.append(
         "## Required Output Structure\n"
         "```python\n"
@@ -121,18 +162,21 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
         "        super().__init__()\n"
         "        # ... your architecture ...\n"
         "    def forward(self, x):\n"
-        f"        # x: (batch, context_len, num_variates) = (batch, {CONTEXT_LEN}, {NUM_VARIATES})\n"
+        f"        # x: (batch, context_len, num_variates) = (batch, {ctx}, {nvar})\n"
         f"        # return: (batch, prediction_len, num_variates, len(quantiles)) = "
-        f"(batch, {PREDICTION_LEN}, {NUM_VARIATES}, {N_QUANTILES})\n"
+        f"(batch, {pred}, {nvar}, {nq})\n"
         "        ...\n\n"
         "def build_model(context_len, prediction_len, num_variates, quantiles):\n"
         "    return YourModel(context_len, prediction_len, num_variates, quantiles)\n\n"
         "def build_optimizer(model):\n"
         "    return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)\n"
         "```\n\n"
-        f"IMPORTANT: num_variates={NUM_VARIATES}, len(quantiles)={N_QUANTILES}.\n"
-        f"quantiles = {QUANTILES}"
+        f"IMPORTANT: num_variates={nvar}, len(quantiles)={nq}.\n"
+        f"quantiles = {quants}"
     )
+
+    # Dynamic FLOPs calculator
+    parts.append(_compute_sizing_guidance(challenge))
 
     # Frontier context
     frontier = context.get("frontier", [])
@@ -162,8 +206,8 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
     if tool_analysis:
         parts.append(f"## Database Research Findings\n{tool_analysis}")
 
-    # Strategy
-    strategy = BUCKET_STRATEGIES.get(bucket, "")
+    # Strategy — computed from the challenge, not a hardcoded dict
+    strategy = _compute_bucket_strategy(challenge, bucket)
     if strategy:
         parts.append(f"## Strategy\n{strategy}")
 

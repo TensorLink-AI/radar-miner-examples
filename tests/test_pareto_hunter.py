@@ -7,6 +7,10 @@ import os
 # Load the agent module with a unique name to avoid cache collisions
 _agent_dir = os.path.join(os.path.dirname(__file__), "..", "agents", "pareto_hunter")
 sys.path.insert(0, _agent_dir)
+# Clear cached core modules to ensure correct resolution
+for _k in list(sys.modules.keys()):
+    if _k == "core" or _k.startswith("core."):
+        del sys.modules[_k]
 _spec = importlib.util.spec_from_file_location(
     "pareto_hunter_agent", os.path.join(_agent_dir, "agent.py"))
 _mod = importlib.util.module_from_spec(_spec)

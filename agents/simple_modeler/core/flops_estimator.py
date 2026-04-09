@@ -1,12 +1,7 @@
-"""Estimate FLOPs for generated model code via static module-tree analysis.
+"""Estimate FLOPs for generated model code.
 
-Instead of running a forward pass (which can OOM on large models or execute
-arbitrary code paths), we instantiate the model and walk its nn.Module tree,
-computing FLOPs from weight shapes and the known input dimensions.
-
-For layers whose output shape depends on the input (Conv, Attention), we
-propagate shapes symbolically through the tree.  This is approximate but safe
-— no tensors are allocated beyond the model parameters themselves.
+Primary method: forward-pass hooks that observe actual tensor shapes.
+Fallback: static module-tree walk (approximate but safe).
 """
 
 import torch
@@ -21,6 +16,9 @@ DEFAULT_QUANTILES = [0.1, 0.5, 0.9]
 # Maximum parameter memory (bytes) we'll allow build_model to allocate.
 # 512 MB covers even the largest bucket (125M FLOPs) with headroom.
 _MAX_PARAM_BYTES = 512 * 1024 * 1024
+
+
+# ── Static helpers (fallback path) ──────────────────────────────
 
 
 def _static_linear_flops(module: nn.Linear, seq_len: int) -> int:
@@ -68,32 +66,25 @@ def _count_param_bytes(model: nn.Module) -> int:
 
 
 def _walk_flops(model: nn.Module, seq_len: int) -> int:
-    """Walk the module tree and sum FLOPs from leaf layers.
+    """Walk the module tree and sum FLOPs from leaf layers (fallback).
 
-    Uses seq_len as the token/sequence dimension (num_variates for our harness,
-    since the input is transposed to (batch, num_variates, context_len) before
-    hitting Linear layers, or kept as (batch, context_len, num_variates)).
-
-    We count each leaf module once. For simplicity we assume the sequence
-    dimension is preserved (true for most time-series architectures that avoid
-    pooling). This is approximate but sufficient for bucket gate-keeping.
+    Uses seq_len as the token/sequence dimension.  This is approximate —
+    it cannot account for internal reshapes that change the effective
+    sequence length seen by inner layers.
     """
     total = 0
     for m in model.modules():
-        # Only count leaf-ish modules (the ones that do actual compute)
         if isinstance(m, nn.Linear):
             total += _static_linear_flops(m, seq_len)
         elif isinstance(m, nn.Conv1d):
             total += _static_conv1d_flops(m, seq_len)
         elif isinstance(m, nn.Conv2d):
-            # Assume spatial dims are roughly sqrt(seq_len) x sqrt(seq_len)
             side = max(int(seq_len ** 0.5), 1)
             total += _static_conv2d_flops(m, side, side)
         elif isinstance(m, nn.MultiheadAttention):
             total += _static_mha_flops(m, seq_len)
         elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d,
                             nn.GroupNorm, nn.InstanceNorm1d)):
-            # ~2 ops per element (normalize + scale/shift)
             norm_features = getattr(m, 'normalized_shape', None)
             if isinstance(norm_features, (list, tuple)):
                 elem = 1
@@ -105,8 +96,104 @@ def _walk_flops(model: nn.Module, seq_len: int) -> int:
     return total
 
 
+# ── Forward-pass hook estimation (primary path) ─────────────────
+
+
+def _forward_pass_flops(model: nn.Module, context_len: int,
+                        num_variates: int) -> tuple[int, str]:
+    """Estimate FLOPs by running a forward pass with hooks.
+
+    Registers hooks on compute-heavy leaf modules, runs the model with
+    batch_size=1, and sums the FLOPs each hook records from the *actual*
+    input tensor shape it receives.  This correctly handles internal
+    reshapes (e.g. channel-independent models that fold num_variates
+    into the batch dimension).
+
+    Returns (total_flops, error_message).  error_message is empty on
+    success.
+    """
+    flop_counts: list[int] = []
+    hooks: list[torch.utils.hooks.RemovableHook] = []
+
+    # -- hook closures ---------------------------------------------------
+
+    def _linear_hook(module, inp, out):
+        x = inp[0]
+        # all dims except the feature (last) dim
+        batch_elements = x.numel() // x.shape[-1]
+        flop_counts.append(2 * module.in_features * module.out_features * batch_elements)
+
+    def _conv1d_hook(module, inp, out):
+        x = inp[0]
+        batch_size = x.shape[0]
+        k = module.kernel_size[0] if isinstance(module.kernel_size, tuple) else module.kernel_size
+        out_len = out.shape[2]
+        flop_counts.append(
+            2 * module.in_channels * k * module.out_channels * out_len * batch_size // module.groups
+        )
+
+    def _conv2d_hook(module, inp, out):
+        x = inp[0]
+        batch_size = x.shape[0]
+        kh, kw = (module.kernel_size if isinstance(module.kernel_size, tuple)
+                   else (module.kernel_size, module.kernel_size))
+        oh, ow = out.shape[2], out.shape[3]
+        flop_counts.append(
+            2 * module.in_channels * kh * kw * module.out_channels * oh * ow * batch_size // module.groups
+        )
+
+    def _mha_hook(module, inp, out):
+        q = inp[0]
+        if module.batch_first:
+            batch_size, seq_len = q.shape[0], q.shape[1]
+        else:
+            seq_len, batch_size = q.shape[0], q.shape[1]
+        d = module.embed_dim
+        proj_flops = 4 * 2 * seq_len * d * d * batch_size
+        attn_flops = 2 * seq_len * seq_len * d * batch_size
+        flop_counts.append(proj_flops + attn_flops)
+
+    def _norm_hook(module, inp, out):
+        x = inp[0]
+        flop_counts.append(2 * x.numel())
+
+    # -- register hooks --------------------------------------------------
+
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            hooks.append(m.register_forward_hook(_linear_hook))
+        elif isinstance(m, nn.Conv1d):
+            hooks.append(m.register_forward_hook(_conv1d_hook))
+        elif isinstance(m, nn.Conv2d):
+            hooks.append(m.register_forward_hook(_conv2d_hook))
+        elif isinstance(m, nn.MultiheadAttention):
+            hooks.append(m.register_forward_hook(_mha_hook))
+        elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d,
+                            nn.GroupNorm, nn.InstanceNorm1d)):
+            hooks.append(m.register_forward_hook(_norm_hook))
+
+    # -- run forward pass ------------------------------------------------
+
+    try:
+        model.eval()
+        with torch.no_grad():
+            dummy = torch.randn(1, context_len, num_variates)
+            model(dummy)
+        return sum(flop_counts), ""
+    except Exception as exc:
+        return 0, f"Forward pass failed: {exc}"
+    finally:
+        for h in hooks:
+            h.remove()
+
+
+# ── Public API ───────────────────────────────────────────────────
+
+
 def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
-    """Execute build_model, then statically estimate FLOPs from the module tree.
+    """Execute build_model, estimate FLOPs via forward-pass hooks.
+
+    Falls back to static module-tree walk if the forward pass fails.
 
     Returns (estimated_flops, error_message).
     On success error_message is empty. On failure estimated_flops is None.
@@ -128,7 +215,7 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
     if not callable(build_model_fn):
         return None, "build_model not found or not callable"
 
-    # Instantiate the model (weights only — no input tensors)
+    # Instantiate the model
     try:
         model = build_model_fn(context_len, prediction_len, num_variates, quantiles)
     except Exception as exc:
@@ -137,7 +224,7 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
     if not isinstance(model, nn.Module):
         return None, "build_model() did not return an nn.Module"
 
-    # Safety check: reject models that are absurdly large before walking
+    # Safety check: reject models that are absurdly large
     param_bytes = _count_param_bytes(model)
     if param_bytes > _MAX_PARAM_BYTES:
         del model
@@ -146,9 +233,13 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
             f"exceeding the {_MAX_PARAM_BYTES // (1024**2)} MB safety limit"
         )
 
-    # Static FLOPs estimate — walk module tree, no forward pass needed.
-    # Use num_variates as the sequence dimension (harness transposes input
-    # to (batch, num_variates, context_len) before the first Linear).
+    # Primary: forward-pass hooks (accurate for models that reshape internally)
+    total_flops, fwd_err = _forward_pass_flops(model, context_len, num_variates)
+    if not fwd_err and total_flops >= 0:
+        del model
+        return total_flops, ""
+
+    # Fallback: static module-tree walk
     seq_len = num_variates
     total_flops = _walk_flops(model, seq_len)
 

@@ -18,11 +18,26 @@ Key rules:
 - NEVER change the model architecture dramatically — only tune the training dynamics
 - Keep FLOPs within budget — do NOT add layers or increase hidden dims"""
 
-BOOTSTRAP_INSTRUCTIONS = """No frontier exists yet. Submit a strong, proven baseline:
-- For time-series: a simple but well-tuned model (linear mixer, small transformer, or patch-based)
-- Use standard best practices: LayerNorm, residual connections, cosine LR schedule
-- Target 60% of max FLOPs to stay safely in range
-- Focus on reliability over novelty — be the baseline others must beat"""
+def _make_bootstrap_instructions(challenge: dict, flops_max: int) -> str:
+    """Build budget-aware bootstrap instructions from the challenge."""
+    task = challenge.get("task", {})
+    ctx = task.get("context_len", 512)
+    pred = task.get("prediction_len", 96)
+    nvar = task.get("num_variates", 370)
+    nq = len(task.get("quantiles", [0.1, 0.5, 0.9]))
+    target = int(flops_max * 0.6)
+
+    denom = 2 * nvar * (ctx + pred * nq)
+    max_hidden = target // denom if denom > 0 else 0
+
+    return (
+        f"No frontier exists yet. Submit a strong, proven baseline:\n"
+        f"- Target {target:,} FLOPs (60% of max). "
+        f"A 2-layer channel-independent model can afford max hidden ~ {max_hidden}.\n"
+        f"- Use standard best practices: LayerNorm, residual connections, cosine LR schedule\n"
+        f"- Use the FLOPs formulas in the calculator section to self-check your design\n"
+        f"- Focus on reliability over novelty — be the baseline others must beat"
+    )
 
 
 def get_frontier_for_bucket(challenge: dict) -> list[dict]:
@@ -64,7 +79,8 @@ def analyze_frontier(frontier: list[dict]) -> str:
 
 
 def build_strategy_instructions(frontier: list[dict], state: dict,
-                                bucket: str) -> str:
+                                bucket: str, challenge: dict | None = None,
+                                flops_max: int = 0) -> str:
     """Build strategy-specific instructions for the user prompt."""
     bucket_history = history.get_bucket_history(state, bucket)
     hist_text = history.format_history(bucket_history, max_entries=5)
@@ -80,7 +96,7 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
         )
         parts.append(analyze_frontier(frontier))
     else:
-        parts.append(BOOTSTRAP_INSTRUCTIONS)
+        parts.append(_make_bootstrap_instructions(challenge or {}, flops_max))
 
     if playbook:
         parts.append(f"### Bucket Playbook (from previous rounds)\n{playbook}")
@@ -135,7 +151,9 @@ def design_architecture(challenge: dict, client) -> dict:
 
     # Build prompts
     llm_url = challenge.get("llm_url", "")
-    strategy_instr = build_strategy_instructions(frontier, state, bucket)
+    strategy_instr = build_strategy_instructions(
+        frontier, state, bucket, challenge=challenge, flops_max=flops_max,
+    )
     frontier_ctx = prompt_builder.format_frontier(frontier, max_entries=3)
     db_ctx = prompt_builder.format_db_context(recent, failures, comp_stats, dead)
     hist_ctx = history.format_history(history.get_history(state), max_entries=5)

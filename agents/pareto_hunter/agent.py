@@ -124,7 +124,7 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
             "No frontier yet. Design an EFFICIENT baseline from the start:\n"
             "- Use bfloat16 (configure_amp)\n"
             "- Large batch size (training_config)\n"
-            "- Simple architecture (linear mixer or small conv)\n"
+            "- Choose an architecture that fits the FLOPs budget efficiently\n"
             "- Proper init (init_weights) for fast convergence\n"
             "This establishes a Pareto-dominant position early."
         )

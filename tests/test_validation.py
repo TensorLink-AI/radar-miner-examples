@@ -7,6 +7,11 @@ import os
 # Use any agent dir — all contain identical core/ modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
 
+# Clear cached core modules to ensure correct resolution
+for _k in list(sys.modules.keys()):
+    if _k == "core" or _k.startswith("core."):
+        del sys.modules[_k]
+
 from core.validation import validate, is_harness_task
 
 
