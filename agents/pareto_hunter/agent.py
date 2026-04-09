@@ -17,12 +17,11 @@ A model that matches frontier crps while being 50% faster and 60% smaller in mem
 will DOMINATE and earn the 1.5x multiplier.
 
 Design principles for multi-objective dominance:
-- Use efficient ops: depthwise convolutions, patch embeddings, compile-friendly layers
 - Use bfloat16 via configure_amp() for memory savings
 - Use larger batch sizes via training_config() for faster wall-clock
 - Use init_weights() for faster convergence (good crps in fewer steps = lower exec_time)
 - Use compute_loss() to jointly optimize crps AND mase
-- Keep model architecturally simple — complexity hurts exec_time and memory"""
+- Use the self-sizing pattern and FLOPs formulas to fit within budget efficiently"""
 
 OBJECTIVE_WEIGHTS = {"crps": 1.0, "mase": 0.5, "exec_time": 0.2, "memory_mb": 0.1}
 
@@ -194,8 +193,7 @@ def design_architecture(challenge: dict, client) -> dict:
         "1. `configure_amp()` returning `{'enabled': True, 'dtype': 'bfloat16'}` for memory savings\n"
         "2. `training_config()` with larger batch_size for faster wall-clock\n"
         "3. `init_weights(model)` with proper initialization for fast convergence\n"
-        "4. Use efficient operations: depthwise convolutions, patch embeddings, avoid heavy attention\n"
-        "5. Consider `compute_loss()` to jointly optimize crps AND mase\n"
+        "4. Consider `compute_loss()` to jointly optimize crps AND mase\n"
     )
     user_prompt += efficiency_addendum
 
