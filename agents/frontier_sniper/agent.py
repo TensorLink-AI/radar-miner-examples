@@ -13,7 +13,7 @@ Do NOT redesign the architecture. Minimal diff, maximum impact.
 Key rules:
 - Start from the BEST frontier member's code — copy it almost entirely
 - Change at most 1-2 things: optimizer config, a normalization layer, init scheme, LR schedule
-- The sigmoid scoring has steepness=20: even 1-2% CRPS improvement gives ~0.55-0.65 score
+- The sigmoid scoring has steepness=20: even 1-2% improvement on the primary metric gives ~0.55-0.65 score
 - With softmax temperature=0.1, even a tiny score lead dominates the round
 - NEVER change the model architecture dramatically — only tune the training dynamics
 - Keep FLOPs within budget — do NOT add layers or increase hidden dims"""
@@ -57,11 +57,9 @@ def analyze_frontier(frontier: list[dict]) -> str:
         metrics = member.get("objectives", {})
         code = member.get("code", "")
         lines.append(f"--- Frontier Member {i + 1} ---")
-        lines.append(f"CRPS: {metrics.get('crps', '?')}")
-        lines.append(f"MASE: {metrics.get('mase', '?')}")
-        lines.append(f"Exec time: {metrics.get('exec_time', '?')}s")
-        lines.append(f"Memory: {metrics.get('memory_mb', '?')}MB")
-        lines.append(f"FLOPs: {member.get('objectives', {}).get('flops_equivalent_size', '?')}")
+        for metric_name, metric_val in metrics.items():
+            lines.append(f"{metric_name}: {metric_val}")
+        lines.append(f"FLOPs: {metrics.get('flops_equivalent_size', '?')}")
         if code:
             if len(code) > 5000:
                 code = code[:5000] + "\n# ... truncated"
@@ -69,7 +67,7 @@ def analyze_frontier(frontier: list[dict]) -> str:
         lines.append("")
 
     lines.append(
-        "Pick the BEST member (lowest CRPS). Copy its code almost entirely. "
+        "Pick the BEST member (best primary metric). Copy its code almost entirely. "
         "Make ONE surgical improvement: better LR schedule, weight init, "
         "gradient clipping, normalization, or optimizer hyperparameters. "
         "Explain your single change in a code comment."
@@ -91,7 +89,7 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
     if frontier:
         parts.append(
             "STRATEGY: You are sniping the frontier. Your goal is to BARELY beat the "
-            "best frontier CRPS. Copy the best frontier code and make ONE targeted change."
+            "best frontier primary metric. Copy the best frontier code and make ONE targeted change."
         )
         parts.append(analyze_frontier(frontier))
     else:
@@ -186,7 +184,7 @@ def design_architecture(challenge: dict, client) -> dict:
                     f"for the '{bucket}' FLOPs bucket. "
                     "Focus on training dynamics: LR schedules, optimizers, "
                     "initialization schemes, and normalization that correlate "
-                    "with good CRPS. Be concise."
+                    "with good primary metric scores. Be concise."
                 )},
                 {"role": "user", "content": (
                     "Search for experiments related to this bucket. Check "

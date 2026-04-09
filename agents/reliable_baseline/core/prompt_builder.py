@@ -237,13 +237,8 @@ def format_frontier(frontier: list[dict], max_entries: int = 3) -> str:
     lines: list[str] = ["## Current Frontier (models you must beat)"]
     for i, member in enumerate(frontier[:max_entries]):
         metrics = member.get("objectives", {})
-        lines.append(
-            f"**Member {i + 1}**: "
-            f"crps={metrics.get('crps', '?')}, "
-            f"mase={metrics.get('mase', '?')}, "
-            f"exec_time={metrics.get('exec_time', '?')}s, "
-            f"memory={metrics.get('memory_mb', '?')}MB"
-        )
+        metric_parts = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        lines.append(f"**Member {i + 1}**: {metric_parts}")
         code = member.get("code", "")
         if code:
             if len(code) > 4000:
@@ -264,9 +259,10 @@ def format_db_context(recent: dict | list, failures: dict | list,
             parts.append("**Recent experiments:**")
             for exp in items[:5]:
                 m = exp.get("metrics", {})
-                parts.append(
-                    f"- {exp.get('name', '?')}: "
-                    f"crps={m.get('crps', '?')}, flops={exp.get('flops', '?')}")
+                metric_str = ", ".join(f"{k}={v}" for k, v in m.items()) if m else "no metrics"
+                flops = exp.get('flops', '')
+                name = exp.get('name', '?')
+                parts.append(f"- {name}: {metric_str}" + (f", flops={flops}" if flops else ""))
 
     if failures:
         items = failures if isinstance(failures, list) else failures.get("failures", [])

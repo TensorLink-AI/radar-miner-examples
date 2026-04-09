@@ -63,10 +63,8 @@ def get_bucket_template_prompt(bucket: str, state: dict,
         parts.append(f"**Your Best Previous Code for This Bucket:**\n```python\n{saved}\n```")
         metrics = state.get("template_metrics", {}).get(bucket, {})
         if metrics:
-            parts.append(
-                f"Previous results: crps={metrics.get('crps', '?')}, "
-                f"flops={metrics.get('flops', '?')}"
-            )
+            metrics_summary = ", ".join(f"{k}={v}" for k, v in metrics.items())
+            parts.append(f"Previous results: {metrics_summary}")
 
     return "\n\n".join(parts)
 
@@ -97,9 +95,9 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
     if frontier:
         parts.append(
             f"There are {len(frontier)} frontier members. "
-            "Study them and design an architecture that beats their CRPS. "
+            "Study them and design an architecture that beats the primary metric. "
             "If your previous template already matches frontier quality, "
-            "focus on secondary objectives (exec_time, memory_mb) for the 1.5x Pareto bonus."
+            "focus on secondary objectives for the 1.5x Pareto bonus."
         )
     else:
         parts.append(

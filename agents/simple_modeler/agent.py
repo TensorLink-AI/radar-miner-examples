@@ -58,10 +58,11 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
 
     if frontier:
         # Just show what exists — don't tell the LLM to game anything
-        best = min(frontier, key=lambda m: m.get("objectives", {}).get("crps", float("inf")))
-        best_crps = best.get("objectives", {}).get("crps", "?")
+        best = frontier[0]
+        best_obj = best.get("objectives", {})
+        best_summary = ", ".join(f"{k}={v}" for k, v in best_obj.items()) if best_obj else "unknown"
         parts.append(
-            f"The current best CRPS on the frontier is {best_crps}. "
+            f"The current best frontier metrics: {best_summary}. "
             "Study the frontier code for inspiration, but don't just copy it — "
             "build something that works well."
         )
