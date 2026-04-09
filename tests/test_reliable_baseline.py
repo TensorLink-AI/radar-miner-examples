@@ -26,7 +26,7 @@ design_architecture = _mod.design_architecture
 from core.validation import validate_code
 from core.llm import extract_code, reason_and_generate, MAX_LLM_ATTEMPTS
 from core.prompt_builder import (
-    build_system_prompt, build_user_prompt, _get_harness_params,
+    build_system_prompt, build_user_prompt,
 )
 from core.history import (
     identify_bucket, extract_flops_budget, load_state, save_state,
@@ -376,27 +376,12 @@ class TestLLMErrorHandling:
 # ══════════════════════════════════════════════════════════════════
 
 class TestPromptBuilding:
-    def test_harness_params_from_challenge(self):
-        """Params come from challenge, with sensible defaults."""
-        challenge = {"task": {"task_params": {"num_variates": 1, "quantiles": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]}}}
-        ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
-        assert nvar == 1
-        assert nq == 9
-        assert quants == [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-    def test_harness_params_defaults(self):
-        """When challenge has no task_params, use sensible defaults."""
-        ctx, pred, nvar, quants, nq = _get_harness_params({"task": {}})
-        assert ctx == 512
-        assert pred == 96
-        assert nvar == 1
-        assert nq == 9
-
-    def test_system_prompt_contains_harness_values(self):
+    def test_system_prompt_contains_task_params(self):
+        """System prompt includes task_params from the challenge."""
         challenge = _make_challenge("small")
         prompt = build_system_prompt(challenge)
-        assert "512" in prompt  # context_len
-        assert "96" in prompt   # prediction_len
+        assert "context_len" in prompt
+        assert "prediction_len" in prompt
         assert "build_model" in prompt
         assert "build_optimizer" in prompt
 
@@ -437,13 +422,13 @@ class TestPromptBuilding:
         assert "frontier" in prompt.lower() or "Frontier" in prompt
 
     def test_user_prompt_contains_sizing_guidance(self):
-        """User prompt should include computed max_hidden value."""
+        """User prompt should include FLOPs sizing guidance."""
         challenge = _make_challenge("small")
         context = {"frontier": [], "recent_experiments": {}, "failures": {},
                    "component_stats": {}, "dead_ends": {}, "history": [],
                    "bucket": "small", "target_flops": 1_100_000}
         prompt = build_user_prompt(challenge, context)
-        assert "max hidden" in prompt.lower()
+        assert "hidden" in prompt.lower()
 
 
 # ══════════════════════════════════════════════════════════════════
