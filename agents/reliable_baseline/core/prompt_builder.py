@@ -27,7 +27,7 @@ def _compute_bucket_strategy(challenge: dict, bucket: str) -> str:
     """
     ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
     flops_min, flops_max = extract_flops_budget(challenge)
-    target = int(flops_max * 0.55) if flops_max else 0
+    target = int(flops_max * 0.6) if flops_max else 0
 
     # Max hidden for a simple 2-layer channel-independent model:
     # FLOPs = V * 2 * H * (ctx + pred * nq)
@@ -36,7 +36,7 @@ def _compute_bucket_strategy(challenge: dict, bucket: str) -> str:
 
     return (
         f"For this '{bucket}' bucket ({flops_min:,}-{flops_max:,} FLOPs), "
-        f"target ~{target:,} FLOPs (55% of max). "
+        f"target ~{target:,} FLOPs (60% of max). "
         f"A simple 2-layer channel-independent model can afford max hidden ~ {max_hidden}. "
         f"More complex architectures must budget FLOPs across their layers. "
         f"Choose whatever architecture best fits this budget — the estimator "
@@ -47,8 +47,9 @@ def _compute_bucket_strategy(challenge: dict, bucket: str) -> str:
 def _compute_sizing_guidance(challenge: dict) -> str:
     """Build architecture-agnostic FLOPs calculator section."""
     ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
+    tp = challenge.get("task", {}).get("task_params", {})
     flops_min, flops_max = extract_flops_budget(challenge)
-    target = int(flops_max * 0.55) if flops_max else 0
+    target = int(flops_max * 0.6) if flops_max else 0
     gate_min = int(flops_min * 0.9) if flops_min else 0
     gate_max = int(flops_max * 1.1) if flops_max else 0
 
@@ -66,7 +67,7 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "-- do NOT double-count",
         "",
         "**Budget summary:**",
-        f"- Target FLOPs: {target:,} (55% of max)",
+        f"- Target FLOPs: {target:,} (60% of max)",
         f"- Hard gate: [{gate_min:,}, {gate_max:,}]",
         f"- context_len={ctx}, num_variates={nvar}, prediction_len={pred}, "
         f"len(quantiles)={nq}",
@@ -81,9 +82,9 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "FLOPs budget constant. Do NOT hardcode hidden dims — derive them from the budget:",
         "",
         "```python",
-        "def build_model(context_len, prediction_len, num_variates, quantiles):",
+        f"def build_model({', '.join(tp.keys()) if tp else '**task_params'}):",
         "    n_quantiles = len(quantiles)",
-        f"    TARGET_FLOPS = {target}  # 55% of max budget",
+        f"    TARGET_FLOPS = {target}  # 60% of max budget",
         "",
         "    out_features = prediction_len * n_quantiles",
         "    flops_per_hidden = max(1, 2 * num_variates * (context_len + out_features))",
@@ -101,6 +102,8 @@ def _compute_sizing_guidance(challenge: dict) -> str:
 def build_system_prompt(challenge: dict) -> str:
     """Build system prompt with domain context and hard constraints."""
     task = challenge.get("task", {})
+    tp = task.get("task_params", {})
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
     ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
     parts: list[str] = []
 
@@ -108,7 +111,7 @@ def build_system_prompt(challenge: dict) -> str:
         "You are an expert ML researcher designing time-series forecasting models "
         "for competitive evaluation.\n\n"
         "Your code runs inside a frozen training harness. You MUST define:\n"
-        "- def build_model(context_len, prediction_len, num_variates, quantiles) -> nn.Module\n"
+        f"- def build_model({param_str}) -> nn.Module\n"
         "- def build_optimizer(model) -> Optimizer\n\n"
         f"The harness calls build_model({ctx}, {pred}, "
         f"{nvar}, {quants}).\n"
@@ -153,16 +156,18 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
     parts: list[str] = []
 
     ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
+    tp = challenge.get("task", {}).get("task_params", {})
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = context.get("bucket", "unknown")
-    target = context.get("target_flops", int(flops_max * 0.55))
+    target = context.get("target_flops", int(flops_max * 0.6))
     gate_min = int(flops_min * 0.9) if flops_min else 0
     gate_max = int(flops_max * 1.1) if flops_max else 0
 
     parts.append(
         f"## FLOPs Budget\n"
         f"Bucket: {bucket} [{flops_min:,} - {flops_max:,}]\n"
-        f"Target: ~{target:,} FLOPs (55% of max)\n"
+        f"Target: ~{target:,} FLOPs (60% of max)\n"
         f"Hard gate: [{gate_min:,}, {gate_max:,}] (10% tolerance)"
     )
 
@@ -173,7 +178,7 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
         "import torch\n"
         "import torch.nn as nn\n\n"
         "class YourModel(nn.Module):\n"
-        f"    def __init__(self, context_len, prediction_len, num_variates, quantiles):\n"
+        f"    def __init__(self, {param_str}):\n"
         "        super().__init__()\n"
         "        # ... your architecture ...\n"
         "    def forward(self, x):\n"
@@ -181,8 +186,8 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
         f"        # return: (batch, prediction_len, num_variates, len(quantiles)) = "
         f"(batch, {pred}, {nvar}, {nq})\n"
         "        ...\n\n"
-        "def build_model(context_len, prediction_len, num_variates, quantiles):\n"
-        "    return YourModel(context_len, prediction_len, num_variates, quantiles)\n\n"
+        f"def build_model({param_str}):\n"
+        f"    return YourModel({param_str})\n\n"
         "def build_optimizer(model):\n"
         "    return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)\n"
         "```\n\n"

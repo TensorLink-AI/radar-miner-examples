@@ -239,6 +239,9 @@ def design_architecture(challenge: dict, client) -> dict:
     motivation = "Multi-objective dominance targeting 1.5x Pareto bonus"
     last_errors: list[str] = []
 
+    tp = challenge.get("task", {}).get("task_params", {})
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
+
     for attempt in range(3):
         print(f"[pareto] LLM attempt {attempt + 1}/3", file=sys.stderr)
 
@@ -267,7 +270,7 @@ def design_architecture(challenge: dict, client) -> dict:
                     "content": (
                         f"Previous attempt failed: {error_detail}. "
                         "You MUST respond with a single ```python code block containing "
-                        "def build_model(context_len, prediction_len, num_variates, quantiles) "
+                        f"def build_model({param_str}) "
                         "and def build_optimizer(model). No text outside the code block."
                     ),
                 })

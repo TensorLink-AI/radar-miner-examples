@@ -122,7 +122,7 @@ def _compute_scaling(challenge: dict) -> dict:
     return best
 
 
-def _generate_code(cfg: dict) -> str:
+def _generate_code(cfg: dict, task_params: dict | None = None) -> str:
     """Render a complete Python module string from scaling config."""
     d = cfg["d_model"]
     n_layers = cfg["n_layers"]
@@ -131,6 +131,8 @@ def _generate_code(cfg: dict) -> str:
     lr = cfg["lr"]
     bs = cfg["batch_size"]
     ga = cfg["grad_accum"]
+
+    param_str = ", ".join(task_params.keys()) if task_params else "context_len, prediction_len, num_variates, quantiles"
 
     return textwrap.dedent(f"""\
         import torch
@@ -235,7 +237,7 @@ def _generate_code(cfg: dict) -> str:
                 return torch.stack(denormed, dim=3)  # (b, pred, V, nq)
 
 
-        def build_model(context_len, prediction_len, num_variates, quantiles):
+        def build_model({param_str}):
             return PatchDecoder(context_len, prediction_len, num_variates, len(quantiles))
 
 
@@ -284,7 +286,8 @@ def design_architecture(challenge: dict, client) -> dict:
          f"layers={cfg['n_layers']}, patch_size={cfg['patch_size']}")
 
     # ── Generate code ────────────────────────────────────────────
-    code = _generate_code(cfg)
+    tp = challenge.get("task", {}).get("task_params", {})
+    code = _generate_code(cfg, tp)
 
     ok, errors = validation.validate_code(code, challenge)
     if not ok:
@@ -293,7 +296,7 @@ def design_architecture(challenge: dict, client) -> dict:
         for delta in [-4, 4, -8, 8, -12, 12]:
             adj = dict(cfg)
             adj["d_model"] = max(4, cfg["d_model"] + delta)
-            code = _generate_code(adj)
+            code = _generate_code(adj, tp)
             ok, errors = validation.validate_code(code, challenge)
             if ok:
                 cfg = adj

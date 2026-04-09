@@ -8,22 +8,24 @@ from core.history import extract_flops_budget
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
 
-HARNESS_REQUIRED = {
-    "build_model": ["context_len", "prediction_len", "num_variates", "quantiles"],
-    "build_optimizer": ["model"],
-}
-
 HARNESS_OPTIONAL = [
     "training_config", "init_weights", "configure_amp",
     "transform_batch", "on_step_end", "build_scheduler", "compute_loss",
 ]
 
 
+def _required_functions(challenge: dict) -> dict[str, list[str]]:
+    """Derive required function signatures from the challenge task_params.
 
-
-def is_harness_task(challenge: dict) -> bool:
-    """Always True — all tasks use the training harness."""
-    return True
+    Reads build_model params from challenge['task']['task_params'] keys
+    instead of hardcoding them — the CLAUDE.md spec requires this.
+    """
+    task_params = challenge.get("task", {}).get("task_params", {})
+    build_model_params = list(task_params.keys()) if task_params else []
+    return {
+        "build_model": build_model_params,
+        "build_optimizer": ["model"],
+    }
 
 
 def validate(code: str, challenge: dict) -> tuple[bool, list[str]]:
@@ -53,26 +55,26 @@ def validate(code: str, challenge: dict) -> tuple[bool, list[str]]:
                 if root in FORBIDDEN_IMPORTS:
                     errors.append(f"Forbidden import: {node.module}")
 
-    # 3. Harness-task-specific checks
-    if is_harness_task(challenge):
-        func_defs = {}
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                params = [a.arg for a in node.args.args]
-                func_defs[node.name] = params
+    # 3. Required function checks — params derived from challenge task_params
+    harness_required = _required_functions(challenge)
+    func_defs = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            params = [a.arg for a in node.args.args]
+            func_defs[node.name] = params
 
-        for fname, required_params in HARNESS_REQUIRED.items():
-            if fname not in func_defs:
-                errors.append(f"Missing required function: {fname}")
-            else:
-                actual = func_defs[fname]
-                # Skip 'self' if present
-                actual_clean = [p for p in actual if p != "self"]
-                for rp in required_params:
-                    if rp not in actual_clean:
-                        errors.append(
-                            f"{fname} missing parameter: {rp}"
-                        )
+    for fname, required_params in harness_required.items():
+        if fname not in func_defs:
+            errors.append(f"Missing required function: {fname}")
+        else:
+            actual = func_defs[fname]
+            # Skip 'self' if present
+            actual_clean = [p for p in actual if p != "self"]
+            for rp in required_params:
+                if rp not in actual_clean:
+                    errors.append(
+                        f"{fname} missing parameter: {rp}"
+                    )
 
     # 4. FLOPs bounds check — only if no structural errors so far
     if not errors:

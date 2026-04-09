@@ -58,7 +58,7 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "FLOPs budget constant. Do NOT hardcode hidden dims — derive them from the budget:",
         "",
         "```python",
-        "def build_model(context_len, prediction_len, num_variates, quantiles):",
+        f"def build_model({', '.join(tp.keys()) if tp else '**task_params'}):",
         "    n_quantiles = len(quantiles)",
         f"    TARGET_FLOPS = {target}  # 60% of max budget",
         "",
@@ -104,10 +104,12 @@ def build_system_prompt(challenge: dict, strategy_preamble: str = "") -> str:
         parts.append("### Example Hypotheses\n" + "\n".join(f"- {h}" for h in example_hypotheses))
 
     # Always reinforce the harness contract in the system prompt
+    tp = challenge.get("task", {}).get("task_params", {})
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
     parts.append(
         "### Absolute Requirements\n"
         "Every response MUST be a single ```python code block containing "
-        "top-level `def build_model(context_len, prediction_len, num_variates, quantiles)` "
+        f"top-level `def build_model({param_str})` "
         "and `def build_optimizer(model)` functions. Code missing either function is "
         "REJECTED automatically."
     )
@@ -142,10 +144,11 @@ def build_user_prompt(challenge: dict, *,
     n_var = tp.get("num_variates", 1)
     q_list = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
     n_q = len(q_list)
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
     parts.append(
         "### Required Interface (Harness Task)\n"
         "Your code MUST define these two top-level functions (not inside a class):\n\n"
-        "1. `def build_model(context_len, prediction_len, num_variates, quantiles):`\n"
+        f"1. `def build_model({param_str}):`\n"
         f"   - Called as: build_model({ctx_len}, {pred_len}, {n_var}, {q_list})\n"
         "   - Must return an nn.Module\n"
         f"   - Forward input shape:  (batch, {ctx_len}, {n_var})\n"
@@ -163,15 +166,15 @@ def build_user_prompt(challenge: dict, *,
         "import torch\n"
         "import torch.nn as nn\n\n"
         "class MyModel(nn.Module):\n"
-        "    def __init__(self, context_len, prediction_len, num_variates, quantiles):\n"
+        f"    def __init__(self, {param_str}):\n"
         "        super().__init__()\n"
         "        # ... your architecture ...\n"
         "    def forward(self, x):\n"
         "        # x: (batch, context_len, num_variates)\n"
         "        # return: (batch, prediction_len, num_variates, len(quantiles))\n"
         "        ...\n\n"
-        "def build_model(context_len, prediction_len, num_variates, quantiles):\n"
-        "    return MyModel(context_len, prediction_len, num_variates, quantiles)\n\n"
+        f"def build_model({param_str}):\n"
+        f"    return MyModel({param_str})\n\n"
         "def build_optimizer(model):\n"
         "    return torch.optim.Adam(model.parameters(), lr=1e-3)\n"
         "```"
