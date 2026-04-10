@@ -33,6 +33,7 @@ from core.history import (
     add_entry, get_history, format_history,
 )
 from core.db_client import recent_experiments, recent_failures, component_stats, dead_ends
+from core.templates import generate_fallback_code
 
 
 # ── Test helpers ──────────────────────────────────────────────────
@@ -103,22 +104,57 @@ def build_optimizer(model):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  1. Templates removed — agent uses LLM only, no template fallback
+#  1. Dynamic fallback code generation
 # ══════════════════════════════════════════════════════════════════
 
-class TestNoTemplates:
-    def test_templates_module_has_no_get_template(self):
-        """templates.py should not export get_template or _TEMPLATES."""
+class TestFallbackCodeGeneration:
+    def test_templates_module_has_no_old_templates(self):
+        """templates.py should not export old hardcoded templates."""
         import importlib
-        # Force reimport to get the current module state
         tmpl_path = os.path.join(_agent_dir, "core", "templates.py")
         spec = importlib.util.spec_from_file_location("core.templates_check", tmpl_path)
         tmpl = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(tmpl)
         assert not hasattr(tmpl, "get_template"), "get_template should be removed"
         assert not hasattr(tmpl, "_TEMPLATES"), "_TEMPLATES should be removed"
-        assert not hasattr(tmpl, "_TINY_TEMPLATE"), "_TINY_TEMPLATE should be removed"
-        assert not hasattr(tmpl, "_SMALL_TEMPLATE"), "_SMALL_TEMPLATE should be removed"
+
+    def test_fallback_generates_valid_code(self):
+        """Fallback generates code that passes validation."""
+        challenge = _make_challenge("small")
+        code = generate_fallback_code(challenge)
+        assert code, "Fallback should produce non-empty code"
+        ok, errors = validate_code(code, challenge)
+        assert ok, f"Fallback code failed validation: {errors}"
+
+    def test_fallback_has_build_model(self):
+        """Fallback code contains build_model with correct params."""
+        challenge = _make_challenge("medium")
+        code = generate_fallback_code(challenge)
+        assert "def build_model(" in code
+        assert "context_len" in code
+        assert "prediction_len" in code
+
+    def test_fallback_has_build_optimizer(self):
+        """Fallback code contains build_optimizer."""
+        challenge = _make_challenge("small")
+        code = generate_fallback_code(challenge)
+        assert "def build_optimizer(model)" in code
+
+    def test_fallback_every_bucket(self):
+        """Fallback produces valid code for every bucket."""
+        from core.history import SIZE_BUCKETS
+        for bucket in SIZE_BUCKETS:
+            challenge = _make_challenge(bucket)
+            code = generate_fallback_code(challenge)
+            assert code, f"No fallback for {bucket}"
+            ok, errors = validate_code(code, challenge)
+            assert ok, f"Fallback invalid for {bucket}: {errors}"
+
+    def test_fallback_empty_without_task_params(self):
+        """No task_params means no fallback possible."""
+        challenge = {"task": {}, "min_flops_equivalent": 0, "max_flops_equivalent": 0}
+        code = generate_fallback_code(challenge)
+        assert code == ""
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -126,7 +162,7 @@ class TestNoTemplates:
 # ══════════════════════════════════════════════════════════════════
 
 class TestGracefulDegradation:
-    """Without LLM, design_architecture returns empty code (skips submission)."""
+    """Without LLM, design_architecture uses dynamic fallback code."""
 
     def _run(self, challenge, client):
         """Run design_architecture with injected globals."""
@@ -141,29 +177,33 @@ class TestGracefulDegradation:
             del builtins.load_scratchpad
             del builtins.save_scratchpad
 
-    def test_no_llm_returns_empty_code(self):
-        """No LLM URL — returns empty code (skip submission)."""
+    def test_no_llm_returns_fallback_code(self):
+        """No LLM URL — returns fallback code (not empty)."""
         challenge = _make_challenge("small", llm_url="", db_url="")
         client = MockClient(raise_on_call=True)
         result = self._run(challenge, client)
-        assert result["code"] == ""
+        assert result["code"] != "", "Should return fallback code, not empty"
+        assert "build_model" in result["code"]
+        assert "fallback" in result["name"]
 
-    def test_llm_failure_returns_empty_code(self):
-        """LLM raises — returns empty code (skip submission)."""
+    def test_llm_failure_returns_fallback_code(self):
+        """LLM raises — returns fallback code (not empty)."""
         challenge = _make_challenge("small", llm_url="http://fake-llm",
                                     db_url="http://fake-db")
         client = MockClient(raise_on_call=True)
         result = self._run(challenge, client)
-        assert result["code"] == ""
+        assert result["code"] != "", "Should return fallback code, not empty"
+        assert "build_model" in result["code"]
 
     def test_does_not_crash_without_llm(self):
-        """Agent returns a dict even when everything fails."""
+        """Agent returns a dict with valid code when LLM unavailable."""
         challenge = _make_challenge("medium", llm_url="", frontier=[])
         client = MockClient()
         result = self._run(challenge, client)
         assert isinstance(result, dict)
         assert "code" in result
         assert "name" in result
+        assert result["code"] != ""
 
     def test_does_not_crash_with_frontier(self):
         """Agent handles frontier context without LLM gracefully."""
@@ -172,16 +212,19 @@ class TestGracefulDegradation:
         client = MockClient()
         result = self._run(challenge, client)
         assert isinstance(result, dict)
+        assert result["code"] != ""
 
-    def test_every_bucket_no_crash(self):
-        """Every bucket produces a result dict when LLM is unavailable."""
+    def test_every_bucket_produces_valid_code(self):
+        """Every bucket produces valid fallback code when LLM is unavailable."""
         from core.history import SIZE_BUCKETS
         for bucket in SIZE_BUCKETS:
             challenge = _make_challenge(bucket, llm_url="")
             client = MockClient()
             result = self._run(challenge, client)
             assert isinstance(result, dict), f"Non-dict result for bucket {bucket}"
-            assert "code" in result
+            assert result["code"] != "", f"Empty code for bucket {bucket}"
+            ok, errors = validate_code(result["code"])
+            assert ok, f"Invalid fallback for {bucket}: {errors}"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -220,8 +263,9 @@ class TestValidation:
         assert any("build_optimizer" in e for e in errors)
 
     def test_missing_params_rejected(self):
+        challenge = _make_challenge("small")
         code = "def build_model(x): pass\ndef build_optimizer(model): pass"
-        ok, errors = validate_code(code)
+        ok, errors = validate_code(code, challenge)
         assert not ok
         assert any("missing parameter" in e for e in errors)
 

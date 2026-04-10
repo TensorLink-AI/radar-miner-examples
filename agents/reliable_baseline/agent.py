@@ -12,6 +12,7 @@ import sys
 import tempfile
 
 from core import llm, db_client, validation, history, tools
+from core.templates import generate_fallback_code
 
 
 def _log(msg: str) -> None:
@@ -108,11 +109,24 @@ def design_architecture(challenge: dict, client) -> dict:
         code, name, motivation = result
         _log(f"[agent] LLM produced valid code: {name}")
     else:
-        # LLM failed or unavailable — skip submission
-        code = ""
-        name = f"skipped_{bucket}"
-        motivation = "LLM unavailable or returned invalid code"
-        _log(f"[agent] LLM unavailable, skipping submission for {bucket}")
+        # LLM failed or unavailable — use dynamic fallback
+        _log(f"[agent] LLM failed, generating fallback for {bucket}")
+        code = generate_fallback_code(challenge)
+        if code:
+            ok, errors = validation.validate_code(code, challenge)
+            if ok:
+                name = f"fallback_{bucket}"
+                motivation = "Dynamic fallback — LLM unavailable or returned invalid code"
+                _log(f"[agent] Fallback code passed validation: {name}")
+            else:
+                _log(f"[agent] Fallback validation failed: {errors}")
+                code = ""
+                name = f"skipped_{bucket}"
+                motivation = f"Both LLM and fallback failed: {errors}"
+        else:
+            name = f"skipped_{bucket}"
+            motivation = "LLM unavailable and fallback not possible for this task"
+            _log(f"[agent] No fallback available for {bucket}")
 
     # ── STEP 4: Final validation ──────────────────────────────────
     if code:
