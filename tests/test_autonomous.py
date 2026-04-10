@@ -166,8 +166,7 @@ class TestToolDefinitions:
     def test_expected_tools_present(self):
         tool_names = {t["function"]["name"] for t in TOOLS}
         expected = {
-            "search_papers", "get_recent_experiments", "get_failures",
-            "get_component_stats", "get_dead_ends", "get_frontier_details",
+            "search_papers", "query_db", "get_frontier_details",
             "estimate_model_flops", "validate_code", "read_scratchpad",
             "write_scratchpad", "submit", "time_remaining",
         }
@@ -196,8 +195,7 @@ class TestToolHandlers:
     def test_all_handlers_present(self):
         handlers = self._make_handlers()
         expected = {
-            "search_papers", "get_recent_experiments", "get_failures",
-            "get_component_stats", "get_dead_ends", "get_frontier_details",
+            "search_papers", "query_db", "get_frontier_details",
             "estimate_model_flops", "validate_code", "read_scratchpad",
             "write_scratchpad", "submit", "time_remaining",
         }
@@ -260,13 +258,86 @@ class TestToolHandlers:
         result = handlers["search_papers"](query="transformer forecasting")
         assert "unavailable" in result.lower()
 
-    def test_db_tools_no_url(self):
+    def test_query_db_no_url(self):
         challenge = _make_challenge(db_url="")
         handlers = self._make_handlers(challenge=challenge)
-        assert "unavailable" in handlers["get_recent_experiments"]().lower()
-        assert "unavailable" in handlers["get_failures"]().lower()
-        assert "unavailable" in handlers["get_component_stats"]().lower()
-        assert "unavailable" in handlers["get_dead_ends"]().lower()
+        result = handlers["query_db"](path="/experiments/recent")
+        assert "unavailable" in result.lower()
+
+    def test_query_db_get(self):
+        """query_db GET returns formatted JSON from the DB."""
+        client = MockClient(responses={
+            "http://db/experiments/recent": {"experiments": [{"name": "exp1", "crps": 0.42}]},
+        })
+        challenge = _make_challenge(db_url="http://db")
+        handlers = self._make_handlers(challenge=challenge, client=client)
+        result = handlers["query_db"](path="/experiments/recent")
+        assert "exp1" in result
+        assert "0.42" in result
+
+    def test_query_db_get_with_query_params(self):
+        """query_db passes query params through in the path."""
+        client = MockClient(responses={
+            "http://db/experiments/recent?n=5": {"experiments": [{"name": "exp2"}]},
+        })
+        challenge = _make_challenge(db_url="http://db")
+        handlers = self._make_handlers(challenge=challenge, client=client)
+        result = handlers["query_db"](path="/experiments/recent?n=5")
+        assert "exp2" in result
+
+    def test_query_db_post(self):
+        """query_db POST sends a JSON body and returns results."""
+        client = MockClient(responses={
+            "http://db/experiments/search": {"results": [{"name": "found_it"}]},
+        })
+        challenge = _make_challenge(db_url="http://db")
+        handlers = self._make_handlers(challenge=challenge, client=client)
+        result = handlers["query_db"](
+            path="/experiments/search",
+            method="POST",
+            body={"bucket": "small", "min_crps": 0.3},
+        )
+        assert "found_it" in result
+
+    def test_query_db_error_handling(self):
+        """query_db returns error message on failure, doesn't crash."""
+        client = MockClient(raise_on_call=True)
+        challenge = _make_challenge(db_url="http://db")
+        handlers = self._make_handlers(challenge=challenge, client=client)
+        result = handlers["query_db"](path="/experiments/recent")
+        assert "failed" in result.lower()
+
+    def test_query_db_error_response(self):
+        """query_db reports when DB returns an error field."""
+        client = MockClient(responses={
+            "http://db/bad/path": {"error": "not found"},
+        })
+        challenge = _make_challenge(db_url="http://db")
+        handlers = self._make_handlers(challenge=challenge, client=client)
+        result = handlers["query_db"](path="/bad/path")
+        assert "not found" in result
+
+    def test_query_db_truncates_large_response(self):
+        """Very large DB responses get truncated to avoid flooding context."""
+        huge = {"data": "x" * 10000}
+        client = MockClient(responses={
+            "http://db/huge": huge,
+        })
+        challenge = _make_challenge(db_url="http://db")
+        handlers = self._make_handlers(challenge=challenge, client=client)
+        result = handlers["query_db"](path="/huge")
+        assert len(result) <= 8100  # 8000 + truncation message
+        assert "truncated" in result
+
+    def test_query_db_prepends_slash(self):
+        """Path without leading slash still works."""
+        client = MockClient(responses={
+            "http://db/experiments/recent": {"ok": True},
+        })
+        challenge = _make_challenge(db_url="http://db")
+        handlers = self._make_handlers(challenge=challenge, client=client)
+        result = handlers["query_db"](path="experiments/recent")
+        assert "ok" in result
 
     def test_submit_valid_raises_signal(self):
         # Use challenge without FLOPs for structural-only validation

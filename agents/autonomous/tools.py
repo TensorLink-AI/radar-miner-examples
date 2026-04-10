@@ -10,9 +10,10 @@ The agent decides what to do and when. Tools cover:
 """
 
 import json
+import sys
 import time
 
-from core import db_client, validation
+from core import validation
 from core.flops_estimator import estimate_flops
 from core.history import (
     extract_flops_budget, identify_bucket, load_state, save_state,
@@ -54,72 +55,39 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "get_recent_experiments",
+            "name": "query_db",
             "description": (
-                "Fetch recent experiment results from the validator database. "
-                "Shows what models others have submitted, their metrics, and "
-                "resource usage. Use this to understand what works."
+                "Query the experiment database. You can hit any endpoint with "
+                "GET or POST. Use this to explore what data is available and "
+                "pull whatever information helps your design.\n\n"
+                "Known endpoints (but feel free to discover others):\n"
+                "  GET  /experiments/recent?n=15      — recent experiment results\n"
+                "  GET  /experiments/failures?n=5     — recent failures with reasons\n"
+                "  GET  /provenance/component_stats   — which components correlate with success\n"
+                "  GET  /provenance/dead_ends         — patterns that consistently fail\n"
+                "  GET  /experiments/{id}             — details for a specific experiment\n"
+                "  POST /experiments/search           — search with custom filters\n\n"
+                "You can also try paths like /experiments/top, /experiments/by_bucket, "
+                "/provenance/lineage, etc. — the DB may support more than what's listed."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of experiments to fetch (default 15)",
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST"],
+                        "description": "HTTP method (default GET)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path, e.g. '/experiments/recent?n=10' or '/provenance/component_stats'",
+                    },
+                    "body": {
+                        "type": "object",
+                        "description": "JSON body for POST requests (optional)",
                     },
                 },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_failures",
-            "description": (
-                "Fetch recent experiment failures with error reasons. "
-                "Use this to understand what approaches don't work and avoid them."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "description": "Number of failures to fetch (default 5)",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_component_stats",
-            "description": (
-                "Fetch component-level success statistics. Shows which "
-                "architectural components (attention, convolution, etc.) "
-                "correlate with good performance in past experiments."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_dead_ends",
-            "description": (
-                "Fetch patterns that consistently fail or produce poor results. "
-                "Use this to avoid repeating known bad approaches."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
+                "required": ["path"],
             },
         },
     },
@@ -333,25 +301,31 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         except Exception as exc:
             return f"Paper search failed: {exc}"
 
-    def get_recent_experiments(limit: int = 15) -> str:
+    def query_db(path: str, method: str = "GET", body: dict | None = None) -> str:
         if not db_url:
-            return "Experiment DB unavailable."
-        return _fmt(db_client.recent_experiments(client, db_url, n=limit))
-
-    def get_failures(limit: int = 5) -> str:
-        if not db_url:
-            return "Experiment DB unavailable."
-        return _fmt(db_client.recent_failures(client, db_url, n=limit))
-
-    def get_component_stats() -> str:
-        if not db_url:
-            return "Experiment DB unavailable."
-        return _fmt(db_client.component_stats(client, db_url))
-
-    def get_dead_ends() -> str:
-        if not db_url:
-            return "Experiment DB unavailable."
-        return _fmt(db_client.dead_ends(client, db_url))
+            return "Experiment DB unavailable (no db_url in challenge)."
+        # Build the full URL: db_url base + path
+        base = db_url.rstrip("/")
+        # Ensure path starts with /
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"{base}{path}"
+        try:
+            if method.upper() == "POST":
+                result = client.post_json(url, body or {})
+            else:
+                result = client.get_json(url)
+            if isinstance(result, dict) and "error" in result:
+                return f"DB returned error: {result['error']}"
+            formatted = _fmt(result)
+            # Truncate very large responses to avoid flooding context
+            if len(formatted) > 8000:
+                formatted = formatted[:8000] + "\n... (truncated, try a more specific query)"
+            return formatted
+        except Exception as exc:
+            print(f"[tools] query_db {method} {path} failed: {exc}",
+                  file=sys.stderr)
+            return f"DB query failed: {exc}"
 
     # ── Analysis handlers ─────────────────────────────────────────
 
@@ -438,10 +412,7 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
 
     return {
         "search_papers": search_papers,
-        "get_recent_experiments": get_recent_experiments,
-        "get_failures": get_failures,
-        "get_component_stats": get_component_stats,
-        "get_dead_ends": get_dead_ends,
+        "query_db": query_db,
         "get_frontier_details": get_frontier_details,
         "estimate_model_flops": estimate_model_flops,
         "validate_code": validate_code_handler,
