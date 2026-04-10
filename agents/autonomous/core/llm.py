@@ -19,6 +19,25 @@ DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 MAX_LLM_ATTEMPTS = 15  # up to 15 turns — half the 30-request rate limit
 
 
+def get_models(client, llm_url: str) -> list[str]:
+    """List available models from the LLM endpoint.
+
+    Returns an empty list on failure so callers can fall back to a default.
+    Handles three response shapes: bare list, OpenAI ``{"data": [...]}``,
+    and legacy ``{"models": [...]}``.
+    """
+    try:
+        resp = client.get_json(f"{llm_url}/v1/models")
+        if isinstance(resp, list):
+            return resp
+        if "data" in resp:
+            return [m["id"] for m in resp["data"]]
+        return resp.get("models", [])
+    except Exception as exc:
+        print(f"[llm] failed to list models: {exc}", file=sys.stderr)
+        return []
+
+
 def chat(client, llm_url: str, messages: list[dict], *,
          temperature: float = 0.7, max_tokens: int = 4096,
          model: str = DEFAULT_MODEL) -> str:

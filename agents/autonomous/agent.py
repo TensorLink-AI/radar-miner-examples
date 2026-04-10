@@ -17,6 +17,7 @@ import time
 
 from core import history, validation
 from core.history import extract_flops_budget, identify_bucket
+from core.llm import get_models
 from core.prompt_builder import _format_task_params, _compute_sizing_guidance
 from tools import TOOLS, SubmitSignal, build_handlers
 
@@ -32,6 +33,33 @@ TIME_BUFFER_SECONDS = 10
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _resolve_model(client, llm_url: str) -> str:
+    """Pick a model that is actually served by the LLM endpoint.
+
+    The hardcoded DEFAULT_MODEL may not exist on every deployment. Querying
+    /v1/models lets us discover what the server actually hosts. We prefer
+    DEFAULT_MODEL when available and otherwise fall back to the first model
+    the endpoint reports. If /v1/models is unreachable we return DEFAULT_MODEL
+    so behavior is unchanged for well-configured servers.
+    """
+    if not llm_url:
+        return DEFAULT_MODEL
+    try:
+        available = get_models(client, llm_url)
+    except Exception as exc:
+        _log(f"[agent] get_models failed, using default: {exc}")
+        return DEFAULT_MODEL
+    if not available:
+        _log("[agent] get_models returned nothing, using default")
+        return DEFAULT_MODEL
+    if DEFAULT_MODEL in available:
+        return DEFAULT_MODEL
+    chosen = available[0]
+    _log(f"[agent] DEFAULT_MODEL '{DEFAULT_MODEL}' not available; "
+         f"using '{chosen}' (of {len(available)} models)")
+    return chosen
 
 
 def _build_system_prompt(challenge: dict) -> str:
@@ -164,7 +192,8 @@ def _build_kickoff_message(challenge: dict) -> str:
 
 
 def _autonomous_loop(client, challenge: dict, messages: list[dict],
-                     tool_handlers: dict, deadline: float) -> dict | None:
+                     tool_handlers: dict, deadline: float,
+                     model: str = DEFAULT_MODEL) -> dict | None:
     """Run the autonomous tool-calling loop.
 
     Returns the submission dict {"code", "name", "motivation"} if the agent
@@ -187,7 +216,7 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
 
         # Build payload — include tools unless it's the very last turn
         payload = {
-            "model": DEFAULT_MODEL,
+            "model": model,
             "messages": messages,
             "temperature": 0.7,
             "max_tokens": 4096,
@@ -331,9 +360,12 @@ def design_architecture(challenge: dict, client) -> dict:
     result = None
     llm_url = challenge.get("llm_url", "")
     if llm_url:
+        model = _resolve_model(client, llm_url)
+        _log(f"[agent] Using LLM model: {model}")
         try:
             result = _autonomous_loop(
                 client, challenge, messages, tool_handlers, deadline,
+                model=model,
             )
         except Exception as exc:
             _log(f"[agent] Autonomous loop failed: {exc}")
