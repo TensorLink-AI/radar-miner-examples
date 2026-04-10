@@ -468,6 +468,44 @@ class TestAutonomousLoop:
         assert result["code"] == VALID_CODE
         assert result["name"] == "instant_model"
 
+    def test_tool_calls_honored_when_finish_reason_stop(self):
+        """Regression: some Kimi/OpenAI-compatible servers return
+        ``finish_reason="stop"`` together with a populated ``tool_calls``
+        list. The loop must still execute those tool calls instead of
+        treating the turn as a plain text response."""
+        challenge = _make_challenge(llm_url="http://llm")
+        challenge.pop("min_flops_equivalent", None)
+        challenge.pop("max_flops_equivalent", None)
+
+        tool_call = _make_tool_call("submit", {
+            "code": VALID_CODE,
+            "name": "kimi_stop_model",
+            "motivation": "finish_reason=stop shouldn't drop tool calls",
+        })
+        # Build the response manually so we can force finish_reason="stop"
+        # *alongside* tool_calls — the combination _make_llm_response avoids.
+        raw_response = {
+            "choices": [{
+                "message": {"content": "", "tool_calls": [tool_call]},
+                "finish_reason": "stop",
+            }]
+        }
+        client = MockClient(responses={
+            "http://llm/v1/chat/completions": raw_response,
+        })
+
+        handlers = build_handlers(
+            client, challenge, tempfile.mkdtemp(), time.time() + 300)
+        messages = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "go"},
+        ]
+        result = _autonomous_loop(
+            client, challenge, messages, handlers, time.time() + 300)
+        assert result is not None, "tool_calls were dropped on finish_reason=stop"
+        assert result["code"] == VALID_CODE
+        assert result["name"] == "kimi_stop_model"
+
     def test_validate_then_submit(self):
         """Agent validates first, then submits — two-turn interaction."""
         challenge = _make_challenge(llm_url="http://llm")

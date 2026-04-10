@@ -19,25 +19,6 @@ DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 MAX_LLM_ATTEMPTS = 15  # up to 15 turns — half the 30-request rate limit
 
 
-def get_models(client, llm_url: str) -> list[str]:
-    """List available models from the LLM endpoint.
-
-    Returns an empty list on failure so callers can fall back to a default.
-    Handles three response shapes: bare list, OpenAI ``{"data": [...]}``,
-    and legacy ``{"models": [...]}``.
-    """
-    try:
-        resp = client.get_json(f"{llm_url}/v1/models")
-        if isinstance(resp, list):
-            return resp
-        if "data" in resp:
-            return [m["id"] for m in resp["data"]]
-        return resp.get("models", [])
-    except Exception as exc:
-        print(f"[llm] failed to list models: {exc}", file=sys.stderr)
-        return []
-
-
 def chat(client, llm_url: str, messages: list[dict], *,
          temperature: float = 0.7, max_tokens: int = 4096,
          model: str = DEFAULT_MODEL) -> str:
@@ -135,9 +116,18 @@ def chat_with_tools(
         tool_calls = assistant_msg.get("tool_calls")
 
         # --- No tool calls → return text content ---
-        if not tool_calls or finish_reason == "stop":
+        # NOTE: we intentionally do NOT short-circuit on
+        # ``finish_reason == "stop"``. Some OpenAI-compatible servers (notably
+        # certain Kimi deployments) return ``finish_reason="stop"`` together
+        # with a populated ``tool_calls`` list; branching on finish_reason
+        # would silently drop those tool calls.
+        if not tool_calls:
             content = assistant_msg.get("content") or ""
-            print(f"[llm] final response: {len(content)} chars", file=sys.stderr)
+            print(
+                f"[llm] final response: {len(content)} chars "
+                f"(finish_reason={finish_reason})",
+                file=sys.stderr,
+            )
             return content
 
         # --- Process tool calls ---

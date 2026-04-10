@@ -17,7 +17,6 @@ import time
 
 from core import history, validation
 from core.history import extract_flops_budget, identify_bucket
-from core.llm import get_models
 from core.prompt_builder import _format_task_params, _compute_sizing_guidance
 from tools import TOOLS, SubmitSignal, build_handlers
 
@@ -35,31 +34,29 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def _resolve_model(client, llm_url: str) -> str:
-    """Pick a model that is actually served by the LLM endpoint.
+def _extract_code_block(text: str) -> str:
+    """Extract the first fenced Python code block from an LLM text response.
 
-    The hardcoded DEFAULT_MODEL may not exist on every deployment. Querying
-    /v1/models lets us discover what the server actually hosts. We prefer
-    DEFAULT_MODEL when available and otherwise fall back to the first model
-    the endpoint reports. If /v1/models is unreachable we return DEFAULT_MODEL
-    so behavior is unchanged for well-configured servers.
+    Used as a safety net when the LLM answers with code in plain text instead
+    of calling ``validate_code``/``submit``. Returns "" if no recognizable
+    block is found.
     """
-    if not llm_url:
-        return DEFAULT_MODEL
-    try:
-        available = get_models(client, llm_url)
-    except Exception as exc:
-        _log(f"[agent] get_models failed, using default: {exc}")
-        return DEFAULT_MODEL
-    if not available:
-        _log("[agent] get_models returned nothing, using default")
-        return DEFAULT_MODEL
-    if DEFAULT_MODEL in available:
-        return DEFAULT_MODEL
-    chosen = available[0]
-    _log(f"[agent] DEFAULT_MODEL '{DEFAULT_MODEL}' not available; "
-         f"using '{chosen}' (of {len(available)} models)")
-    return chosen
+    if not text:
+        return ""
+    for marker in ("```python", "```Python", "```py"):
+        if marker in text:
+            start = text.index(marker) + len(marker)
+            closing = text.find("```", start)
+            return (text[start:] if closing == -1 else text[start:closing]).strip()
+    if "```" in text:
+        start = text.index("```") + 3
+        nl = text.find("\n", start)
+        if nl == -1:
+            return text[start:].strip()
+        start = nl + 1
+        closing = text.find("```", start)
+        return (text[start:] if closing == -1 else text[start:closing]).strip()
+    return ""
 
 
 def _build_system_prompt(challenge: dict) -> str:
@@ -192,8 +189,7 @@ def _build_kickoff_message(challenge: dict) -> str:
 
 
 def _autonomous_loop(client, challenge: dict, messages: list[dict],
-                     tool_handlers: dict, deadline: float,
-                     model: str = DEFAULT_MODEL) -> dict | None:
+                     tool_handlers: dict, deadline: float) -> dict | None:
     """Run the autonomous tool-calling loop.
 
     Returns the submission dict {"code", "name", "motivation"} if the agent
@@ -216,7 +212,7 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
 
         # Build payload — include tools unless it's the very last turn
         payload = {
-            "model": model,
+            "model": DEFAULT_MODEL,
             "messages": messages,
             "temperature": 0.7,
             "max_tokens": 4096,
@@ -246,13 +242,32 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
         finish_reason = choice.get("finish_reason", "")
         tool_calls = assistant_msg.get("tool_calls")
 
-        # No tool calls → the LLM wants to talk. Append and continue
-        # (it might be thinking aloud before the next tool call)
-        if not tool_calls or finish_reason == "stop":
+        # No tool calls → the LLM wants to talk. Append and continue.
+        # NOTE: we do NOT also branch on ``finish_reason == "stop"`` — some
+        # OpenAI-compatible servers (notably certain Kimi deployments) return
+        # ``finish_reason="stop"`` alongside a populated ``tool_calls`` list.
+        # Short-circuiting on finish_reason would silently drop those tool
+        # calls and leave an assistant message with unresolved tool_calls in
+        # the history, which the next /v1/chat/completions call would reject.
+        if not tool_calls:
             content = assistant_msg.get("content") or ""
-            _log(f"[agent] Text response ({len(content)} chars): "
-                 f"{content[:200]}...")
+            _log(f"[agent] Text response ({len(content)} chars, "
+                 f"finish_reason={finish_reason}): {content[:200]}...")
             messages.append(assistant_msg)
+
+            # Fallback: if the LLM dumped code in a text response instead of
+            # calling validate_code, try to validate it ourselves so the
+            # round still has something to submit.
+            fallback_code = _extract_code_block(content)
+            if fallback_code:
+                ok, errors = validation.validate_code(fallback_code, challenge)
+                if ok:
+                    _log("[agent] Text response contained valid code — "
+                         "tracking as fallback")
+                    last_validated_code = fallback_code
+                else:
+                    _log(f"[agent] Text code block failed validation: {errors}")
+
             # If this is the last turn, the loop ends
             if turn == MAX_TURNS - 1:
                 break
@@ -261,8 +276,8 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
                 "role": "user",
                 "content": (
                     "Continue using your tools. If you have code ready, "
-                    "validate it and submit. Check time_remaining if unsure "
-                    "how much time you have left."
+                    "call validate_code on it, then submit. "
+                    "Check time_remaining if unsure how much time you have left."
                 ),
             })
             continue
@@ -360,12 +375,9 @@ def design_architecture(challenge: dict, client) -> dict:
     result = None
     llm_url = challenge.get("llm_url", "")
     if llm_url:
-        model = _resolve_model(client, llm_url)
-        _log(f"[agent] Using LLM model: {model}")
         try:
             result = _autonomous_loop(
                 client, challenge, messages, tool_handlers, deadline,
-                model=model,
             )
         except Exception as exc:
             _log(f"[agent] Autonomous loop failed: {exc}")

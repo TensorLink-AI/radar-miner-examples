@@ -116,9 +116,18 @@ def chat_with_tools(
         tool_calls = assistant_msg.get("tool_calls")
 
         # --- No tool calls → return text content ---
-        if not tool_calls or finish_reason == "stop":
+        # NOTE: we intentionally do NOT short-circuit on
+        # finish_reason == "stop". Some OpenAI-compatible servers (notably
+        # certain Kimi deployments) return finish_reason="stop" together
+        # with a populated tool_calls list; branching on finish_reason
+        # would silently drop those tool calls.
+        if not tool_calls:
             content = assistant_msg.get("content") or ""
-            print(f"[llm] final response: {len(content)} chars", file=sys.stderr)
+            print(
+                f"[llm] final response: {len(content)} chars "
+                f"(finish_reason={finish_reason})",
+                file=sys.stderr,
+            )
             return content
 
         # --- Process tool calls ---
