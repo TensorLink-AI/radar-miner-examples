@@ -22,27 +22,20 @@ def _compute_bucket_guidance(bucket: str, flops_min: int, flops_max: int,
     """Compute dynamic sizing guidance for a bucket from the challenge."""
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    ctx = tp.get("context_len", 512)
-    pred = tp.get("prediction_len", 96)
-    nvar = tp.get("num_variates", 1)
-    quants = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
-    nq = len(quants)
     target = int(flops_max * 0.6)
 
-    # Max hidden for a simple 2-layer channel-independent model
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
+    description = f"{flops_min:,}-{flops_max:,} FLOPs. Target ~{target:,} FLOPs."
+    if tp:
+        param_summary = ", ".join(f"{k}={v}" for k, v in tp.items())
+        description += f" Task parameters: {param_summary}."
 
     return {
-        "description": (
-            f"{flops_min:,}-{flops_max:,} FLOPs. Target ~{target:,} FLOPs. "
-            f"A 2-layer channel-independent model can afford max hidden ~ {max_hidden}."
-        ),
+        "description": description,
         "tips": [
-            f"Budget your FLOPs: nn.Linear(in, out) on (batch, seq, in) costs 2*in*out*seq",
-            f"If channel-independent (batch*V reshape), V={nvar} is already in the batch",
-            f"Self-attention costs 8*S*d^2 + 2*S^2*d — check if it fits your budget",
+            "Budget your FLOPs: nn.Linear(in, out) on (batch, seq, in) costs 2*in*out*seq",
+            "Self-attention costs 8*S*d^2 + 2*S^2*d -- check if it fits your budget",
             "Focus on training dynamics (LR schedule, warmup, init) as much as architecture",
+            f"Target ~{target:,} FLOPs -- size hidden dims and layer count accordingly",
         ],
     }
 
@@ -70,10 +63,8 @@ def get_bucket_template_prompt(bucket: str, state: dict,
         parts.append(f"**Your Best Previous Code for This Bucket:**\n```python\n{saved}\n```")
         metrics = state.get("template_metrics", {}).get(bucket, {})
         if metrics:
-            parts.append(
-                f"Previous results: crps={metrics.get('crps', '?')}, "
-                f"flops={metrics.get('flops', '?')}"
-            )
+            metrics_summary = ", ".join(f"{k}={v}" for k, v in metrics.items())
+            parts.append(f"Previous results: {metrics_summary}")
 
     return "\n\n".join(parts)
 
@@ -104,9 +95,9 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
     if frontier:
         parts.append(
             f"There are {len(frontier)} frontier members. "
-            "Study them and design an architecture that beats their CRPS. "
+            "Study them and design an architecture that beats the primary metric. "
             "If your previous template already matches frontier quality, "
-            "focus on secondary objectives (exec_time, memory_mb) for the 1.5x Pareto bonus."
+            "focus on secondary objectives for the 1.5x Pareto bonus."
         )
     else:
         parts.append(
@@ -149,11 +140,17 @@ def design_architecture(challenge: dict, client) -> dict:
           f"target: {target_flops:,}", file=sys.stderr)
 
     # Load scratchpad (load_scratchpad is injected by harness)
-    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    scratch_dir = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    except Exception as exc:
+        print(f"[specialist] scratchpad load failed: {exc}", file=sys.stderr)
     state = history.load_state(scratch_dir) if scratch_dir else {}
     print(f"[specialist] Scratchpad loaded: {len(state)} keys", file=sys.stderr)
 
     frontier = challenge.get("feasible_frontier", [])
+    if not frontier:
+        frontier = challenge.get("pareto_frontier", [])
     if not isinstance(frontier, list):
         frontier = []
     print(f"[specialist] Frontier members: {len(frontier)}", file=sys.stderr)
@@ -300,7 +297,10 @@ def design_architecture(challenge: dict, client) -> dict:
     state = save_template(state, bucket, code)
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)
-    save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    try:
+        save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    except Exception as exc:
+        print(f"[specialist] scratchpad save failed: {exc}", file=sys.stderr)
 
     return {
         "code": code,

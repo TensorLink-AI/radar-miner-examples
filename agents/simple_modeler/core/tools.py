@@ -43,8 +43,7 @@ TOOLS: list[dict] = [
             "name": "recent_experiments",
             "description": (
                 "Fetch the most recent experiment results from the validator "
-                "database, including metrics like crps, mase, exec_time, and "
-                "memory_mb."
+                "database, including performance metrics and resource usage stats."
             ),
             "parameters": {
                 "type": "object",

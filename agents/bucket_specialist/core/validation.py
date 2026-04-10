@@ -1,17 +1,11 @@
 """AST-based code validation — syntax, required functions, forbidden imports, FLOPs bounds."""
 
 import ast
-import sys
 
 from core.flops_estimator import estimate_flops
 from core.history import extract_flops_budget
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
-
-HARNESS_OPTIONAL = [
-    "training_config", "init_weights", "configure_amp",
-    "transform_batch", "on_step_end", "build_scheduler", "compute_loss",
-]
 
 
 def _required_functions(challenge: dict) -> dict[str, list[str]]:
@@ -56,22 +50,21 @@ def validate(code: str, challenge: dict) -> tuple[bool, list[str]]:
                     errors.append(f"Forbidden import: {node.module}")
 
     # 3. Required function checks — params derived from challenge task_params
+    #    Use iter_child_nodes (not walk) to enforce top-level requirement
     harness_required = _required_functions(challenge)
-    func_defs = {}
-    for node in ast.walk(tree):
+    top_level_funcs = {}
+    for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            params = [a.arg for a in node.args.args]
-            func_defs[node.name] = params
+            params = [a.arg for a in node.args.args if a.arg != "self"]
+            top_level_funcs[node.name] = params
 
     for fname, required_params in harness_required.items():
-        if fname not in func_defs:
-            errors.append(f"Missing required function: {fname}")
+        if fname not in top_level_funcs:
+            errors.append(f"Missing required top-level function: {fname}")
         else:
-            actual = func_defs[fname]
-            # Skip 'self' if present
-            actual_clean = [p for p in actual if p != "self"]
+            actual = top_level_funcs[fname]
             for rp in required_params:
-                if rp not in actual_clean:
+                if rp not in actual:
                     errors.append(
                         f"{fname} missing parameter: {rp}"
                     )

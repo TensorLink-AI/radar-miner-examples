@@ -22,14 +22,7 @@ def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness.  Always returns valid code."""
 
     # ── STEP 0: Identify bucket and prepare fallback ──────────────
-    flops_min = int(challenge.get("min_flops_equivalent", 0))
-    flops_max = int(challenge.get("max_flops_equivalent", 0))
-    # Also check nested format
-    if not (flops_min or flops_max):
-        fb = challenge.get("flops_budget", {})
-        if isinstance(fb, dict):
-            flops_min = int(fb.get("min", 0))
-            flops_max = int(fb.get("max", 0))
+    flops_min, flops_max = history.extract_flops_budget(challenge)
 
     bucket = history.identify_bucket(flops_min, flops_max)
     target_flops = int(flops_max * 0.6) if flops_max else 0

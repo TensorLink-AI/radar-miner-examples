@@ -7,13 +7,13 @@ from core import llm, db_client, validation, prompt_builder, history, tools
 
 STRATEGY_PREAMBLE = """\
 You are a pragmatic ML engineer. Your goal is simple: build a well-designed PyTorch model \
-for time-series forecasting that fits within the given FLOPs budget and produces good predictions.
+that fits within the given FLOPs budget and produces good predictions for the task described below.
 
 Do NOT overthink strategy. Do NOT try to game scoring. Just build a solid model:
-- Pick an appropriate architecture for the FLOPs budget
+- Pick an appropriate architecture for the FLOPs budget and task
 - Use standard best practices (LayerNorm, residual connections, proper init)
 - Set reasonable training hyperparameters (learning rate, batch size, epochs)
-- Make sure the output shape is exactly right
+- Make sure the output shape matches the task requirements exactly
 - Keep it clean and correct — a working simple model beats a broken clever one"""
 
 
@@ -39,29 +39,30 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
         f"Target around {target:,} FLOPs."
     )
 
-    # Dynamic sizing guidance from challenge parameters
+    # Generic sizing guidance from challenge parameters
     task = (challenge or {}).get("task", {})
     tp = task.get("task_params", {})
-    ctx = tp.get("context_len", 512)
-    pred = tp.get("prediction_len", 96)
-    nvar = tp.get("num_variates", 1)
-    nq = len(tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
 
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
-
-    parts.append(
-        f"A simple 2-layer channel-independent model can afford max hidden ~ {max_hidden}. "
-        f"More complex architectures must budget FLOPs across layers. "
-        f"Use the FLOPs formulas in the calculator section to verify your design fits."
-    )
+    if tp:
+        param_summary = ", ".join(f"{k}={v}" for k, v in tp.items())
+        parts.append(
+            f"Task parameters: {param_summary}.\n"
+            f"Size your model to fit within ~{target:,} FLOPs. "
+            f"Use the FLOPs formulas in the calculator section to verify your design fits."
+        )
+    else:
+        parts.append(
+            f"Size your model to fit within ~{target:,} FLOPs. "
+            f"Use the FLOPs formulas in the calculator section to verify your design fits."
+        )
 
     if frontier:
         # Just show what exists — don't tell the LLM to game anything
-        best = min(frontier, key=lambda m: m.get("objectives", {}).get("crps", float("inf")))
-        best_crps = best.get("objectives", {}).get("crps", "?")
+        best = frontier[0]
+        best_obj = best.get("objectives", {})
+        best_summary = ", ".join(f"{k}={v}" for k, v in best_obj.items()) if best_obj else "unknown"
         parts.append(
-            f"The current best CRPS on the frontier is {best_crps}. "
+            f"The current best frontier metrics: {best_summary}. "
             "Study the frontier code for inspiration, but don't just copy it — "
             "build something that works well."
         )
@@ -91,7 +92,11 @@ def design_architecture(challenge: dict, client) -> dict:
           f"target: {target_flops:,}", file=sys.stderr)
 
     # Load scratchpad
-    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    scratch_dir = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    except Exception as exc:
+        print(f"[simple] scratchpad load failed: {exc}", file=sys.stderr)
     state = history.load_state(scratch_dir) if scratch_dir else {}
 
     # Get frontier
@@ -241,7 +246,10 @@ def design_architecture(challenge: dict, client) -> dict:
     )
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)
-    save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    try:
+        save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    except Exception as exc:
+        print(f"[simple] scratchpad save failed: {exc}", file=sys.stderr)
 
     return {
         "code": code,

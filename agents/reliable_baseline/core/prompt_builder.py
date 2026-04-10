@@ -1,22 +1,18 @@
 """Build rich context prompts for the LLM.
 
-All harness parameters are read from the challenge dict, with sensible
-defaults matching flops_estimator.py.  Nothing is hardcoded.
+All harness parameters are read from the challenge dict generically.
+No task-specific parameter names are hardcoded — the prompt adapts to
+whatever task_params the challenge provides.
 """
 
 from core.history import extract_flops_budget, format_history
 
 
-def _get_harness_params(challenge: dict) -> tuple[int, int, int, list, int]:
-    """Extract harness parameters from the challenge, with defaults."""
-    task = challenge.get("task", {})
-    tp = task.get("task_params", {})
-    ctx = tp.get("context_len", 512)
-    pred = tp.get("prediction_len", 96)
-    nvar = tp.get("num_variates", 1)
-    quants = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
-    nq = len(quants)
-    return ctx, pred, nvar, quants, nq
+def _format_task_params(tp: dict) -> str:
+    """Format task_params as key=value pairs for display."""
+    if not tp:
+        return "(none)"
+    return ", ".join(f"{k}={v}" for k, v in tp.items())
 
 
 def _compute_bucket_strategy(challenge: dict, bucket: str) -> str:
@@ -25,36 +21,26 @@ def _compute_bucket_strategy(challenge: dict, bucket: str) -> str:
     Instead of prescribing specific architectures, computes budget-derived
     constraints the LLM can use to size whatever model it builds.
     """
-    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
     flops_min, flops_max = extract_flops_budget(challenge)
     target = int(flops_max * 0.6) if flops_max else 0
-
-    # Max hidden for a simple 2-layer channel-independent model:
-    # FLOPs = V * 2 * H * (ctx + pred * nq)
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
 
     return (
         f"For this '{bucket}' bucket ({flops_min:,}-{flops_max:,} FLOPs), "
         f"target ~{target:,} FLOPs (60% of max). "
-        f"A simple 2-layer channel-independent model can afford max hidden ~ {max_hidden}. "
-        f"More complex architectures must budget FLOPs across their layers. "
         f"Choose whatever architecture best fits this budget — the estimator "
-        f"measures actual forward-pass FLOPs, so any standard PyTorch ops work."
+        f"measures actual forward-pass FLOPs, so any standard PyTorch ops work. "
+        f"More complex architectures must budget FLOPs across their layers."
     )
 
 
 def _compute_sizing_guidance(challenge: dict) -> str:
     """Build architecture-agnostic FLOPs calculator section."""
-    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
     tp = challenge.get("task", {}).get("task_params", {})
+    param_str = ", ".join(tp.keys()) if tp else "**task_params"
     flops_min, flops_max = extract_flops_budget(challenge)
     target = int(flops_max * 0.6) if flops_max else 0
     gate_min = int(flops_min * 0.9) if flops_min else 0
     gate_max = int(flops_max * 1.1) if flops_max else 0
-
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
 
     lines = [
         "## FLOPs Calculator",
@@ -69,11 +55,10 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "**Budget summary:**",
         f"- Target FLOPs: {target:,} (60% of max)",
         f"- Hard gate: [{gate_min:,}, {gate_max:,}]",
-        f"- context_len={ctx}, num_variates={nvar}, prediction_len={pred}, "
-        f"len(quantiles)={nq}",
+        f"- Task params: {_format_task_params(tp)}",
         "",
         "**Quick sizing:**",
-        f"- A simple 2-layer model can afford max hidden ~ {max_hidden}.",
+        "- Use the FLOPs formulas above to estimate your model's total FLOPs.",
         "- ALWAYS verify your total FLOPs against the gate range.",
         "",
         "## Self-Sizing Pattern (IMPORTANT — use this in your build_model)",
@@ -82,15 +67,15 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "FLOPs budget constant. Do NOT hardcode hidden dims — derive them from the budget:",
         "",
         "```python",
-        f"def build_model({', '.join(tp.keys()) if tp else '**task_params'}):",
-        "    n_quantiles = len(quantiles)",
+        f"def build_model({param_str}):",
         f"    TARGET_FLOPS = {target}  # 60% of max budget",
         "",
-        "    out_features = prediction_len * n_quantiles",
-        "    flops_per_hidden = max(1, 2 * num_variates * (context_len + out_features))",
+        "    # Estimate FLOPs per hidden unit based on your architecture,",
+        "    # then derive hidden_dim from TARGET_FLOPS // flops_per_hidden.",
+        "    # Adjust this formula to match your specific layer structure.",
         "    hidden_dim = max(4, TARGET_FLOPS // flops_per_hidden)",
         "",
-        "    return MyModel(context_len, prediction_len, num_variates, n_quantiles, hidden_dim)",
+        f"    return MyModel({param_str}, hidden_dim)",
         "```",
         "",
         "This ensures the model adapts to any task parameters and budget automatically. "
@@ -104,19 +89,17 @@ def build_system_prompt(challenge: dict) -> str:
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
     param_str = ", ".join(tp.keys()) if tp else "**task_params"
-    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
+    task_name = task.get("name", "unknown")
     parts: list[str] = []
 
     parts.append(
-        "You are an expert ML researcher designing time-series forecasting models "
-        "for competitive evaluation.\n\n"
+        f"You are an expert ML researcher designing models for the '{task_name}' task "
+        "in a competitive evaluation.\n\n"
         "Your code runs inside a frozen training harness. You MUST define:\n"
         f"- def build_model({param_str}) -> nn.Module\n"
         "- def build_optimizer(model) -> Optimizer\n\n"
-        f"The harness calls build_model({ctx}, {pred}, "
-        f"{nvar}, {quants}).\n"
-        f"Input shape: (batch, {ctx}, {nvar}). "
-        f"Output shape: (batch, {pred}, {nvar}, {nq})."
+        f"The harness calls build_model with these parameters: {_format_task_params(tp)}.\n"
+        "See the task description and constraints below for I/O shape requirements."
     )
 
     domain = task.get("domain_system_prompt", "")
@@ -155,9 +138,9 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
     """Build the user prompt with budget, frontier, DB context, and history."""
     parts: list[str] = []
 
-    ctx, pred, nvar, quants, nq = _get_harness_params(challenge)
     tp = challenge.get("task", {}).get("task_params", {})
     param_str = ", ".join(tp.keys()) if tp else "**task_params"
+    call_args = ", ".join(f"{k}={v!r}" for k, v in tp.items()) if tp else "..."
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = context.get("bucket", "unknown")
     target = context.get("target_flops", int(flops_max * 0.6))
@@ -174,6 +157,17 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
     # Required interface with values from the challenge
     parts.append(
         "## Required Output Structure\n"
+        "Your code MUST define these two top-level functions (not inside a class):\n\n"
+        f"1. `def build_model({param_str}):`\n"
+        f"   - Called as: build_model({call_args})\n"
+        "   - Must return an nn.Module\n"
+        "   - See the task description and constraints for I/O shape details\n\n"
+        "2. `def build_optimizer(model):`\n"
+        "   - Takes the model returned by build_model()\n"
+        "   - Must return a torch.optim.Optimizer\n\n"
+        "Optional hooks: training_config(), init_weights(), configure_amp(), "
+        "transform_batch(), on_step_end(), build_scheduler(), compute_loss()\n\n"
+        "Minimal skeleton:\n"
         "```python\n"
         "import torch\n"
         "import torch.nn as nn\n\n"
@@ -182,17 +176,14 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
         "        super().__init__()\n"
         "        # ... your architecture ...\n"
         "    def forward(self, x):\n"
-        f"        # x: (batch, context_len, num_variates) = (batch, {ctx}, {nvar})\n"
-        f"        # return: (batch, prediction_len, num_variates, len(quantiles)) = "
-        f"(batch, {pred}, {nvar}, {nq})\n"
+        "        # See task description/constraints for I/O shapes\n"
         "        ...\n\n"
         f"def build_model({param_str}):\n"
         f"    return YourModel({param_str})\n\n"
         "def build_optimizer(model):\n"
         "    return torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)\n"
         "```\n\n"
-        f"IMPORTANT: num_variates={nvar}, len(quantiles)={nq}.\n"
-        f"quantiles = {quants}"
+        f"Task parameters: {_format_task_params(tp)}"
     )
 
     # Dynamic FLOPs calculator
@@ -235,8 +226,7 @@ def build_user_prompt(challenge: dict, context: dict) -> str:
         "## Output Format\n"
         "Return ONLY a single ```python code block with the complete code. "
         "Include optional hooks (training_config, build_scheduler, init_weights) "
-        "for best training dynamics. Include RevIN (Reversible Instance Normalization) "
-        "for cross-domain robustness."
+        "for best training dynamics."
     )
 
     return "\n\n".join(parts)
@@ -247,13 +237,8 @@ def format_frontier(frontier: list[dict], max_entries: int = 3) -> str:
     lines: list[str] = ["## Current Frontier (models you must beat)"]
     for i, member in enumerate(frontier[:max_entries]):
         metrics = member.get("objectives", {})
-        lines.append(
-            f"**Member {i + 1}**: "
-            f"crps={metrics.get('crps', '?')}, "
-            f"mase={metrics.get('mase', '?')}, "
-            f"exec_time={metrics.get('exec_time', '?')}s, "
-            f"memory={metrics.get('memory_mb', '?')}MB"
-        )
+        metric_parts = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        lines.append(f"**Member {i + 1}**: {metric_parts}")
         code = member.get("code", "")
         if code:
             if len(code) > 4000:
@@ -274,9 +259,10 @@ def format_db_context(recent: dict | list, failures: dict | list,
             parts.append("**Recent experiments:**")
             for exp in items[:5]:
                 m = exp.get("metrics", {})
-                parts.append(
-                    f"- {exp.get('name', '?')}: "
-                    f"crps={m.get('crps', '?')}, flops={exp.get('flops', '?')}")
+                metric_str = ", ".join(f"{k}={v}" for k, v in m.items()) if m else "no metrics"
+                flops = exp.get('flops', '')
+                name = exp.get('name', '?')
+                parts.append(f"- {name}: {metric_str}" + (f", flops={flops}" if flops else ""))
 
     if failures:
         items = failures if isinstance(failures, list) else failures.get("failures", [])

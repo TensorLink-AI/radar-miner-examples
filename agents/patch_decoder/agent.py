@@ -47,19 +47,32 @@ def _analytical_flops(V, n_patches, patch_size, d_model, ff_mult,
     return patch_embed + mlp_total + norms + head
 
 
-def _compute_scaling(challenge: dict) -> dict:
+def _compute_scaling(challenge: dict) -> dict | None:
     """Derive (d_model, n_layers, patch_size) from the challenge budget.
 
     Grid-searches combinations and picks the one closest to 60% of
     flops_max.  Falls back to a minimal direct-linear config if no
     patch-based config fits.
+
+    Returns None if the task is not ts_forecasting (i.e. required
+    task_params keys are missing), signalling that this agent cannot
+    handle the task.
     """
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    context_len = tp.get("context_len", 512)
-    prediction_len = tp.get("prediction_len", 96)
-    num_variates = tp.get("num_variates", 1)
-    quantiles = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+
+    # This agent only supports ts_forecasting.  Bail out early when the
+    # required task_params keys are absent.
+    required_keys = {"context_len", "prediction_len", "num_variates", "quantiles"}
+    if not required_keys.issubset(tp.keys()):
+        missing = required_keys - tp.keys()
+        _log(f"[patch_decoder] Unsupported task — missing task_params keys: {missing}")
+        return None
+
+    context_len = tp["context_len"]
+    prediction_len = tp["prediction_len"]
+    num_variates = tp["num_variates"]
+    quantiles = tp["quantiles"]
 
     flops_min, flops_max = history.extract_flops_budget(challenge)
     target = int(flops_max * 0.6)
@@ -132,7 +145,7 @@ def _generate_code(cfg: dict, task_params: dict | None = None) -> str:
     bs = cfg["batch_size"]
     ga = cfg["grad_accum"]
 
-    param_str = ", ".join(task_params.keys()) if task_params else "context_len, prediction_len, num_variates, quantiles"
+    param_str = ", ".join(task_params.keys()) if task_params else "**task_params"
 
     return textwrap.dedent(f"""\
         import torch
@@ -281,6 +294,13 @@ def design_architecture(challenge: dict, client) -> dict:
 
     # ── Compute scaling dynamically from budget ──────────────────
     cfg = _compute_scaling(challenge)
+
+    if cfg is None:
+        task_name = challenge.get("task", {}).get("name", "<unknown>")
+        _log(f"[patch_decoder] Skipping submission — patch_decoder only supports "
+             f"ts_forecasting tasks (got {task_name!r})")
+        return {"code": "", "name": "patch_decoder_skip", "motivation":
+                f"patch_decoder only supports ts_forecasting tasks, not {task_name!r}"}
 
     _log(f"[patch_decoder] Dynamic config: d_model={cfg['d_model']}, "
          f"layers={cfg['n_layers']}, patch_size={cfg['patch_size']}")

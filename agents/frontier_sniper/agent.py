@@ -13,7 +13,7 @@ Do NOT redesign the architecture. Minimal diff, maximum impact.
 Key rules:
 - Start from the BEST frontier member's code — copy it almost entirely
 - Change at most 1-2 things: optimizer config, a normalization layer, init scheme, LR schedule
-- The sigmoid scoring has steepness=20: even 1-2% CRPS improvement gives ~0.55-0.65 score
+- The sigmoid scoring has steepness=20: even 1-2% improvement on the primary metric gives ~0.55-0.65 score
 - With softmax temperature=0.1, even a tiny score lead dominates the round
 - NEVER change the model architecture dramatically — only tune the training dynamics
 - Keep FLOPs within budget — do NOT add layers or increase hidden dims"""
@@ -22,23 +22,21 @@ def _make_bootstrap_instructions(challenge: dict, flops_max: int) -> str:
     """Build budget-aware bootstrap instructions from the challenge."""
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    ctx = tp.get("context_len", 512)
-    pred = tp.get("prediction_len", 96)
-    nvar = tp.get("num_variates", 1)
-    nq = len(tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]))
     target = int(flops_max * 0.6)
 
-    denom = 2 * nvar * (ctx + pred * nq)
-    max_hidden = target // denom if denom > 0 else 0
-
-    return (
-        f"No frontier exists yet. Submit a strong, proven baseline:\n"
-        f"- Target {target:,} FLOPs (60% of max). "
-        f"A 2-layer channel-independent model can afford max hidden ~ {max_hidden}.\n"
-        f"- Use standard best practices: LayerNorm, residual connections, cosine LR schedule\n"
-        f"- Use the FLOPs formulas in the calculator section to self-check your design\n"
-        f"- Focus on reliability over novelty — be the baseline others must beat"
-    )
+    lines = [
+        f"No frontier exists yet. Submit a strong, proven baseline:",
+        f"- Target {target:,} FLOPs (60% of max).",
+    ]
+    if tp:
+        param_summary = ", ".join(f"{k}={v}" for k, v in tp.items())
+        lines.append(f"- Task parameters: {param_summary}. Size your model accordingly.")
+    lines += [
+        f"- Use standard best practices: LayerNorm, residual connections, cosine LR schedule",
+        f"- Use the FLOPs formulas in the calculator section to self-check your design",
+        f"- Focus on reliability over novelty — be the baseline others must beat",
+    ]
+    return "\n".join(lines)
 
 
 def get_frontier_for_bucket(challenge: dict) -> list[dict]:
@@ -59,11 +57,9 @@ def analyze_frontier(frontier: list[dict]) -> str:
         metrics = member.get("objectives", {})
         code = member.get("code", "")
         lines.append(f"--- Frontier Member {i + 1} ---")
-        lines.append(f"CRPS: {metrics.get('crps', '?')}")
-        lines.append(f"MASE: {metrics.get('mase', '?')}")
-        lines.append(f"Exec time: {metrics.get('exec_time', '?')}s")
-        lines.append(f"Memory: {metrics.get('memory_mb', '?')}MB")
-        lines.append(f"FLOPs: {member.get('objectives', {}).get('flops_equivalent_size', '?')}")
+        for metric_name, metric_val in metrics.items():
+            lines.append(f"{metric_name}: {metric_val}")
+        lines.append(f"FLOPs: {metrics.get('flops_equivalent_size', '?')}")
         if code:
             if len(code) > 5000:
                 code = code[:5000] + "\n# ... truncated"
@@ -71,7 +67,7 @@ def analyze_frontier(frontier: list[dict]) -> str:
         lines.append("")
 
     lines.append(
-        "Pick the BEST member (lowest CRPS). Copy its code almost entirely. "
+        "Pick the BEST member (best primary metric). Copy its code almost entirely. "
         "Make ONE surgical improvement: better LR schedule, weight init, "
         "gradient clipping, normalization, or optimizer hyperparameters. "
         "Explain your single change in a code comment."
@@ -93,7 +89,7 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
     if frontier:
         parts.append(
             "STRATEGY: You are sniping the frontier. Your goal is to BARELY beat the "
-            "best frontier CRPS. Copy the best frontier code and make ONE targeted change."
+            "best frontier primary metric. Copy the best frontier code and make ONE targeted change."
         )
         parts.append(analyze_frontier(frontier))
     else:
@@ -135,7 +131,11 @@ def design_architecture(challenge: dict, client) -> dict:
           f"target: {target_flops:,}", file=sys.stderr)
 
     # Load scratchpad (load_scratchpad is injected by harness)
-    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    scratch_dir = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    except Exception as exc:
+        print(f"[sniper] scratchpad load failed: {exc}", file=sys.stderr)
     state = history.load_state(scratch_dir) if scratch_dir else {}
     print(f"[sniper] Scratchpad loaded: {len(state)} keys", file=sys.stderr)
 
@@ -184,7 +184,7 @@ def design_architecture(challenge: dict, client) -> dict:
                     f"for the '{bucket}' FLOPs bucket. "
                     "Focus on training dynamics: LR schedules, optimizers, "
                     "initialization schemes, and normalization that correlate "
-                    "with good CRPS. Be concise."
+                    "with good primary metric scores. Be concise."
                 )},
                 {"role": "user", "content": (
                     "Search for experiments related to this bucket. Check "
@@ -289,7 +289,10 @@ def design_architecture(challenge: dict, client) -> dict:
     state = update_playbook(state, bucket, name, motivation)
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)
-    save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    try:
+        save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    except Exception as exc:
+        print(f"[sniper] scratchpad save failed: {exc}", file=sys.stderr)
 
     return {
         "code": code,

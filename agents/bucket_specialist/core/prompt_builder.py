@@ -13,22 +13,14 @@ def _compute_sizing_guidance(challenge: dict) -> str:
     """
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    ctx_len = tp.get("context_len", 512)
-    pred_len = tp.get("prediction_len", 96)
-    n_var = tp.get("num_variates", 1)
-    q_list = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
-    n_q = len(q_list)
 
     flops_min, flops_max = extract_flops_budget(challenge)
     target = int(flops_max * 0.6) if flops_max else 0
     gate_min = int(flops_min * 0.9) if flops_min else 0
     gate_max = int(flops_max * 1.1) if flops_max else 0
 
-    # Compute max_hidden for a simple 2-layer channel-independent model
-    # Linear(ctx_len, H) + Linear(H, pred*nq) per variate
-    # FLOPs = V * 2 * (ctx_len * H + H * pred * nq) ≈ V * 2 * H * (ctx_len + pred*nq)
-    denom = 2 * n_var * (ctx_len + pred_len * n_q)
-    max_hidden = target // denom if denom > 0 else 0
+    # Format task_params as key=value pairs
+    tp_summary = ", ".join(f"{k}={v}" for k, v in tp.items()) if tp else "(none provided)"
 
     lines = [
         "### FLOPs Calculator (use this to self-check your design)",
@@ -43,12 +35,10 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "**Budget summary:**",
         f"- Target FLOPs: {target:,} (60% of max)",
         f"- Hard gate: [{gate_min:,}, {gate_max:,}] (10% tolerance of [{flops_min:,}, {flops_max:,}])",
-        f"- context_len={ctx_len}, num_variates={n_var}, prediction_len={pred_len}, "
-        f"len(quantiles)={n_q}",
+        f"- Task params: {tp_summary}",
         "",
-        "**Quick sizing reference** (computed from this budget):",
-        f"- A simple 2-layer channel-independent model (Linear->ReLU->Linear) can afford "
-        f"max hidden ~ {max_hidden}.",
+        "**Quick sizing reference:**",
+        "- Use the task_params and target FLOPs to estimate how large your layers can be.",
         "- More complex architectures must budget FLOPs across their layers accordingly.",
         "- ALWAYS verify your total FLOPs against the gate range before finalizing.",
         "",
@@ -59,14 +49,13 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         "",
         "```python",
         f"def build_model({', '.join(tp.keys()) if tp else '**task_params'}):",
-        "    n_quantiles = len(quantiles)",
         f"    TARGET_FLOPS = {target}  # 60% of max budget",
         "",
-        "    out_features = prediction_len * n_quantiles",
-        "    flops_per_hidden = max(1, 2 * num_variates * (context_len + out_features))",
-        "    hidden_dim = max(4, TARGET_FLOPS // flops_per_hidden)",
-        "",
-        "    return MyModel(context_len, prediction_len, num_variates, n_quantiles, hidden_dim)",
+        "    # Estimate total input/output features from your task_params,",
+        "    # then derive hidden_dim so total FLOPs stay within budget.",
+        "    # Example for a 2-layer model (Linear->ReLU->Linear):",
+        "    #   flops_per_hidden = max(1, 2 * (in_features + out_features))",
+        "    #   hidden_dim = max(4, TARGET_FLOPS // flops_per_hidden)",
         "```",
         "",
         "This ensures the model adapts to any task parameters and budget automatically. "
@@ -139,21 +128,15 @@ def build_user_prompt(challenge: dict, *,
     # Harness interface — use actual challenge parameters when available
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
-    ctx_len = tp.get("context_len", 512)
-    pred_len = tp.get("prediction_len", 96)
-    n_var = tp.get("num_variates", 1)
-    q_list = tp.get("quantiles", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
-    n_q = len(q_list)
     param_str = ", ".join(tp.keys()) if tp else "**task_params"
+    call_args = ", ".join(f"{k}={v!r}" for k, v in tp.items()) if tp else "..."
     parts.append(
         "### Required Interface (Harness Task)\n"
         "Your code MUST define these two top-level functions (not inside a class):\n\n"
         f"1. `def build_model({param_str}):`\n"
-        f"   - Called as: build_model({ctx_len}, {pred_len}, {n_var}, {q_list})\n"
+        f"   - Called as: build_model({call_args})\n"
         "   - Must return an nn.Module\n"
-        f"   - Forward input shape:  (batch, {ctx_len}, {n_var})\n"
-        f"   - Forward output shape: (batch, {pred_len}, {n_var}, {n_q})  "
-        "# i.e. (batch, prediction_len, num_variates, len(quantiles))\n\n"
+        "   - Read the task description and constraints below for I/O shape details\n\n"
         "2. `def build_optimizer(model):`\n"
         "   - Takes the model returned by build_model()\n"
         "   - Must return a torch.optim.Optimizer\n\n"
@@ -170,8 +153,7 @@ def build_user_prompt(challenge: dict, *,
         "        super().__init__()\n"
         "        # ... your architecture ...\n"
         "    def forward(self, x):\n"
-        "        # x: (batch, context_len, num_variates)\n"
-        "        # return: (batch, prediction_len, num_variates, len(quantiles))\n"
+        "        # See task description/constraints for I/O shapes\n"
         "        ...\n\n"
         f"def build_model({param_str}):\n"
         f"    return MyModel({param_str})\n\n"
@@ -213,14 +195,8 @@ def format_frontier(frontier: list[dict], max_entries: int = 3) -> str:
     lines: list[str] = []
     for i, member in enumerate(frontier[:max_entries]):
         metrics = member.get("objectives", {})
-        lines.append(
-            f"**Member {i + 1}**: "
-            f"crps={metrics.get('crps', '?')}, "
-            f"mase={metrics.get('mase', '?')}, "
-            f"exec_time={metrics.get('exec_time', '?')}s, "
-            f"memory={metrics.get('memory_mb', '?')}MB, "
-            f"flops={member.get('objectives', {}).get('flops_equivalent_size', '?')}"
-        )
+        metric_parts = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        lines.append(f"**Member {i + 1}**: {metric_parts}")
         code = member.get("code", "")
         if code:
             # Truncate very long code
@@ -243,10 +219,10 @@ def format_db_context(recent: dict | list, failures: dict | list,
             parts.append("**Recent experiments:**")
             for exp in items[:5]:
                 m = exp.get("metrics", {})
-                parts.append(
-                    f"- {exp.get('name', '?')}: "
-                    f"crps={m.get('crps', '?')}, flops={exp.get('flops', '?')}"
-                )
+                metric_str = ", ".join(f"{k}={v}" for k, v in m.items()) if m else "no metrics"
+                flops = exp.get('flops', '')
+                name = exp.get('name', '?')
+                parts.append(f"- {name}: {metric_str}" + (f", flops={flops}" if flops else ""))
 
     if failures:
         items = failures if isinstance(failures, list) else failures.get("failures", [])

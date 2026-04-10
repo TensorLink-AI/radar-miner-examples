@@ -6,24 +6,19 @@ import tempfile
 from core import llm, db_client, validation, prompt_builder, history, tools
 
 STRATEGY_PREAMBLE = """You are a multi-objective optimizer. You MUST beat the frontier on ALL \
-metrics simultaneously to earn the 1.5x dominance bonus. The objectives are:
-- crps (weight 1.0) — primary forecast quality metric, lower is better
-- mase (weight 0.5) — mean absolute scaled error, lower is better
-- exec_time (weight 0.2) — training wall-clock time in seconds, lower is better
-- memory_mb (weight 0.1) — peak GPU memory in MB, lower is better
+metrics simultaneously to earn the 1.5x dominance bonus. The task's objectives \
+(primary and secondary) are listed in the Objectives section below — read them carefully.
 
-Most miners only optimize crps. The secondary metrics are your ATTACK SURFACE. \
-A model that matches frontier crps while being 50% faster and 60% smaller in memory \
-will DOMINATE and earn the 1.5x multiplier.
+Most miners only optimize the primary metric. The secondary metrics are your ATTACK SURFACE. \
+A model that matches the frontier's primary metric while being significantly better on \
+secondary objectives will DOMINATE and earn the 1.5x multiplier.
 
 Design principles for multi-objective dominance:
 - Use bfloat16 via configure_amp() for memory savings
 - Use larger batch sizes via training_config() for faster wall-clock
-- Use init_weights() for faster convergence (good crps in fewer steps = lower exec_time)
-- Use compute_loss() to jointly optimize crps AND mase
+- Use init_weights() for faster convergence (good primary metric in fewer steps)
+- Use compute_loss() to jointly optimize the primary and secondary objectives
 - Use the self-sizing pattern and FLOPs formulas to fit within budget efficiently"""
-
-OBJECTIVE_WEIGHTS = {"crps": 1.0, "mase": 0.5, "exec_time": 0.2, "memory_mb": 0.1}
 
 
 
@@ -35,34 +30,13 @@ def analyze_frontier_weaknesses(frontier: list[dict]) -> str:
     lines = ["### Frontier Weakness Analysis\n"]
     for i, member in enumerate(frontier):
         metrics = member.get("objectives", {})
-        crps = metrics.get("crps", None)
-        mase = metrics.get("mase", None)
-        exec_time = metrics.get("exec_time", None)
-        memory = metrics.get("memory_mb", None)
 
         lines.append(f"**Member {i + 1}:**")
-        lines.append(f"  crps={crps}, mase={mase}, exec_time={exec_time}s, memory={memory}MB")
-
-        # Identify weaknesses
-        weaknesses = []
-        if exec_time is not None and isinstance(exec_time, (int, float)):
-            if exec_time > 100:
-                weaknesses.append(f"SLOW (exec_time={exec_time}s) — attack with faster training")
-            if exec_time > 200:
-                weaknesses.append("VERY SLOW — use large batch + bfloat16 + simple ops")
-        if memory is not None and isinstance(memory, (int, float)):
-            if memory > 2000:
-                weaknesses.append(f"MEMORY HOG ({memory}MB) — use efficient layers + bfloat16")
-            if memory > 4000:
-                weaknesses.append("VERY HEAVY — depthwise convs + patch embedding + quantization")
-        if mase is not None and isinstance(mase, (int, float)) and mase > 0.5:
-            weaknesses.append(f"Weak MASE ({mase}) — add MASE to loss function")
-
-        if weaknesses:
-            lines.append("  Weaknesses: " + "; ".join(weaknesses))
-            lines.append("  → This member is DOMINATABLE on secondary metrics!")
-        else:
-            lines.append("  No obvious weaknesses — focus on matching crps with lower overhead")
+        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        lines.append(f"  Objectives: {metric_str}")
+        lines.append(
+            "  Analyze these metrics to find weaknesses you can exploit for Pareto dominance."
+        )
 
         code = member.get("code", "")
         if code:
@@ -75,22 +49,12 @@ def analyze_frontier_weaknesses(frontier: list[dict]) -> str:
 
 
 def get_dominatable_targets(frontier: list[dict]) -> list[dict]:
-    """Find frontier members that are weak on secondary objectives."""
-    targets = []
-    for member in frontier:
-        m = member.get("objectives", {})
-        weakness_score = 0
-        if isinstance(m.get("exec_time"), (int, float)) and m["exec_time"] > 100:
-            weakness_score += 1
-        if isinstance(m.get("memory_mb"), (int, float)) and m["memory_mb"] > 2000:
-            weakness_score += 1
-        if isinstance(m.get("mase"), (int, float)) and m["mase"] > 0.5:
-            weakness_score += 1
-        if weakness_score > 0:
-            targets.append({**member, "_weakness_score": weakness_score})
+    """Return all frontier members as potential domination targets.
 
-    targets.sort(key=lambda x: x.get("_weakness_score", 0), reverse=True)
-    return targets
+    Rather than applying hardcoded thresholds, we return every member
+    and let the LLM reason about which are weakest on secondary metrics.
+    """
+    return list(frontier)
 
 
 def build_strategy_instructions(frontier: list[dict], state: dict,
@@ -111,9 +75,10 @@ def build_strategy_instructions(frontier: list[dict], state: dict,
             )
         else:
             parts.append(
-                "No obviously dominatable members — focus on matching best crps "
-                "while being extremely efficient. Use bfloat16, large batches, "
-                "simple but effective architectures."
+                "No obviously dominatable members — focus on matching the best "
+                "primary metric while being extremely efficient on secondary "
+                "objectives. Use bfloat16, large batches, simple but effective "
+                "architectures."
             )
 
         # Track dominatable targets in state
@@ -152,11 +117,17 @@ def design_architecture(challenge: dict, client) -> dict:
           f"target: {target_flops:,}", file=sys.stderr)
 
     # Load scratchpad state (load_scratchpad is injected by harness)
-    scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    scratch_dir = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821
+    except Exception as exc:
+        print(f"[pareto] scratchpad load failed: {exc}", file=sys.stderr)
     state = history.load_state(scratch_dir) if scratch_dir else {}
     print(f"[pareto] Scratchpad loaded: {len(state)} keys", file=sys.stderr)
 
     frontier = challenge.get("feasible_frontier", [])
+    if not frontier:
+        frontier = challenge.get("pareto_frontier", [])
     if not isinstance(frontier, list):
         frontier = []
     print(f"[pareto] Frontier members: {len(frontier)}", file=sys.stderr)
@@ -193,7 +164,7 @@ def design_architecture(challenge: dict, client) -> dict:
         "1. `configure_amp()` returning `{'enabled': True, 'dtype': 'bfloat16'}` for memory savings\n"
         "2. `training_config()` with larger batch_size for faster wall-clock\n"
         "3. `init_weights(model)` with proper initialization for fast convergence\n"
-        "4. Consider `compute_loss()` to jointly optimize crps AND mase\n"
+        "4. Consider `compute_loss()` to jointly optimize the task's primary and secondary objectives\n"
     )
     user_prompt += efficiency_addendum
 
@@ -209,8 +180,8 @@ def design_architecture(challenge: dict, client) -> dict:
                     "gather information about past experiments, then summarize "
                     "what approaches achieve good multi-objective performance "
                     f"in the '{bucket}' FLOPs bucket. "
-                    "Focus on exec_time, memory_mb, and mase in addition to "
-                    "crps. Identify which components are efficient. Be concise."
+                    "Focus on all objectives, not just the primary metric. "
+                    "Identify which components are efficient. Be concise."
                 )},
                 {"role": "user", "content": (
                     "Search for efficient experiments. Check component stats "
@@ -310,7 +281,10 @@ def design_architecture(challenge: dict, client) -> dict:
     )
     scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)
-    save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    try:
+        save_scratchpad(challenge, scratch_dir)  # noqa: F821
+    except Exception as exc:
+        print(f"[pareto] scratchpad save failed: {exc}", file=sys.stderr)
 
     return {
         "code": code,
