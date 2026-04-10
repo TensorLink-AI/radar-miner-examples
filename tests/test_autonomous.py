@@ -610,6 +610,51 @@ class TestAutonomousLoop:
         assert result["name"] == "autonomous_fallback"
         assert result["code"] == VALID_CODE
 
+    def test_fallback_to_proposed_when_flops_off_gate(self):
+        """If validate_code fails ONLY on FLOPs, the structurally-ok code
+        should still be captured as ``last_proposed_code`` and returned as
+        ``autonomous_best_effort`` when the loop exhausts. Previously the
+        loop returned None and the agent shipped literal empty code, which
+        the harness rejected with ``Missing build_model``."""
+        # Use impossibly-high FLOPs bounds so VALID_CODE (a trivial linear
+        # model) definitely fails the FLOPs hard gate but still passes
+        # structural checks (has build_model + build_optimizer at top level).
+        challenge = _make_challenge(llm_url="http://llm")
+        challenge["min_flops_equivalent"] = 10 ** 15
+        challenge["max_flops_equivalent"] = 10 ** 16
+
+        def mock_llm(payload):
+            # Every turn the LLM calls validate_code with the same code.
+            return _make_llm_response(tool_calls=[
+                _make_tool_call(
+                    "validate_code", {"code": VALID_CODE}, "call_v1"),
+            ])
+
+        client = MockClient(responses={
+            "http://llm/v1/chat/completions": mock_llm,
+        })
+        handlers = build_handlers(
+            client, challenge, tempfile.mkdtemp(), time.time() + 300)
+        messages = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "go"},
+        ]
+
+        original_max = _mod.MAX_TURNS
+        _mod.MAX_TURNS = 3
+        try:
+            result = _autonomous_loop(
+                client, challenge, messages, handlers, time.time() + 300)
+        finally:
+            _mod.MAX_TURNS = original_max
+
+        assert result is not None, (
+            "loop returned None — off-gate proposals should fall back to "
+            "last_proposed_code instead of nothing"
+        )
+        assert result["name"] == "autonomous_best_effort"
+        assert result["code"] == VALID_CODE
+
     def test_llm_failure_all_retries(self):
         """All LLM retries fail — loop returns None."""
         challenge = _make_challenge(llm_url="http://llm")
