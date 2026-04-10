@@ -34,6 +34,31 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _extract_code_block(text: str) -> str:
+    """Extract the first fenced Python code block from an LLM text response.
+
+    Used as a safety net when the LLM answers with code in plain text instead
+    of calling ``validate_code``/``submit``. Returns "" if no recognizable
+    block is found.
+    """
+    if not text:
+        return ""
+    for marker in ("```python", "```Python", "```py"):
+        if marker in text:
+            start = text.index(marker) + len(marker)
+            closing = text.find("```", start)
+            return (text[start:] if closing == -1 else text[start:closing]).strip()
+    if "```" in text:
+        start = text.index("```") + 3
+        nl = text.find("\n", start)
+        if nl == -1:
+            return text[start:].strip()
+        start = nl + 1
+        closing = text.find("```", start)
+        return (text[start:] if closing == -1 else text[start:closing]).strip()
+    return ""
+
+
 def _build_system_prompt(challenge: dict) -> str:
     """Build a system prompt that teaches the LLM how to be an autonomous agent."""
     task = challenge.get("task", {})
@@ -217,13 +242,32 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
         finish_reason = choice.get("finish_reason", "")
         tool_calls = assistant_msg.get("tool_calls")
 
-        # No tool calls → the LLM wants to talk. Append and continue
-        # (it might be thinking aloud before the next tool call)
-        if not tool_calls or finish_reason == "stop":
+        # No tool calls → the LLM wants to talk. Append and continue.
+        # NOTE: we do NOT also branch on ``finish_reason == "stop"`` — some
+        # OpenAI-compatible servers (notably certain Kimi deployments) return
+        # ``finish_reason="stop"`` alongside a populated ``tool_calls`` list.
+        # Short-circuiting on finish_reason would silently drop those tool
+        # calls and leave an assistant message with unresolved tool_calls in
+        # the history, which the next /v1/chat/completions call would reject.
+        if not tool_calls:
             content = assistant_msg.get("content") or ""
-            _log(f"[agent] Text response ({len(content)} chars): "
-                 f"{content[:200]}...")
+            _log(f"[agent] Text response ({len(content)} chars, "
+                 f"finish_reason={finish_reason}): {content[:200]}...")
             messages.append(assistant_msg)
+
+            # Fallback: if the LLM dumped code in a text response instead of
+            # calling validate_code, try to validate it ourselves so the
+            # round still has something to submit.
+            fallback_code = _extract_code_block(content)
+            if fallback_code:
+                ok, errors = validation.validate_code(fallback_code, challenge)
+                if ok:
+                    _log("[agent] Text response contained valid code — "
+                         "tracking as fallback")
+                    last_validated_code = fallback_code
+                else:
+                    _log(f"[agent] Text code block failed validation: {errors}")
+
             # If this is the last turn, the loop ends
             if turn == MAX_TURNS - 1:
                 break
@@ -232,8 +276,8 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
                 "role": "user",
                 "content": (
                     "Continue using your tools. If you have code ready, "
-                    "validate it and submit. Check time_remaining if unsure "
-                    "how much time you have left."
+                    "call validate_code on it, then submit. "
+                    "Check time_remaining if unsure how much time you have left."
                 ),
             })
             continue
