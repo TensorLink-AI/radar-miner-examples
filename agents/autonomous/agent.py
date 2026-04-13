@@ -16,6 +16,7 @@ import tempfile
 import time
 
 from core import history, validation
+from core.fallback_templates import generate_fallback
 from core.history import extract_flops_budget, identify_bucket
 from core.prompt_builder import _format_task_params, _compute_sizing_guidance
 from tools import TOOLS, SubmitSignal, build_handlers
@@ -138,7 +139,9 @@ def _build_system_prompt(challenge: dict) -> str:
         "4. Only torch + stdlib — no external dependencies\n"
         "5. No subprocess, socket, or ftplib imports\n"
         "6. Use standard nn ops (Linear, Conv1d, MultiheadAttention, etc.) "
-        "so the FLOPs counter works"
+        "so the FLOPs counter works\n"
+        "7. Read ALL task parameters from the function arguments — NEVER "
+        "hardcode dimension values, output shapes, or task-specific assumptions"
     )
 
     # ── Workflow guidance ─────────────────────────────────────────
@@ -151,16 +154,21 @@ def _build_system_prompt(challenge: dict) -> str:
         "component stats, dead ends — any endpoint you want), "
         "`search_papers` if you need new ideas\n"
         "4. Generate code based on your research\n"
-        "5. Use `validate_code` to check for errors\n"
-        "6. If validation fails, fix the errors and validate again\n"
+        "5. Use `validate_code` to check for errors — this runs the REAL FLOPs check\n"
+        "6. If validation fails, read the error carefully and follow the resize suggestion\n"
         "7. Optionally use `estimate_model_flops` for quick FLOPs checks while iterating\n"
         "8. When satisfied, call `submit` with your validated code\n"
         "9. Save notes via `write_scratchpad` for future rounds\n\n"
         "This is a suggestion — you can do these in any order. "
         "If the frontier already has strong models, focus on understanding "
         "and improving them. If bootstrapping, just build something solid.\n\n"
-        "IMPORTANT: Always validate before submitting. "
-        "If time is running low, submit what you have rather than researching more."
+        "## TIME MANAGEMENT (CRITICAL)\n"
+        "- You MUST have validated code by the halfway point of your time budget\n"
+        "- Generate and validate a working model FIRST, then iterate to improve\n"
+        "- Do NOT spend more than 2-3 turns on research before generating code\n"
+        "- If validate_code fails on FLOPs, follow the resize suggestion immediately\n"
+        "- If time is running low, submit what you have rather than researching more\n"
+        "- A submitted model that passes validation always beats no submission"
     )
 
     return "\n\n".join(parts)
@@ -211,6 +219,10 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
 
     Returns the submission dict {"code", "name", "motivation"} if the agent
     calls submit, or None if time/turns run out without a submission.
+
+    Time management checkpoints:
+      - At 50% time used with no validated code: inject urgent nudge
+      - At 75% time used with no validated code: auto-generate fallback
     """
     llm_url = challenge.get("llm_url", "")
     if not llm_url:
@@ -222,11 +234,63 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
     last_validated_code = None     # Passed validate_code cleanly (preferred)
     last_proposed_code = None      # Structurally ok but may have failed FLOPs
 
+    start_time = time.time()
+    total_budget = deadline - start_time
+    nudged_50pct = False           # Have we injected the 50% warning?
+    fallback_injected = False      # Have we injected the 75% fallback?
+
     for turn in range(MAX_TURNS):
         remaining = deadline - time.time()
         if remaining < TIME_BUFFER_SECONDS:
             _log(f"[agent] Time's up at turn {turn + 1}, breaking loop")
             break
+
+        elapsed = time.time() - start_time
+        pct_used = elapsed / total_budget if total_budget > 0 else 1.0
+
+        # ── 50% checkpoint: force code generation if nothing yet ──
+        if pct_used >= 0.50 and not nudged_50pct and not last_validated_code:
+            nudged_50pct = True
+            _log("[agent] 50% time checkpoint — no validated code yet, injecting urgency")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "WARNING: You have used over half your time with no validated "
+                    "code. Generate and validate code NOW. You can iterate after "
+                    "you have a working baseline. Call validate_code with your "
+                    "best code immediately."
+                ),
+            })
+
+        # ── 75% checkpoint: auto-generate fallback if still nothing ──
+        if pct_used >= 0.75 and not fallback_injected and not last_validated_code:
+            fallback_injected = True
+            _log("[agent] 75% time checkpoint — generating fallback template")
+            try:
+                fb_code = generate_fallback(challenge)
+                ok, errors = validation.validate_code(fb_code, challenge)
+                if ok:
+                    last_validated_code = fb_code
+                    _log("[agent] Fallback template passed validation")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "URGENT: A fallback model has been auto-generated and "
+                            "validated. You can still submit better code, but you "
+                            "MUST call submit within the next 1-2 turns or the "
+                            "fallback will be used. If you have improved code, "
+                            "validate and submit it now."
+                        ),
+                    })
+                else:
+                    struct_ok, _ = _structural_ok(fb_code, challenge)
+                    if struct_ok:
+                        last_proposed_code = fb_code
+                        _log(f"[agent] Fallback structurally ok but FLOPs off: {errors}")
+                    else:
+                        _log(f"[agent] Fallback template failed: {errors}")
+            except Exception as exc:
+                _log(f"[agent] Fallback generation failed: {exc}")
 
         # Build payload — include tools unless it's the very last turn
         payload = {
@@ -439,10 +503,29 @@ def design_architecture(challenge: dict, client) -> dict:
         motivation = result["motivation"]
         _log(f"[agent] Submitting: {name}")
     else:
-        code = ""
-        name = f"skipped_{bucket}"
-        motivation = "Autonomous agent could not produce validated code"
-        _log(f"[agent] No valid submission for {bucket}")
+        # Last-resort fallback: generate a guaranteed-valid model
+        _log(f"[agent] No result from loop — trying fallback template for {bucket}")
+        try:
+            fb_code = generate_fallback(challenge)
+            fb_ok, fb_errors = _structural_ok(fb_code, challenge)
+            if fb_ok:
+                code = fb_code
+                name = f"fallback_{bucket}"
+                motivation = (
+                    "Autonomous agent could not produce LLM-generated code; "
+                    "using auto-sized fallback template"
+                )
+                _log(f"[agent] Fallback template accepted for {bucket}")
+            else:
+                _log(f"[agent] Fallback template also failed: {fb_errors}")
+                code = ""
+                name = f"skipped_{bucket}"
+                motivation = "Autonomous agent could not produce validated code"
+        except Exception as exc:
+            _log(f"[agent] Fallback generation failed: {exc}")
+            code = ""
+            name = f"skipped_{bucket}"
+            motivation = "Autonomous agent could not produce validated code"
 
     # ── Final validation safety net ───────────────────────────────
     # We only wipe the submission when the code is STRUCTURALLY unusable

@@ -34,7 +34,7 @@ def _compute_bucket_strategy(challenge: dict, bucket: str) -> str:
 
 
 def _compute_sizing_guidance(challenge: dict) -> str:
-    """Build architecture-agnostic FLOPs calculator section."""
+    """Build architecture-agnostic FLOPs calculator and compliance protocol."""
     tp = challenge.get("task", {}).get("task_params", {})
     param_str = ", ".join(tp.keys()) if tp else "**task_params"
     flops_min, flops_max = extract_flops_budget(challenge)
@@ -43,6 +43,21 @@ def _compute_sizing_guidance(challenge: dict) -> str:
     gate_max = int(flops_max * 1.1) if flops_max else 0
 
     lines = [
+        "## FLOPs Compliance Protocol (CRITICAL — read this carefully)",
+        "",
+        "Your model WILL be measured with `torch.utils.flop_counter.FlopCounterMode`. "
+        "This is the EXACT same measurement the validator uses. The `validate_code` tool "
+        "runs this exact measurement. If it says your model is too large or too small, "
+        "you MUST fix it before submitting — otherwise the validator will reject it "
+        "with score=0.",
+        "",
+        "**Rules:**",
+        "1. Use standard nn ops (nn.Linear, nn.Conv1d, nn.MultiheadAttention, etc.) "
+        "so the FLOPs counter can see them",
+        "2. ALWAYS call `validate_code` before `submit` — it runs the real FLOPs check",
+        "3. If validate_code says FLOPs are off, follow its resize suggestion",
+        f"4. Target ~{target:,} FLOPs (60% of max). Hard gate: [{gate_min:,}, {gate_max:,}]",
+        "",
         "## FLOPs Calculator",
         "",
         "**FLOPs formulas for common ops:**",
@@ -57,28 +72,26 @@ def _compute_sizing_guidance(challenge: dict) -> str:
         f"- Hard gate: [{gate_min:,}, {gate_max:,}]",
         f"- Task params: {_format_task_params(tp)}",
         "",
-        "**Quick sizing:**",
-        "- Use the FLOPs formulas above to estimate your model's total FLOPs.",
-        "- ALWAYS verify your total FLOPs against the gate range.",
-        "",
-        "## Self-Sizing Pattern (IMPORTANT — use this in your build_model)",
+        "## Self-Sizing Pattern (MANDATORY — embed this in your build_model)",
         "",
         "Your `build_model()` MUST compute layer dimensions dynamically from an embedded "
-        "FLOPs budget constant. Do NOT hardcode hidden dims — derive them from the budget:",
+        "FLOPs budget constant. Do NOT hardcode hidden dims — derive them from the budget. "
+        "This is the #1 reason models get rejected: hardcoded dimensions that don't match "
+        "the FLOPs budget.",
         "",
         "```python",
         f"def build_model({param_str}):",
         f"    TARGET_FLOPS = {target}  # 60% of max budget",
         "",
-        "    # Estimate FLOPs per hidden unit based on your architecture,",
-        "    # then derive hidden_dim from TARGET_FLOPS // flops_per_hidden.",
-        "    # Adjust this formula to match your specific layer structure.",
+        "    # 1. Compute input/output features from your task_params",
+        "    # 2. Estimate FLOPs per hidden unit: flops_per_h = 2 * (in_feat + out_feat)",
+        "    # 3. Derive: hidden_dim = max(4, TARGET_FLOPS // flops_per_h)",
         "    hidden_dim = max(4, TARGET_FLOPS // flops_per_hidden)",
         "",
         f"    return MyModel({param_str}, hidden_dim)",
         "```",
         "",
-        "This ensures the model adapts to any task parameters and budget automatically. "
+        "This ensures the model auto-sizes to any budget. "
         "For multi-layer models, divide the budget across layers accordingly.",
     ]
     return "\n".join(lines)
