@@ -1,8 +1,13 @@
-"""AST-based pre-flight validation — mirrors the validator's checks exactly."""
+"""AST-based pre-flight validation — mirrors the validator's checks exactly.
+
+Uses ``torch.utils.flop_counter.FlopCounterMode`` as the primary FLOPs
+measurement (same as the validator), with actionable resize suggestions
+when models land outside the budget.
+"""
 
 import ast
 
-from core.flops_estimator import estimate_flops
+from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import extract_flops_budget
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
@@ -36,6 +41,7 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
       6. build_optimizer has param: model
       7. No forbidden imports (subprocess, socket, ftplib)
       8. FLOPs within budget bounds (if challenge provided)
+         — includes actionable resize suggestions on failure
     """
     errors: list[str] = []
 
@@ -85,19 +91,24 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
         if flops_min or flops_max:
             gate_min = int(flops_min * 0.9)
             gate_max = int(flops_max * 1.1)
+            target = int(flops_max * 0.6)
             estimated, err = estimate_flops(code, challenge)
             if err:
                 errors.append(f"FLOPs estimation failed: {err}")
             elif estimated is not None:
                 if estimated < gate_min:
+                    hint = suggest_resize(estimated, gate_min, gate_max, target)
                     errors.append(
                         f"Estimated FLOPs ({estimated:,}) below hard gate "
                         f"minimum ({gate_min:,}). Increase model capacity."
+                        + (f"\n{hint}" if hint else "")
                     )
                 elif estimated > gate_max:
+                    hint = suggest_resize(estimated, gate_min, gate_max, target)
                     errors.append(
                         f"Estimated FLOPs ({estimated:,}) above hard gate "
                         f"maximum ({gate_max:,}). Reduce model capacity."
+                        + (f"\n{hint}" if hint else "")
                     )
 
     return len(errors) == 0, errors

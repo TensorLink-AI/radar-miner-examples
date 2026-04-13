@@ -14,7 +14,7 @@ import sys
 import time
 
 from core import validation
-from core.flops_estimator import estimate_flops
+from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
     extract_flops_budget, identify_bucket, load_state, save_state,
     get_history, format_history,
@@ -344,17 +344,23 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         gate_min = int(flops_min * 0.9)
         gate_max = int(flops_max * 1.1)
         status = "WITHIN BUDGET"
+        hint = ""
         if estimated < gate_min:
             status = f"TOO LOW (below gate minimum {gate_min:,})"
+            hint = suggest_resize(estimated, gate_min, gate_max, target_flops)
         elif estimated > gate_max:
             status = f"TOO HIGH (above gate maximum {gate_max:,})"
-        return (
+            hint = suggest_resize(estimated, gate_min, gate_max, target_flops)
+        result = (
             f"Estimated FLOPs: {estimated:,}\n"
             f"Target: {target_flops:,} (60% of max)\n"
             f"Budget: [{flops_min:,}, {flops_max:,}]\n"
             f"Hard gate: [{gate_min:,}, {gate_max:,}]\n"
             f"Status: {status}"
         )
+        if hint:
+            result += f"\n{hint}"
+        return result
 
     # ── Validation handler ────────────────────────────────────────
 

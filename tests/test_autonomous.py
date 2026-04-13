@@ -766,18 +766,26 @@ class TestGracefulDegradation:
             del builtins.load_scratchpad
             del builtins.save_scratchpad
 
-    def test_no_llm_returns_empty_code(self):
+    def test_no_llm_uses_fallback_template(self):
+        """When no LLM URL is provided, fallback template provides valid code."""
         challenge = _make_challenge("small", llm_url="")
         client = MockClient()
         result = self._run(challenge, client)
-        assert result["code"] == ""
-        assert "skipped" in result["name"]
+        # Fallback template should produce structurally valid code
+        assert result["code"] != ""
+        assert "fallback" in result["name"]
+        assert "build_model" in result["code"]
+        assert "build_optimizer" in result["code"]
 
-    def test_llm_failure_returns_empty_code(self):
+    def test_llm_failure_uses_fallback_template(self):
+        """When the LLM is unreachable, fallback template provides valid code."""
         challenge = _make_challenge("small", llm_url="http://fake-llm")
         client = MockClient(raise_on_call=True)
         result = self._run(challenge, client)
-        assert result["code"] == ""
+        # Fallback template should produce structurally valid code
+        assert result["code"] != ""
+        assert "fallback" in result["name"]
+        assert "build_model" in result["code"]
 
     def test_does_not_crash_without_llm(self):
         challenge = _make_challenge("medium", llm_url="")
