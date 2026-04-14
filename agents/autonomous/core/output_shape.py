@@ -4,7 +4,7 @@ Purpose: catch "model outputs wrong shape" failures BEFORE submission, so
 training doesn't die on tensor-size mismatches like
 ``size of tensor a (96) must match the size of tensor b (64)``.
 
-Strategy (task-agnostic):
+Strategy (task-agnostic, layered):
   1. Parse the task's ``constraints`` strings for a pattern like
      ``Output[...]: (batch, prediction_len, num_variates, len(quantiles))``.
   2. Resolve each non-batch dimension against ``task_params``:
@@ -12,12 +12,16 @@ Strategy (task-agnostic):
        - direct key             → ``prediction_len`` → ``tp["prediction_len"]``
        - ``len(...)``           → ``len(quantiles)`` → ``len(tp["quantiles"])``
        - unresolved name        → wildcard (``-1``) — skipped during compare
-  3. Compare against the actual tensor shape the model produces on a dummy
-     forward pass. Works for 2D, 3D, 4D, or any rank that the constraint
-     specifies.
+  3. If constraint parsing yields nothing, fall back to shape fingerprints
+     derived from ``task.name`` + the key set of ``task_params`` (see
+     ``_fingerprint_shape``). This catches rounds where validators omit the
+     shape line from the constraints list — the CLAUDE.md spec still
+     pins the output shape for known tasks.
+  4. Compare against the actual tensor shape the model produces on a dummy
+     forward pass. Works for 2D, 3D, 4D, or any rank inferred above.
 
-If no constraint string is present (or none parses cleanly) inference returns
-None and the verifier is a no-op — we never reject on guesses.
+If nothing can be inferred, verification is a no-op — we never reject on
+guesses.
 """
 
 import re
@@ -118,13 +122,9 @@ def _resolve_dim(token: str, tp: dict) -> int | None:
     return None
 
 
-def infer_output_shape(task_params: dict,
-                       constraints: Iterable[str] | None) -> list[int] | None:
-    """Infer the expected output shape (excluding batch) from constraints.
-
-    Returns a list of ints where unresolved dims are ``-1`` (wildcards),
-    or ``None`` if no output-shape constraint was found / parseable.
-    """
+def _parse_from_constraints(task_params: dict,
+                            constraints: Iterable[str] | None) -> list[int] | None:
+    """Try the constraint-string path only. Returns None if nothing parses."""
     if not constraints:
         return None
 
@@ -152,6 +152,79 @@ def infer_output_shape(task_params: dict,
         return resolved
 
     return None
+
+
+# ── Task-fingerprint fallbacks ──────────────────────────────────────
+#
+# When validators omit the "Output: (...)" constraint we still know the
+# expected shape for well-defined tasks from CLAUDE.md:
+#
+#   ts_forecasting   : (B, prediction_len, num_variates, len(quantiles))
+#   token / nanogpt  : (B, block_size | seq_len | context_len, vocab_size)
+#
+# The recognizer keys off *task_params keys* rather than just task.name so
+# renames don't silently disable the check.
+
+_TOKEN_VOCAB_KEYS = ("vocab_size", "n_vocab", "vocabulary_size")
+_TOKEN_SEQ_KEYS = ("block_size", "seq_len", "sequence_length", "context_len")
+
+_TS_FORECAST_REQUIRED = ("prediction_len", "num_variates", "quantiles")
+
+
+def _first_int(tp: dict, keys) -> int | None:
+    for k in keys:
+        v = tp.get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    return None
+
+
+def _fingerprint_shape(task_name: str, task_params: dict) -> list[int] | None:
+    """Infer expected output shape from task.name + task_params keys.
+
+    Returns None when the task doesn't match a known fingerprint.
+    """
+    tp = task_params or {}
+    name = (task_name or "").lower()
+
+    # ── ts_forecasting: (B, prediction_len, num_variates, len(quantiles))
+    has_ts_keys = all(k in tp for k in _TS_FORECAST_REQUIRED)
+    if has_ts_keys and (
+        "forecast" in name or "forecasting" in name or "time_series" in name
+        or "ts_" in name or name == ""  # tolerate missing/blank task name
+    ):
+        pred = tp.get("prediction_len")
+        nv = tp.get("num_variates")
+        qs = tp.get("quantiles")
+        if (isinstance(pred, int) and isinstance(nv, int)
+                and isinstance(qs, (list, tuple))):
+            return [int(pred), int(nv), len(qs)]
+
+    # ── token / autoregressive: (B, seq_len, vocab_size)
+    vocab = _first_int(tp, _TOKEN_VOCAB_KEYS)
+    seq = _first_int(tp, _TOKEN_SEQ_KEYS)
+    if vocab is not None and seq is not None:
+        return [seq, vocab]
+
+    return None
+
+
+def infer_output_shape(task_params: dict,
+                       constraints: Iterable[str] | None,
+                       task_name: str | None = None) -> list[int] | None:
+    """Infer the expected output shape (excluding batch).
+
+    Order of preference:
+      1. Parse a constraint string (most specific).
+      2. Fall back to a task-fingerprint shape (name + param key set).
+
+    Returns a list of ints where unresolved dims are ``-1`` (wildcards),
+    or ``None`` if nothing could be inferred.
+    """
+    parsed = _parse_from_constraints(task_params, constraints)
+    if parsed is not None:
+        return parsed
+    return _fingerprint_shape(task_name or "", task_params or {})
 
 
 def verify_output_shape(actual: tuple | list,

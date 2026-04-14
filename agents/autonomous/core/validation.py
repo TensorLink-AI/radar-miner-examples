@@ -98,11 +98,11 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
         task = challenge.get("task", {}) or {}
         task_params = task.get("task_params", {}) or {}
         constraints = task.get("constraints", []) or []
+        task_name = task.get("name", "") or ""
         out_shape_sink: list = []
 
-        run_estimator = bool(flops_min or flops_max) or bool(
-            infer_output_shape(task_params, constraints)
-        )
+        expected_shape = infer_output_shape(task_params, constraints, task_name)
+        run_estimator = bool(flops_min or flops_max) or expected_shape is not None
 
         if run_estimator:
             estimated, err = estimate_flops(code, challenge, out_shape_sink)
@@ -127,12 +127,11 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
                         + (f"\n{hint}" if hint else "")
                     )
 
-            # 9. Output shape coherence — only when we actually saw a forward
-            # pass output (primary / JIT-trace path) AND the task declares an
-            # output shape constraint we could parse.
-            expected = infer_output_shape(task_params, constraints)
-            if expected is not None and out_shape_sink:
-                shape_err = verify_output_shape(out_shape_sink[0], expected)
+            # 9. Output shape coherence — fires whenever we captured a forward
+            # pass output AND we inferred an expected shape (constraint string
+            # OR task-fingerprint fallback).
+            if expected_shape is not None and out_shape_sink:
+                shape_err = verify_output_shape(out_shape_sink[0], expected_shape)
                 if shape_err:
                     errors.append(shape_err)
 

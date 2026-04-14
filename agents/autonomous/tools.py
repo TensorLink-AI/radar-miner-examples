@@ -439,12 +439,14 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         task = challenge.get("task", {}) or {}
         tp = task.get("task_params", {}) or {}
         constraints = task.get("constraints", []) or []
-        expected = infer_output_shape(tp, constraints)
+        task_name = task.get("name", "") or ""
+        expected = infer_output_shape(tp, constraints, task_name)
         if expected is None:
             return (
-                "No parseable output-shape constraint in task.constraints; "
-                "skipping shape check. (This is not an error — the task "
-                "simply doesn't declare an expected output shape.)"
+                "Could not infer an expected output shape for this task "
+                "(no parseable 'Output: (...)' constraint and the task "
+                "params/name don't match a known fingerprint). Skipping "
+                "shape check — not an error."
             )
         sink: list = []
         _, err = estimate_flops(code, challenge, sink)

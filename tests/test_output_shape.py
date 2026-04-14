@@ -84,14 +84,54 @@ class TestInferOutputShape:
         constraints = ["Output: (batch, prediction_len, mystery)"]
         assert infer_output_shape(tp, constraints) == [64, -1]
 
-    def test_no_constraint_returns_none(self):
-        assert infer_output_shape(_TS_TP, []) is None
+    def test_no_constraint_returns_none_for_unknown_task(self):
+        # Unknown task params + no constraint + unknown name → can't infer.
+        tp = {"foo": 10, "bar": 20}
+        assert infer_output_shape(tp, []) is None
 
-    def test_constraint_without_output_returns_none(self):
-        assert infer_output_shape(_TS_TP, ["Use Adam", "No dropout"]) is None
+    def test_constraint_without_output_returns_none_for_unknown_task(self):
+        tp = {"foo": 10, "bar": 20}
+        assert infer_output_shape(tp, ["Use Adam", "No dropout"]) is None
 
-    def test_none_constraints_returns_none(self):
-        assert infer_output_shape(_TS_TP, None) is None
+    def test_none_constraints_returns_none_for_unknown_task(self):
+        tp = {"foo": 10, "bar": 20}
+        assert infer_output_shape(tp, None) is None
+
+    # ── Fingerprint fallback (no constraint string) ────────────────
+
+    def test_fingerprint_ts_forecasting_by_name(self):
+        shape = infer_output_shape(_TS_TP, [], task_name="ts_forecasting")
+        assert shape == [96, 1, 3]
+
+    def test_fingerprint_ts_forecasting_by_keys_no_name(self):
+        # Even without a recognisable task name, the key set alone triggers
+        # the ts_forecasting fingerprint — the CLAUDE.md output shape is
+        # fully determined by task_params.
+        shape = infer_output_shape(_TS_TP, [], task_name="")
+        assert shape == [96, 1, 3]
+
+    def test_fingerprint_token_task(self):
+        tp = {"block_size": 128, "vocab_size": 5000}
+        shape = infer_output_shape(tp, [], task_name="nanogpt")
+        assert shape == [128, 5000]
+
+    def test_fingerprint_token_task_alt_key(self):
+        tp = {"seq_len": 64, "n_vocab": 2000}
+        shape = infer_output_shape(tp, [], task_name="")
+        assert shape == [64, 2000]
+
+    def test_fingerprint_unknown_task_returns_none(self):
+        tp = {"foo": 10, "bar": 20}
+        assert infer_output_shape(tp, [], task_name="mystery") is None
+
+    def test_constraint_string_wins_over_fingerprint(self):
+        # If both are parseable, the explicit constraint takes precedence.
+        shape = infer_output_shape(
+            _TS_TP,
+            ["Output: (batch, 7, 1, 3)"],
+            task_name="ts_forecasting",
+        )
+        assert shape == [7, 1, 3]
 
 
 # ── Verification ────────────────────────────────────────────────────
@@ -196,13 +236,20 @@ class TestValidateCodeShapeIntegration:
         ok, errors = validate_code(_CORRECT_CODE, _ts_challenge())
         assert ok, f"Unexpected errors: {errors}"
 
-    def test_no_constraints_means_no_shape_check(self):
-        # Remove the output-shape constraint — the check should be skipped.
+    def test_fingerprint_catches_bug_when_no_constraint_string(self):
+        # Regression: validator log showed "tensor a (96) must match tensor b (64)"
+        # on a Medium-bucket round. The previous check silently skipped when
+        # the challenge had no "Output: (...)" constraint string. With the
+        # task-fingerprint fallback we now catch the wrong-shape model even
+        # when constraints is empty, as long as the task is recognizable.
         ch = _ts_challenge(constraints=[])
+        # The ts_forecasting task name + prediction_len/num_variates/quantiles
+        # in task_params are enough to know the expected output shape.
+        ch["task"]["name"] = "ts_forecasting"
         ok, errors = validate_code(_WRONG_SHAPE_CODE, ch)
-        # The wrong-shape model has no FLOPs problem, so without a shape
-        # constraint to trigger verification it should pass structural checks.
-        assert ok, f"Unexpected errors without constraints: {errors}"
+        assert not ok, "Expected shape check to fire via fingerprint fallback"
+        joined = "\n".join(errors)
+        assert "mismatch" in joined.lower()
 
     def test_flops_and_shape_both_enforced(self):
         # With a tiny bucket, the FLOPs check should still run alongside
