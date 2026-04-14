@@ -19,6 +19,7 @@ from core.history import (
     extract_flops_budget, identify_bucket, load_state, save_state,
     get_history, format_history,
 )
+from core.output_shape import infer_output_shape, verify_output_shape
 from core.prompt_builder import format_frontier
 
 # ---------------------------------------------------------------------------
@@ -135,6 +136,30 @@ TOOLS: list[dict] = [
         },
     },
     # ── Validation tools ──────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "check_output_shape",
+            "description": (
+                "Run build_model and a dummy forward pass, then compare the "
+                "output tensor's shape against the expected shape parsed from "
+                "the task constraints. Catches 'tensor a (X) must match tensor "
+                "b (Y)' training failures before submission. Works for any "
+                "output rank (2D, 3D, 4D, ...) — the expected shape is "
+                "derived from the challenge, never hardcoded."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Python code with build_model",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -364,6 +389,35 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
 
     # ── Validation handler ────────────────────────────────────────
 
+    def check_output_shape_handler(code: str) -> str:
+        task = challenge.get("task", {}) or {}
+        tp = task.get("task_params", {}) or {}
+        constraints = task.get("constraints", []) or []
+        expected = infer_output_shape(tp, constraints)
+        if expected is None:
+            return (
+                "No parseable output-shape constraint in task.constraints; "
+                "skipping shape check. (This is not an error — the task "
+                "simply doesn't declare an expected output shape.)"
+            )
+        sink: list = []
+        _, err = estimate_flops(code, challenge, sink)
+        if err:
+            return f"Could not run forward pass: {err}"
+        if not sink:
+            return (
+                "Forward pass completed but no tensor output was captured "
+                "(possibly via a fallback path). Add a concrete forward() "
+                "that returns a torch.Tensor."
+            )
+        shape_err = verify_output_shape(sink[0], expected)
+        if shape_err:
+            return f"FAILED: {shape_err}"
+        return (
+            f"PASSED: Output shape {tuple(sink[0])} matches expected "
+            f"(B, {', '.join(str(e) if e >= 0 else '?' for e in expected)})."
+        )
+
     def validate_code_handler(code: str) -> str:
         ok, errors = validation.validate_code(code, challenge)
         if ok:
@@ -421,6 +475,7 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         "query_db": query_db,
         "get_frontier_details": get_frontier_details,
         "estimate_model_flops": estimate_model_flops,
+        "check_output_shape": check_output_shape_handler,
         "validate_code": validate_code_handler,
         "read_scratchpad": read_scratchpad,
         "write_scratchpad": write_scratchpad,

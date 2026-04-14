@@ -167,8 +167,8 @@ class TestToolDefinitions:
         tool_names = {t["function"]["name"] for t in TOOLS}
         expected = {
             "search_papers", "query_db", "get_frontier_details",
-            "estimate_model_flops", "validate_code", "read_scratchpad",
-            "write_scratchpad", "submit", "time_remaining",
+            "estimate_model_flops", "check_output_shape", "validate_code",
+            "read_scratchpad", "write_scratchpad", "submit", "time_remaining",
         }
         assert expected == tool_names
 
@@ -196,8 +196,8 @@ class TestToolHandlers:
         handlers = self._make_handlers()
         expected = {
             "search_papers", "query_db", "get_frontier_details",
-            "estimate_model_flops", "validate_code", "read_scratchpad",
-            "write_scratchpad", "submit", "time_remaining",
+            "estimate_model_flops", "check_output_shape", "validate_code",
+            "read_scratchpad", "write_scratchpad", "submit", "time_remaining",
         }
         assert set(handlers.keys()) == expected
 
