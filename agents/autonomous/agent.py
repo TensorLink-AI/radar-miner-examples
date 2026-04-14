@@ -144,6 +144,27 @@ def _build_system_prompt(challenge: dict) -> str:
         "hardcode dimension values, output shapes, or task-specific assumptions"
     )
 
+    # ── CRITICAL: output shape ────────────────────────────────────
+    parts.append(
+        "## CRITICAL: Output Shape\n"
+        "The #1 cause of training failure is tensor size mismatch — the "
+        "model projects to the wrong dim and the loss function errors out "
+        "with 'size of tensor a (X) must match the size of tensor b (Y)' "
+        "partway through training.\n\n"
+        "Your model's `forward()` MUST return a tensor whose shape EXACTLY "
+        "matches the shape described in the task constraints. Every "
+        "non-batch dimension must be derived from the build_model "
+        "arguments (task_params) — NEVER hardcode a dimension and NEVER "
+        "use context_len where prediction_len is required, or vice versa.\n\n"
+        "ALWAYS call `validate_code` before `submit`. `validate_code` runs "
+        "a real forward pass and checks the output shape against the "
+        "constraint — if it reports a dimension mismatch you MUST fix it "
+        "and re-validate. If `validate_code` reports a shape error, the "
+        "`check_output_shape` tool can help diagnose which layer produces "
+        "the wrong dim. Submitting code that hasn't passed `validate_code` "
+        "is the fastest way to lose this round."
+    )
+
     # ── Workflow guidance ─────────────────────────────────────────
     parts.append(
         "## Recommended Workflow\n"
@@ -431,9 +452,12 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
             })
 
     # Loop ended without an explicit submit. Prefer fully-validated code;
-    # otherwise fall back to any structurally-ok proposal we captured. The
-    # harness's pre_validate_code only checks structure, so an off-gate
-    # proposal still gets further through the pipeline than empty code.
+    # otherwise try to fully validate any structurally-ok proposal before
+    # falling back. Shipping code that only passed ``_structural_ok`` —
+    # i.e. parses + has build_model/build_optimizer — is how we end up
+    # submitting models with the wrong output shape or FLOPs mismatch,
+    # which then crash mid-training. Better to fall through to the
+    # guaranteed-valid template than to ship unvalidated code.
     if last_validated_code:
         _log("[agent] Loop ended without submit, using last validated code")
         return {
@@ -442,18 +466,24 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
             "motivation": "Time/turns exhausted — submitting last validated code",
         }
     if last_proposed_code:
-        _log("[agent] Loop ended without submit and no fully-validated code; "
-             "submitting last structurally-ok proposal")
-        return {
-            "code": last_proposed_code,
-            "name": "autonomous_best_effort",
-            "motivation": (
-                "Time/turns exhausted; submitting last structurally-valid "
-                "proposal so pre_validate_code has something to work with"
-            ),
-        }
+        full_ok, full_errors = validation.validate_code(
+            last_proposed_code, challenge,
+        )
+        if full_ok:
+            _log("[agent] Last proposed code passed full validation on final check; "
+                 "submitting it")
+            return {
+                "code": last_proposed_code,
+                "name": "autonomous_best_effort",
+                "motivation": (
+                    "Time/turns exhausted; last proposed code passed full "
+                    "validation on final re-check"
+                ),
+            }
+        _log("[agent] Last proposed code failed full validation on final check "
+             f"({full_errors}); falling through to guaranteed-valid template")
 
-    _log("[agent] Loop ended with no usable code at all")
+    _log("[agent] Loop ended with no fully-validated code")
     return None
 
 

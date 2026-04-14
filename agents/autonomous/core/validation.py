@@ -127,13 +127,31 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
                         + (f"\n{hint}" if hint else "")
                     )
 
-            # 9. Output shape coherence — only when we actually saw a forward
-            # pass output (primary / JIT-trace path) AND the task declares an
-            # output shape constraint we could parse.
+            # 9. Output shape coherence — must be a HARD gate whenever the
+            # task declares a parseable output-shape constraint. The classic
+            # "tensor a (96) vs tensor b (64)" training failure happens when
+            # build_model() returns a module whose forward() projects to the
+            # wrong dim; it would train for an hour before crashing. Better
+            # to reject at validate time.
             expected = infer_output_shape(task_params, constraints)
-            if expected is not None and out_shape_sink:
-                shape_err = verify_output_shape(out_shape_sink[0], expected)
-                if shape_err:
-                    errors.append(shape_err)
+            if expected is not None:
+                if not out_shape_sink:
+                    # FLOPs path bailed out (hook-based / static-walk fallback,
+                    # or we skipped FLOPs entirely because no budget was set).
+                    # Run a dedicated forward pass just to capture the shape.
+                    _, shape_only_err = estimate_flops(
+                        code, challenge, out_shape_sink,
+                    )
+                    if shape_only_err and not out_shape_sink:
+                        # Couldn't even instantiate/run the model — surface it
+                        # as a validation failure so the agent retries rather
+                        # than submitting something that won't run.
+                        errors.append(
+                            f"Output shape check failed: {shape_only_err}"
+                        )
+                if out_shape_sink:
+                    shape_err = verify_output_shape(out_shape_sink[0], expected)
+                    if shape_err:
+                        errors.append(shape_err)
 
     return len(errors) == 0, errors
