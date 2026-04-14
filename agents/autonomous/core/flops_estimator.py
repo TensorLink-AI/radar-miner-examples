@@ -28,11 +28,16 @@ def _log(msg: str) -> None:
 # ── FlopCounterMode estimation (primary — matches validator) ──────
 
 
-def _flopcounter_mode_flops(model: nn.Module, dummy: torch.Tensor) -> tuple[int, str]:
+def _flopcounter_mode_flops(model: nn.Module, dummy: torch.Tensor,
+                            out_shape: list | None = None) -> tuple[int, str]:
     """Estimate FLOPs using torch.utils.flop_counter.FlopCounterMode.
 
     This is the same approach the validator uses and is the source of truth
     for the size gate.  Returns (total_flops, error_message).
+
+    If ``out_shape`` is a mutable list, the actual output tensor's shape is
+    appended to it (as a tuple) so callers can perform additional coherence
+    checks without re-running the model.
     """
     try:
         from torch.utils.flop_counter import FlopCounterMode
@@ -44,8 +49,10 @@ def _flopcounter_mode_flops(model: nn.Module, dummy: torch.Tensor) -> tuple[int,
         with torch.no_grad():
             flop_counter = FlopCounterMode(display=False)
             with flop_counter:
-                model(dummy)
+                output = model(dummy)
             total = flop_counter.get_total_flops()
+            if out_shape is not None and isinstance(output, torch.Tensor):
+                out_shape.append(tuple(output.shape))
             return int(total), ""
     except Exception as exc:
         return 0, f"FlopCounterMode failed: {exc}"
@@ -54,7 +61,8 @@ def _flopcounter_mode_flops(model: nn.Module, dummy: torch.Tensor) -> tuple[int,
 # ── JIT trace + FlopCounterMode (fallback 1) ─────────────────────
 
 
-def _jit_trace_flops(model: nn.Module, dummy: torch.Tensor) -> tuple[int, str]:
+def _jit_trace_flops(model: nn.Module, dummy: torch.Tensor,
+                     out_shape: list | None = None) -> tuple[int, str]:
     """Trace the model with torch.jit.trace, then measure with FlopCounterMode."""
     try:
         from torch.utils.flop_counter import FlopCounterMode
@@ -67,8 +75,10 @@ def _jit_trace_flops(model: nn.Module, dummy: torch.Tensor) -> tuple[int, str]:
             traced = torch.jit.trace(model, dummy)
             flop_counter = FlopCounterMode(display=False)
             with flop_counter:
-                traced(dummy)
+                output = traced(dummy)
             total = flop_counter.get_total_flops()
+            if out_shape is not None and isinstance(output, torch.Tensor):
+                out_shape.append(tuple(output.shape))
             return int(total), ""
     except Exception as exc:
         return 0, f"JIT trace + FlopCounterMode failed: {exc}"
@@ -247,13 +257,19 @@ def suggest_resize(estimated: int, gate_min: int, gate_max: int,
 # ── Public API ───────────────────────────────────────────────────
 
 
-def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
+def estimate_flops(code: str, challenge: dict,
+                   out_shape_sink: list | None = None) -> tuple[int | None, str]:
     """Execute build_model, estimate FLOPs using FlopCounterMode (matching validator).
 
     Falls back through: JIT trace, forward-pass hooks, static walk.
 
     Returns (estimated_flops, error_message).
     On success error_message is empty. On failure estimated_flops is None.
+
+    If ``out_shape_sink`` is a mutable list, the actual forward-pass output
+    shape is appended to it as a tuple of ints — enabling callers like
+    ``validation`` to run an output-shape coherence check without paying for
+    a second forward pass.
     """
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
@@ -303,7 +319,7 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
         return None, f"Failed to create dummy input: {exc}"
 
     # ── Primary: FlopCounterMode (same as validator) ─────────────
-    total_flops, err = _flopcounter_mode_flops(model, dummy)
+    total_flops, err = _flopcounter_mode_flops(model, dummy, out_shape_sink)
     if not err and total_flops > 0:
         _log(f"[flops] FlopCounterMode: {total_flops:,}")
         del model
@@ -313,7 +329,7 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
         _log(f"[flops] FlopCounterMode failed, trying fallbacks: {err}")
 
     # ── Fallback 1: JIT trace + FlopCounterMode ──────────────────
-    total_flops, err2 = _jit_trace_flops(model, dummy)
+    total_flops, err2 = _jit_trace_flops(model, dummy, out_shape_sink)
     if not err2 and total_flops > 0:
         _log(f"[flops] JIT+FlopCounterMode: {total_flops:,}")
         del model

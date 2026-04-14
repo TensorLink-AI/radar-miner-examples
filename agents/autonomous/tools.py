@@ -19,7 +19,9 @@ from core.history import (
     extract_flops_budget, identify_bucket, load_state, save_state,
     get_history, format_history,
 )
+from core.output_shape import infer_output_shape, verify_output_shape
 from core.prompt_builder import format_frontier
+from core.trace import trace_architecture, format_trace
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
@@ -135,6 +137,63 @@ TOOLS: list[dict] = [
         },
     },
     # ── Validation tools ──────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "trace_architecture",
+            "description": (
+                "Run a dummy forward pass through build_model and return an "
+                "op-by-op trace: each leaf module's name, class, input shape, "
+                "output shape, and parameter count. Memory-efficient — only "
+                "shape tuples and ints are captured, never tensor data. Use "
+                "this to debug where a shape goes wrong inside the model, or "
+                "to verify an architecture behaves as you expect before "
+                "submission."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Python code with build_model",
+                    },
+                    "max_rows": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum trace rows to include in the rendered "
+                            "output (default 60). Deeper traces are still "
+                            "recorded internally but truncated for display."
+                        ),
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_output_shape",
+            "description": (
+                "Run build_model and a dummy forward pass, then compare the "
+                "output tensor's shape against the expected shape parsed from "
+                "the task constraints. Catches 'tensor a (X) must match tensor "
+                "b (Y)' training failures before submission. Works for any "
+                "output rank (2D, 3D, 4D, ...) — the expected shape is "
+                "derived from the challenge, never hardcoded."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Complete Python code with build_model",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -364,6 +423,47 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
 
     # ── Validation handler ────────────────────────────────────────
 
+    def trace_architecture_handler(code: str, max_rows: int = 60) -> str:
+        entries, err = trace_architecture(code, challenge)
+        if err:
+            return f"Trace failed: {err}"
+        if not entries:
+            return (
+                "Trace produced no entries — the model has no leaf modules "
+                "with parameters, or the forward pass produced no tensor "
+                "outputs through hooked modules."
+            )
+        return format_trace(entries, max_rows=max_rows)
+
+    def check_output_shape_handler(code: str) -> str:
+        task = challenge.get("task", {}) or {}
+        tp = task.get("task_params", {}) or {}
+        constraints = task.get("constraints", []) or []
+        expected = infer_output_shape(tp, constraints)
+        if expected is None:
+            return (
+                "No parseable output-shape constraint in task.constraints; "
+                "skipping shape check. (This is not an error — the task "
+                "simply doesn't declare an expected output shape.)"
+            )
+        sink: list = []
+        _, err = estimate_flops(code, challenge, sink)
+        if err:
+            return f"Could not run forward pass: {err}"
+        if not sink:
+            return (
+                "Forward pass completed but no tensor output was captured "
+                "(possibly via a fallback path). Add a concrete forward() "
+                "that returns a torch.Tensor."
+            )
+        shape_err = verify_output_shape(sink[0], expected)
+        if shape_err:
+            return f"FAILED: {shape_err}"
+        return (
+            f"PASSED: Output shape {tuple(sink[0])} matches expected "
+            f"(B, {', '.join(str(e) if e >= 0 else '?' for e in expected)})."
+        )
+
     def validate_code_handler(code: str) -> str:
         ok, errors = validation.validate_code(code, challenge)
         if ok:
@@ -421,6 +521,8 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         "query_db": query_db,
         "get_frontier_details": get_frontier_details,
         "estimate_model_flops": estimate_model_flops,
+        "trace_architecture": trace_architecture_handler,
+        "check_output_shape": check_output_shape_handler,
         "validate_code": validate_code_handler,
         "read_scratchpad": read_scratchpad,
         "write_scratchpad": write_scratchpad,

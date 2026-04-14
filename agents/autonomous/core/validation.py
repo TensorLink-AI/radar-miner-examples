@@ -9,6 +9,7 @@ import ast
 
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import extract_flops_budget
+from core.output_shape import infer_output_shape, verify_output_shape
 
 FORBIDDEN_IMPORTS = {"subprocess", "socket", "ftplib"}
 
@@ -42,6 +43,9 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
       7. No forbidden imports (subprocess, socket, ftplib)
       8. FLOPs within budget bounds (if challenge provided)
          — includes actionable resize suggestions on failure
+      9. Output shape matches the expected shape parsed from the task
+         ``constraints`` (when such a constraint is present). Handles any
+         tensor rank — the comparison is driven by the constraint string.
     """
     errors: list[str] = []
 
@@ -85,17 +89,29 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
                 if root in FORBIDDEN_IMPORTS:
                     errors.append(f"Forbidden import: {node.module}")
 
-    # 8. FLOPs bounds check — only if challenge provided and no structural errors
+    # 8. FLOPs bounds + 9. output shape check — only if no structural errors.
+    #    Both share a single forward pass: the estimator captures the
+    #    output tensor shape via ``out_shape_sink`` so we don't re-run the
+    #    model to verify coherence.
     if not errors and challenge is not None:
         flops_min, flops_max = extract_flops_budget(challenge)
-        if flops_min or flops_max:
-            gate_min = int(flops_min * 0.9)
-            gate_max = int(flops_max * 1.1)
-            target = int(flops_max * 0.6)
-            estimated, err = estimate_flops(code, challenge)
+        task = challenge.get("task", {}) or {}
+        task_params = task.get("task_params", {}) or {}
+        constraints = task.get("constraints", []) or []
+        out_shape_sink: list = []
+
+        run_estimator = bool(flops_min or flops_max) or bool(
+            infer_output_shape(task_params, constraints)
+        )
+
+        if run_estimator:
+            estimated, err = estimate_flops(code, challenge, out_shape_sink)
             if err:
                 errors.append(f"FLOPs estimation failed: {err}")
-            elif estimated is not None:
+            elif estimated is not None and (flops_min or flops_max):
+                gate_min = int(flops_min * 0.9)
+                gate_max = int(flops_max * 1.1)
+                target = int(flops_max * 0.6)
                 if estimated < gate_min:
                     hint = suggest_resize(estimated, gate_min, gate_max, target)
                     errors.append(
@@ -110,5 +126,14 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
                         f"maximum ({gate_max:,}). Reduce model capacity."
                         + (f"\n{hint}" if hint else "")
                     )
+
+            # 9. Output shape coherence — only when we actually saw a forward
+            # pass output (primary / JIT-trace path) AND the task declares an
+            # output shape constraint we could parse.
+            expected = infer_output_shape(task_params, constraints)
+            if expected is not None and out_shape_sink:
+                shape_err = verify_output_shape(out_shape_sink[0], expected)
+                if shape_err:
+                    errors.append(shape_err)
 
     return len(errors) == 0, errors
