@@ -17,6 +17,7 @@ import textwrap
 
 from core.history import extract_flops_budget
 from core.input_shape import infer_input, _looks_like_token_task
+from core.output_shape import infer_output_shape
 
 
 def generate_fallback(challenge: dict) -> str:
@@ -60,33 +61,28 @@ def _parse_output_shape_from_constraints(constraints: list[str]) -> str | None:
 def _generate_continuous_fallback(sig: str, param_names: list[str],
                                   tp: dict, target_flops: int,
                                   constraints: list[str]) -> str:
-    """Generate a simple Linear model for continuous-input tasks."""
-    # Infer input/output dimensions from task_params
+    """Generate a simple Linear model for continuous-input tasks.
+
+    The model's ``forward()`` reshapes to the exact output shape inferred
+    from the task's constraint string — avoiding the classic "output has
+    wrong rank / wrong dim" failure that causes tensor-size mismatches
+    during training.
+    """
+    # Infer input dimensions from task_params
     input_shape, _ = infer_input(tp, constraints)
     # input_shape is [1, dim1, dim2, ...] — product of dims after batch = input features per sample
     input_dims = input_shape[1:]  # drop batch
-
-    # Try to figure out a sensible in_features and out_features
-    # For a simple linear model: flops = 2 * in_features * out_features
-    # We'll use in_features from input shape and compute hidden_dim from budget
 
     # Estimate in_features as product of non-batch dims
     in_features = 1
     for d in input_dims:
         in_features *= d
 
-    # Parse output shape from constraints to determine output size
-    output_shape_str = _parse_output_shape_from_constraints(constraints)
-
-    # Compute hidden_dim for a 2-layer model:
-    # FLOPs ~ 2 * in_features * hidden + 2 * hidden * out_features
-    # Approximate: hidden = target_flops / (2 * (in_features + out_features))
-    # But we don't know out_features yet, so estimate conservatively
-    out_features_estimate = in_features  # reasonable default
-    flops_per_hidden = max(1, 2 * (in_features + out_features_estimate))
-    hidden_dim = max(4, target_flops // flops_per_hidden)
-    # Clamp to reasonable range
-    hidden_dim = min(hidden_dim, 2048)
+    # Infer expected output shape (excluding batch) from constraints so the
+    # forward pass reshapes to something that matches the task contract.
+    # ``expected_out`` is a list of ints where unresolved dims are -1.
+    expected_out = infer_output_shape(tp, constraints)
+    expected_out_literal = repr(expected_out) if expected_out is not None else "None"
 
     # Build a kwargs dict string for the __init__ call
     kwargs_items = ", ".join(f"{n}={n}" for n in param_names)
@@ -102,7 +98,12 @@ def _generate_continuous_fallback(sig: str, param_names: list[str],
                 # Store all params for shape computation
                 self._tp = dict({kwargs_items})
 
-                # Compute input/output features from task_params
+                # Expected output shape (excluding batch) parsed from task
+                # constraints by the host agent.  ``-1`` marks an unresolved
+                # wildcard which we back-fill from the residual feature
+                # count at forward time.
+                self._expected_out = {expected_out_literal}
+
                 int_params = [v for v in self._tp.values() if isinstance(v, int) and v > 0]
                 list_params = [v for v in self._tp.values() if isinstance(v, list)]
 
@@ -114,15 +115,29 @@ def _generate_continuous_fallback(sig: str, param_names: list[str],
                 else:
                     self._in_features = 64
 
-                # Infer output feature dimension
-                # Default: same as input, but check for list params (like quantiles)
-                n_list = len(list_params[0]) if list_params else 1
-                if len(int_params) >= 2:
-                    self._out_features = int_params[1] * max(1, n_list)
-                    if len(int_params) >= 3:
-                        self._out_features *= int_params[2]
+                # Compute the output feature count: if we have a concrete
+                # expected shape, use the product of its resolved dims and
+                # leave a single residual for any wildcard.  Otherwise fall
+                # back to a best-effort estimate from int/list task params.
+                if self._expected_out is not None:
+                    resolved_product = 1
+                    wildcard_dims = 0
+                    for d in self._expected_out:
+                        if d >= 0:
+                            resolved_product *= d
+                        else:
+                            wildcard_dims += 1
+                    # For each wildcard dim, pick a size of 1 so reshape works.
+                    self._wildcard_size = 1
+                    self._out_features = resolved_product * (self._wildcard_size ** wildcard_dims)
                 else:
-                    self._out_features = self._in_features
+                    n_list = len(list_params[0]) if list_params else 1
+                    if len(int_params) >= 2:
+                        self._out_features = int_params[1] * max(1, n_list)
+                        if len(int_params) >= 3:
+                            self._out_features *= int_params[2]
+                    else:
+                        self._out_features = self._in_features
 
                 # Size hidden_dim to fit FLOPs budget
                 TARGET_FLOPS = {target_flops}
@@ -149,8 +164,26 @@ def _generate_continuous_fallback(sig: str, param_names: list[str],
                                           device=x.device, dtype=x.dtype)
                         x_flat = torch.cat([x_flat, pad], dim=1)
                 out = self.net(x_flat)
-                # Reshape to output dims
-                return out.reshape(b, -1, self._out_features // max(1, out.shape[1]))
+
+                # Reshape to the EXACT output shape required by the task,
+                # replacing wildcards with concrete sizes.  torch.reshape
+                # only accepts a single -1, so fix any extras to 1 and let
+                # reshape infer the last wildcard from the residual.
+                if self._expected_out is not None:
+                    target = [b]
+                    seen_wildcard = False
+                    for d in self._expected_out:
+                        if d >= 0:
+                            target.append(d)
+                        elif not seen_wildcard:
+                            target.append(-1)
+                            seen_wildcard = True
+                        else:
+                            target.append(1)
+                    return out.reshape(*target)
+
+                # No constraint parsed — best-effort fallback reshape.
+                return out.reshape(b, -1, max(1, self._out_features // max(1, out.shape[1])))
 
         def build_model({sig}):
             return FallbackModel({sig})

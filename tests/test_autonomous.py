@@ -612,12 +612,21 @@ class TestAutonomousLoop:
         assert result["name"] == "autonomous_fallback"
         assert result["code"] == VALID_CODE
 
-    def test_fallback_to_proposed_when_flops_off_gate(self):
-        """If validate_code fails ONLY on FLOPs, the structurally-ok code
-        should still be captured as ``last_proposed_code`` and returned as
-        ``autonomous_best_effort`` when the loop exhausts. Previously the
-        loop returned None and the agent shipped literal empty code, which
-        the harness rejected with ``Missing build_model``."""
+    def test_no_fallback_to_off_gate_proposal(self):
+        """Code that only passed ``_structural_ok`` must NOT be submitted.
+
+        The previous contract shipped off-gate structurally-valid code as
+        ``autonomous_best_effort`` so the harness's pre_validate_code had
+        something to chew on. That behavior masked the real failure mode
+        where build_model produced a tensor with the wrong output shape:
+        the model parses + imports are clean so ``_structural_ok`` returns
+        True, the code gets shipped, and training dies 45 min later with
+        ``size of tensor a (96) must match the size of tensor b (64)``.
+
+        The new contract: the loop returns None rather than submit
+        anything that didn't pass full ``validate_code``. The outer
+        ``design_architecture`` then falls through to the guaranteed-valid
+        fallback template."""
         # Use impossibly-high FLOPs bounds so VALID_CODE (a trivial linear
         # model) definitely fails the FLOPs hard gate but still passes
         # structural checks (has build_model + build_optimizer at top level).
@@ -650,12 +659,11 @@ class TestAutonomousLoop:
         finally:
             _mod.MAX_TURNS = original_max
 
-        assert result is not None, (
-            "loop returned None — off-gate proposals should fall back to "
-            "last_proposed_code instead of nothing"
+        assert result is None, (
+            "loop should return None when only structurally-ok (but "
+            "fully-invalid) code was seen — the outer design_architecture "
+            f"falls through to the fallback template instead. Got {result}"
         )
-        assert result["name"] == "autonomous_best_effort"
-        assert result["code"] == VALID_CODE
 
     def test_llm_failure_all_retries(self):
         """All LLM retries fail — loop returns None."""

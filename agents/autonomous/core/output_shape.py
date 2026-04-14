@@ -115,6 +115,27 @@ def _resolve_dim(token: str, tp: dict) -> int | None:
         # e.g. a shape constraint that references the `quantiles` list
         # as a dim means "one output per quantile" — use its length.
         return len(v)
+
+    # "num_X" / "n_X" → len(tp["X"]) or tp["X"] when X is a collection/int
+    # e.g. constraint says ``num_quantiles`` but task_params only has
+    # ``quantiles`` (the list). We resolve to ``len(quantiles)``.
+    for prefix in ("num_", "n_"):
+        if t.startswith(prefix) and len(t) > len(prefix):
+            base = t[len(prefix):]
+            bv = tp.get(base)
+            if isinstance(bv, (list, tuple)):
+                return len(bv)
+            if isinstance(bv, int):
+                return bv
+
+    # "X_len" / "X_length" / "X_size" → len(tp["X"]) when X is a collection.
+    for suffix in ("_len", "_length", "_size"):
+        if t.endswith(suffix) and len(t) > len(suffix):
+            base = t[: -len(suffix)]
+            bv = tp.get(base)
+            if isinstance(bv, (list, tuple)):
+                return len(bv)
+
     return None
 
 
