@@ -16,10 +16,12 @@ import tempfile
 import time
 
 from core import history, validation
+from core.arch_knowledge import build_arch_guidance
 from core.fallback_templates import generate_fallback
 from core.history import extract_flops_budget, identify_bucket
 from core.prompt_builder import _format_task_params, _compute_sizing_guidance
-from tools import TOOLS, SubmitSignal, build_handlers
+from strategies import build_strategy, select_strategy
+from tools import TOOLS, SubmitSignal, build_handlers, build_tools
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 
@@ -60,8 +62,14 @@ def _extract_code_block(text: str) -> str:
     return ""
 
 
-def _build_system_prompt(challenge: dict) -> str:
-    """Build a system prompt that teaches the LLM how to be an autonomous agent."""
+def _build_system_prompt(challenge: dict, strategy: dict | None = None) -> str:
+    """Build a system prompt that teaches the LLM how to be an autonomous agent.
+
+    ``strategy`` (optional) is a strategy dict from ``strategies.build_strategy``
+    — it contributes an identity persona and workflow hints without changing
+    any of the tools, validation, or loop structure.
+    """
+    strategy = strategy or {}
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
     param_str = ", ".join(tp.keys()) if tp else "**task_params"
@@ -83,6 +91,10 @@ def _build_system_prompt(challenge: dict) -> str:
         "The loop ends when you call `submit` with validated code, or time runs out."
     )
 
+    # ── Strategy identity (persona) ───────────────────────────────
+    if strategy.get("identity"):
+        parts.append(f"## Strategy Persona\n{strategy['identity']}")
+
     # ── Task description ──────────────────────────────────────────
     desc = task.get("description", "")
     parts.append(
@@ -91,6 +103,14 @@ def _build_system_prompt(challenge: dict) -> str:
         + f"Task parameters: {_format_task_params(tp)}\n"
         f"build_model signature: `def build_model({param_str})`"
     )
+
+    # ── Architecture reasoning guidance ───────────────────────────
+    frontier = (
+        challenge.get("feasible_frontier")
+        or challenge.get("pareto_frontier")
+        or []
+    )
+    parts.append(build_arch_guidance(challenge, frontier))
 
     # ── Domain context ────────────────────────────────────────────
     domain = task.get("domain_system_prompt", "")
@@ -155,7 +175,10 @@ def _build_system_prompt(challenge: dict) -> str:
         "matches the shape described in the task constraints. Every "
         "non-batch dimension must be derived from the build_model "
         "arguments (task_params) — NEVER hardcode a dimension and NEVER "
-        "use context_len where prediction_len is required, or vice versa.\n\n"
+        "confuse input-side dimensions with output-side dimensions. Read "
+        "the constraint string carefully to determine which task_param "
+        "maps to which output dimension. The `check_output_shape` tool "
+        "will catch mismatches.\n\n"
         "ALWAYS call `validate_code` before `submit`. `validate_code` runs "
         "a real forward pass and checks the output shape against the "
         "constraint — if it reports a dimension mismatch you MUST fix it "
@@ -168,27 +191,28 @@ def _build_system_prompt(challenge: dict) -> str:
     # ── Workflow guidance ─────────────────────────────────────────
     parts.append(
         "## Recommended Workflow\n"
-        "1. Check `read_scratchpad` for notes from previous rounds\n"
-        "2. Check `time_remaining` to plan your time\n"
-        "3. Research: `get_frontier_details` to see what you're competing against, "
-        "`query_db` to explore the experiment database (recent results, failures, "
-        "component stats, dead ends — any endpoint you want), "
-        "`search_papers` if you need new ideas\n"
-        "4. Generate code based on your research\n"
-        "5. Use `validate_code` to check for errors — this runs the REAL FLOPs check "
-        "AND verifies the model's output tensor shape matches the task constraints "
-        "(prevents 'tensor size mismatch' training failures)\n"
-        "6. If validation fails, read the error carefully and follow the resize suggestion "
-        "or adjust your forward() to produce the expected output shape\n"
-        "7. Optionally use `estimate_model_flops` for quick FLOPs checks, "
-        "`check_output_shape` to verify the final output tensor, or "
-        "`trace_architecture` to see every layer's input/output shape and "
-        "param count when debugging where a shape goes wrong inside the model\n"
-        "8. When satisfied, call `submit` with your validated code\n"
-        "9. Save notes via `write_scratchpad` for future rounds\n\n"
+        "1. Call `analyze_task` to get shapes, budget, and frontier gaps in "
+        "one structured summary\n"
+        "2. Call `read_scratchpad` for notes from previous rounds\n"
+        "3. Optionally research: `get_frontier_details`, `query_db`, "
+        "`search_papers` (don't spend more than 2-3 turns on research)\n"
+        "4. DESIGN ITERATIVELY:\n"
+        "   a. Use `estimate_layer_flops` to cost individual building blocks "
+        "you're considering. Any PyTorch module works — standard or custom.\n"
+        "   b. Use `sketch_architecture` to test your overall design. Write "
+        "a minimal build_model, get back per-layer FLOPs and shape flow. "
+        "Iterate until the shapes are right and FLOPs fit the budget.\n"
+        "   This is MUCH cheaper than writing full code and debugging failures.\n"
+        "5. Expand your validated sketch into full code: add build_optimizer, "
+        "training_config, build_scheduler, init_weights, and other hooks.\n"
+        "6. Call `validate_code` — final check on syntax, FLOPs, AND output shape.\n"
+        "7. If validation fails, fix based on the error and re-validate.\n"
+        "8. Call `submit` with validated code.\n"
+        "9. Save notes via `write_scratchpad` for future rounds.\n\n"
         "This is a suggestion — you can do these in any order. "
-        "If the frontier already has strong models, focus on understanding "
-        "and improving them. If bootstrapping, just build something solid.\n\n"
+        "You can also skip the prototype step and go straight to full code "
+        "if you're confident. But prototyping with `estimate_layer_flops` and "
+        "`sketch_architecture` is cheap and catches mistakes early.\n\n"
         "## TIME MANAGEMENT (CRITICAL)\n"
         "- You MUST have validated code by the halfway point of your time budget\n"
         "- Generate and validate a working model FIRST, then iterate to improve\n"
@@ -198,11 +222,20 @@ def _build_system_prompt(challenge: dict) -> str:
         "- A submitted model that passes validation always beats no submission"
     )
 
+    # ── Strategy-specific workflow (appended, not replacing) ──────
+    if strategy.get("workflow_guidance"):
+        parts.append(strategy["workflow_guidance"])
+
     return "\n\n".join(parts)
 
 
-def _build_kickoff_message(challenge: dict) -> str:
-    """Build the initial user message that starts the agent loop."""
+def _build_kickoff_message(challenge: dict, strategy: dict | None = None) -> str:
+    """Build the initial user message that starts the agent loop.
+
+    ``strategy['kickoff_additions']`` is appended verbatim to focus the
+    agent on the strategy-specific angle for this round.
+    """
+    strategy = strategy or {}
     task = challenge.get("task", {})
     task_name = task.get("name", "unknown")
     flops_min, flops_max = extract_flops_budget(challenge)
@@ -213,7 +246,7 @@ def _build_kickoff_message(challenge: dict) -> str:
 
     time_budget = task.get("time_budget", 300)
 
-    return (
+    base = (
         f"New round started. Task: {task_name}, Bucket: {bucket}, "
         f"FLOPs range: [{flops_min:,}, {flops_max:,}].\n"
         f"Frontier has {len(frontier)} model(s) to beat.\n"
@@ -221,6 +254,10 @@ def _build_kickoff_message(challenge: dict) -> str:
         "Begin your autonomous design process. Use the tools available to "
         "research, design, validate, and submit the best model you can."
     )
+    additions = strategy.get("kickoff_additions", "")
+    if additions:
+        return f"{base}\n\n{additions}"
+    return base
 
 
 def _structural_ok(code: str, challenge: dict | None) -> tuple[bool, list[str]]:
@@ -241,7 +278,9 @@ def _structural_ok(code: str, challenge: dict | None) -> tuple[bool, list[str]]:
 
 
 def _autonomous_loop(client, challenge: dict, messages: list[dict],
-                     tool_handlers: dict, deadline: float) -> dict | None:
+                     tool_handlers: dict, deadline: float,
+                     tools: list | None = None,
+                     temperature: float = 0.7) -> dict | None:
     """Run the autonomous tool-calling loop.
 
     Returns the submission dict {"code", "name", "motivation"} if the agent
@@ -323,11 +362,11 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
         payload = {
             "model": DEFAULT_MODEL,
             "messages": messages,
-            "temperature": 0.7,
+            "temperature": temperature,
             "max_tokens": 4096,
         }
         if turn < MAX_TURNS - 1:
-            payload["tools"] = TOOLS
+            payload["tools"] = tools if tools is not None else TOOLS
 
         _log(f"[agent] Turn {turn + 1}/{MAX_TURNS}, "
              f"{remaining:.0f}s remaining, {len(messages)} messages")
@@ -509,12 +548,30 @@ def design_architecture(challenge: dict, client) -> dict:
     except Exception as exc:
         _log(f"[agent] Scratchpad load failed: {exc}")
 
+    state = history.load_state(scratch_dir) if scratch_dir else {}
+
+    # ── Select strategy ───────────────────────────────────────────
+    try:
+        strategy_name = select_strategy(challenge, state)
+        strategy = build_strategy(strategy_name, challenge, state)
+    except Exception as exc:
+        _log(f"[agent] Strategy selection failed: {exc} — using defaults")
+        strategy_name = "simple_modeler"
+        strategy = {
+            "identity": "",
+            "kickoff_additions": "",
+            "workflow_guidance": "",
+            "temperature": 0.7,
+        }
+    _log(f"[agent] Strategy: {strategy_name} (temp={strategy.get('temperature', 0.7)})")
+
     # ── Build tools ───────────────────────────────────────────────
     tool_handlers = build_handlers(client, challenge, scratch_dir, deadline)
+    tools = build_tools(challenge)
 
     # ── Build messages ────────────────────────────────────────────
-    system_prompt = _build_system_prompt(challenge)
-    kickoff = _build_kickoff_message(challenge)
+    system_prompt = _build_system_prompt(challenge, strategy)
+    kickoff = _build_kickoff_message(challenge, strategy)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -528,6 +585,8 @@ def design_architecture(challenge: dict, client) -> dict:
         try:
             result = _autonomous_loop(
                 client, challenge, messages, tool_handlers, deadline,
+                tools=tools,
+                temperature=strategy.get("temperature", 0.7),
             )
         except Exception as exc:
             _log(f"[agent] Autonomous loop failed: {exc}")
@@ -585,15 +644,15 @@ def design_architecture(challenge: dict, client) -> dict:
                      f"{full_errors}")
 
     # ── Save scratchpad ───────────────────────────────────────────
-    # Get the state from the tool handlers (may have been updated by the agent)
-    state = {}
+    # Prefer the tool-handler state (it may have been updated by the agent via
+    # write_scratchpad); otherwise keep the state we loaded at the start.
     if hasattr(tool_handlers.get("submit", None), "_state_holder"):
         state = tool_handlers["submit"]._state_holder["state"]
 
     state = history.add_entry(
         state, name=name, code=code, motivation=motivation,
         bucket=bucket, flops=int(flops_max * 0.6) if flops_max else 0,
-        strategy="autonomous",
+        strategy=strategy_name,
     )
 
     scratch_dir = scratch_dir or tempfile.mkdtemp()

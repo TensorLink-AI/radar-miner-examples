@@ -5,34 +5,30 @@ import sys
 import os
 
 # Use any agent dir — all contain identical core/ modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "autonomous"))
 
 # Clear cached core modules to ensure correct resolution
 for _k in list(sys.modules.keys()):
     if _k == "core" or _k.startswith("core."):
         del sys.modules[_k]
 
-from core.validation import validate, is_harness_task
+from core.validation import validate_code as validate
 
 
+# All task-invariant checks (syntax, forbidden imports, required functions)
+# work with an empty task spec — there's no longer an is_harness_task split.
 HARNESS_CHALLENGE = {
-    "task": {"run_command": "python harness.py --config config.yaml"}
+    "task": {
+        "task_params": {
+            "context_len": 512,
+            "prediction_len": 96,
+            "num_variates": 1,
+            "quantiles": [0.1, 0.5, 0.9],
+        },
+    },
 }
 
-STANDALONE_CHALLENGE = {
-    "task": {"run_command": "python train.py"}
-}
-
-
-class TestIsHarnessTask:
-    def test_harness_task(self):
-        assert is_harness_task(HARNESS_CHALLENGE) is True
-
-    def test_standalone_task(self):
-        assert is_harness_task(STANDALONE_CHALLENGE) is True
-
-    def test_empty_challenge(self):
-        assert is_harness_task({}) is True
+STANDALONE_CHALLENGE = {"task": {}}
 
 
 class TestValidateSyntax:

@@ -6,7 +6,7 @@ import sys
 import tempfile
 
 # Use any agent dir — all contain identical core/ modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "autonomous"))
 # Clear cached core modules to ensure correct resolution
 for _k in list(sys.modules.keys()):
     if _k == "core" or _k.startswith("core."):

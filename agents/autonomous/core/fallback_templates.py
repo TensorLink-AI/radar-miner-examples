@@ -16,14 +16,42 @@ import math
 import textwrap
 
 from core.history import extract_flops_budget
-from core.input_shape import infer_input, _looks_like_token_task
+from core.input_shape import (
+    _CHANNEL_KEYS,
+    _FEATURE_KEYS,
+    _GRAPH_NODE_KEYS,
+    _IMAGE_SIZE_KEYS,
+    _SEQUENCE_LENGTH_KEYS,
+    _find_key,
+    _looks_like_token_task,
+    infer_input,
+)
 from core.output_shape import infer_output_shape
+
+
+def _has_recognized_continuous_keys(tp: dict) -> bool:
+    """True when task_params contains at least one key we recognize as
+    continuous-input (sequence length, channel count, image size, feature
+    size, or graph nodes). Drives the generic-fallback fallback path."""
+    for key_set in (_SEQUENCE_LENGTH_KEYS, _CHANNEL_KEYS, _IMAGE_SIZE_KEYS,
+                    _FEATURE_KEYS, _GRAPH_NODE_KEYS):
+        if _find_key(tp, key_set):
+            return True
+    return False
 
 
 def generate_fallback(challenge: dict) -> str:
     """Generate a minimal but valid model that WILL pass the size gate.
 
     Returns a complete Python code string with build_model and build_optimizer.
+
+    Archetype selection:
+      1. Token-ID tasks (vocab_size etc.) → embedding + linear
+      2. Continuous input that infer_input resolves cleanly → MLP that
+         reshapes to the declared output shape
+      3. Everything else → a generic MLP that reads dimensions from
+         constraint strings and task_params, with no assumptions about
+         task family
     """
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
@@ -35,13 +63,20 @@ def generate_fallback(challenge: dict) -> str:
     param_names = list(tp.keys()) if tp else []
     sig = ", ".join(param_names) if param_names else "**kwargs"
 
-    # Determine if this is a token-ID task or continuous-input task
-    is_token_task = _looks_like_token_task(tp)
-
-    if is_token_task:
+    # 1. Token-ID task
+    if _looks_like_token_task(tp):
         return _generate_token_fallback(sig, param_names, tp, target_flops, constraints)
-    else:
-        return _generate_continuous_fallback(sig, param_names, tp, target_flops, constraints)
+
+    # 2. Continuous/recognized input — at least one familiar key present
+    if _has_recognized_continuous_keys(tp):
+        return _generate_continuous_fallback(
+            sig, param_names, tp, target_flops, constraints,
+        )
+
+    # 3. Unknown task — generic MLP that reads whatever dims it can parse
+    return _generate_generic_fallback(
+        sig, param_names, tp, target_flops, constraints,
+    )
 
 
 def _parse_output_shape_from_constraints(constraints: list[str]) -> str | None:
@@ -187,6 +222,103 @@ def _generate_continuous_fallback(sig: str, param_names: list[str],
 
         def build_model({sig}):
             return FallbackModel({sig})
+
+        def build_optimizer(model):
+            return torch.optim.Adam(model.parameters(), lr=1e-3)
+    """)
+    return code
+
+
+def _generate_generic_fallback(sig: str, param_names: list[str],
+                               tp: dict, target_flops: int,
+                               constraints: list[str]) -> str:
+    """Generic MLP for tasks whose task_params we don't recognize.
+
+    Reads input shape from constraint strings when possible, falling back
+    to the product of integer task_params. Output shape is always derived
+    from ``infer_output_shape``; unresolved dims collapse to 1 so the
+    reshape is well-defined.
+    """
+    expected_out = infer_output_shape(tp, constraints)
+    expected_out_literal = repr(expected_out) if expected_out is not None else "None"
+
+    kwargs_items = ", ".join(f"{n}={n}" for n in param_names)
+
+    code = textwrap.dedent(f"""\
+        import torch
+        import torch.nn as nn
+
+        class GenericFallbackModel(nn.Module):
+            def __init__(self, {sig}):
+                super().__init__()
+                self._tp = dict({kwargs_items})
+                self._expected_out = {expected_out_literal}
+
+                # Infer in_features as the product of positive integer params,
+                # capped so we don't allocate absurd layers for huge ints.
+                int_params = [v for v in self._tp.values()
+                              if isinstance(v, int) and v > 0]
+                if int_params:
+                    prod = 1
+                    for v in int_params[:3]:
+                        prod *= v
+                    self._in_features = max(4, min(prod, 4096))
+                else:
+                    self._in_features = 64
+
+                # Output features — product of resolved dims, wildcards → 1.
+                if self._expected_out is not None:
+                    out = 1
+                    for d in self._expected_out:
+                        out *= d if d >= 0 else 1
+                    self._out_features = max(1, out)
+                else:
+                    # Lean on the largest int param as a best-effort output.
+                    self._out_features = int_params[0] if int_params else self._in_features
+
+                TARGET_FLOPS = {target_flops}
+                flops_per_h = max(1, 2 * (self._in_features + self._out_features))
+                hidden_dim = max(4, TARGET_FLOPS // flops_per_h)
+                hidden_dim = min(hidden_dim, 2048)
+
+                self.net = nn.Sequential(
+                    nn.Linear(self._in_features, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, self._out_features),
+                )
+
+            def forward(self, x):
+                if not isinstance(x, torch.Tensor):
+                    x = torch.as_tensor(x)
+                if x.dtype not in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+                    x = x.float()
+                b = x.shape[0] if x.dim() > 0 else 1
+                x_flat = x.reshape(b, -1)
+                if x_flat.shape[1] != self._in_features:
+                    if x_flat.shape[1] > self._in_features:
+                        x_flat = x_flat[:, :self._in_features]
+                    else:
+                        pad = torch.zeros(b, self._in_features - x_flat.shape[1],
+                                          device=x.device, dtype=x_flat.dtype)
+                        x_flat = torch.cat([x_flat, pad], dim=1)
+                out = self.net(x_flat)
+
+                if self._expected_out is not None:
+                    target = [b]
+                    seen_wildcard = False
+                    for d in self._expected_out:
+                        if d >= 0:
+                            target.append(d)
+                        elif not seen_wildcard:
+                            target.append(-1)
+                            seen_wildcard = True
+                        else:
+                            target.append(1)
+                    return out.reshape(*target)
+                return out
+
+        def build_model({sig}):
+            return GenericFallbackModel({sig})
 
         def build_optimizer(model):
             return torch.optim.Adam(model.parameters(), lr=1e-3)
