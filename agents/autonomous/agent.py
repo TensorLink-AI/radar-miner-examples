@@ -25,9 +25,9 @@ from tools import TOOLS, SubmitSignal, build_handlers, build_tools
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 
-# Reserve ~5 LLM calls worth of headroom from the 30-request rate limit.
-# Each loop iteration is 1 call, so this gives us up to 25 turns.
-MAX_TURNS = 25
+# Each loop iteration is 1 LLM call. With ~30s average per call and a 1500s
+# budget, this allows ~50 turns with buffer.
+MAX_TURNS = 50
 
 # Minimum seconds to reserve for final submission overhead.
 TIME_BUFFER_SECONDS = 10
@@ -307,235 +307,276 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
     validation_failures: list[str] = []  # Track error strings across turns
 
     for turn in range(MAX_TURNS):
-        remaining = deadline - time.time()
-        if remaining < TIME_BUFFER_SECONDS:
-            _log(f"[agent] Time's up at turn {turn + 1}, breaking loop")
-            break
-
-        elapsed = time.time() - start_time
-        pct_used = elapsed / total_budget if total_budget > 0 else 1.0
-
-        # ── 85% checkpoint: force code generation if nothing yet ──
-        if pct_used >= 0.85 and not nudged_85pct and not last_validated_code:
-            nudged_85pct = True
-            _log("[agent] 85% time checkpoint — no validated code yet, injecting urgency")
-            messages.append({
-                "role": "user",
-                "content": (
-                    "WARNING: You have used 85% of your time with no validated "
-                    "code. Generate and validate code NOW. You can iterate after "
-                    "you have a working baseline. Call validate_code with your "
-                    "best code immediately."
-                ),
-            })
-
-        # ── 93% checkpoint: auto-generate fallback if still nothing ──
-        if pct_used >= 0.93 and not fallback_injected and not last_validated_code:
-            fallback_injected = True
-            _log("[agent] 93% time checkpoint — generating fallback template")
-            try:
-                fb_code = generate_fallback(challenge)
-                ok, errors = validation.validate_code(fb_code, challenge)
-                if ok:
-                    last_validated_code = fb_code
-                    _log("[agent] Fallback template passed validation")
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "URGENT: A fallback model has been auto-generated and "
-                            "validated. You can still submit better code, but you "
-                            "MUST call submit within the next 1-2 turns or the "
-                            "fallback will be used. If you have improved code, "
-                            "validate and submit it now."
-                        ),
-                    })
-                else:
-                    struct_ok, _ = _structural_ok(fb_code, challenge)
-                    if struct_ok:
-                        last_proposed_code = fb_code
-                        _log(f"[agent] Fallback structurally ok but FLOPs off: {errors}")
-                    else:
-                        _log(f"[agent] Fallback template failed: {errors}")
-            except Exception as exc:
-                _log(f"[agent] Fallback generation failed: {exc}")
-
-        # Build payload — include tools unless it's the very last turn
-        payload = {
-            "model": DEFAULT_MODEL,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": 4096,
-        }
-        if turn < MAX_TURNS - 1:
-            payload["tools"] = tools if tools is not None else TOOLS
-
-        _log(f"[agent] Turn {turn + 1}/{MAX_TURNS}, "
-             f"{remaining:.0f}s remaining, {len(messages)} messages")
-
-        # LLM call with retries for transient failures
-        resp = None
-        for attempt in range(max_retries):
-            try:
-                resp = client.post_json(url, payload)
+        # ── Outer per-turn safety net ─────────────────────────────
+        # A crash in any single turn (malformed response, unexpected
+        # data in messages, a tool-handler exception that slipped past
+        # its inner guard, etc.) must not kill the whole loop — we
+        # still have turns and time left to recover. SubmitSignal is
+        # the success path and must propagate untouched.
+        try:
+            remaining = deadline - time.time()
+            if remaining < TIME_BUFFER_SECONDS:
+                _log(f"[agent] Time's up at turn {turn + 1}, breaking loop")
                 break
-            except Exception as exc:
-                _log(f"[agent] Turn {turn + 1} attempt {attempt + 1}/{max_retries} "
-                     f"failed: {exc}")
 
-        if resp is None:
-            _log(f"[agent] All retries failed at turn {turn + 1}")
-            break
+            elapsed = time.time() - start_time
+            pct_used = elapsed / total_budget if total_budget > 0 else 1.0
 
-        choice = resp["choices"][0]
-        assistant_msg = choice["message"]
-        finish_reason = choice.get("finish_reason", "")
-        tool_calls = assistant_msg.get("tool_calls")
+            # ── 85% checkpoint: force code generation if nothing yet ──
+            if pct_used >= 0.85 and not nudged_85pct and not last_validated_code:
+                nudged_85pct = True
+                _log("[agent] 85% time checkpoint — no validated code yet, injecting urgency")
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "WARNING: You have used 85% of your time with no validated "
+                        "code. Generate and validate code NOW. You can iterate after "
+                        "you have a working baseline. Call validate_code with your "
+                        "best code immediately."
+                    ),
+                })
 
-        # No tool calls → the LLM wants to talk. Append and continue.
-        # NOTE: we do NOT also branch on ``finish_reason == "stop"`` — some
-        # OpenAI-compatible servers (notably certain Kimi deployments) return
-        # ``finish_reason="stop"`` alongside a populated ``tool_calls`` list.
-        # Short-circuiting on finish_reason would silently drop those tool
-        # calls and leave an assistant message with unresolved tool_calls in
-        # the history, which the next /v1/chat/completions call would reject.
-        if not tool_calls:
-            content = assistant_msg.get("content") or ""
-            _log(f"[agent] Text response ({len(content)} chars, "
-                 f"finish_reason={finish_reason}): {content[:200]}...")
-            messages.append(assistant_msg)
+            # ── 93% checkpoint: auto-generate fallback if still nothing ──
+            if pct_used >= 0.93 and not fallback_injected and not last_validated_code:
+                fallback_injected = True
+                _log("[agent] 93% time checkpoint — generating fallback template")
+                try:
+                    fb_code = generate_fallback(challenge)
+                    ok, errors = validation.validate_code(fb_code, challenge)
+                    if ok:
+                        last_validated_code = fb_code
+                        _log("[agent] Fallback template passed validation")
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "URGENT: A fallback model has been auto-generated and "
+                                "validated. You can still submit better code, but you "
+                                "MUST call submit within the next 1-2 turns or the "
+                                "fallback will be used. If you have improved code, "
+                                "validate and submit it now."
+                            ),
+                        })
+                    else:
+                        struct_ok, _ = _structural_ok(fb_code, challenge)
+                        if struct_ok:
+                            last_proposed_code = fb_code
+                            _log(f"[agent] Fallback structurally ok but FLOPs off: {errors}")
+                        else:
+                            _log(f"[agent] Fallback template failed: {errors}")
+                except Exception as exc:
+                    _log(f"[agent] Fallback generation failed: {exc}")
 
-            # Fallback: if the LLM dumped code in a text response instead of
-            # calling validate_code, capture it so the round still has
-            # something to submit. Track structurally-ok code even when the
-            # FLOPs gate rejects it — the harness pre_validate only checks
-            # structure, so shipping a mis-sized model beats shipping nothing.
-            fallback_code = _extract_code_block(content)
-            if fallback_code:
-                ok, errors = validation.validate_code(fallback_code, challenge)
-                if ok:
-                    _log("[agent] Text response contained fully valid code")
-                    last_validated_code = fallback_code
-                    last_proposed_code = fallback_code
-                else:
-                    struct_ok, _ = _structural_ok(fallback_code, challenge)
-                    if struct_ok:
-                        _log("[agent] Text code block is structurally ok "
-                             f"(full validation failed: {errors}) — "
-                             "tracked as last_proposed_code")
+            # Build payload — include tools unless it's the very last turn
+            payload = {
+                "model": DEFAULT_MODEL,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 4096,
+            }
+            if turn < MAX_TURNS - 1:
+                payload["tools"] = tools if tools is not None else TOOLS
+
+            _log(f"[agent] Turn {turn + 1}/{MAX_TURNS}, "
+                 f"{remaining:.0f}s remaining, {len(messages)} messages")
+
+            # LLM call with retries for transient failures
+            resp = None
+            for attempt in range(max_retries):
+                try:
+                    resp = client.post_json(url, payload)
+                    break
+                except Exception as exc:
+                    _log(f"[agent] Turn {turn + 1} attempt {attempt + 1}/{max_retries} "
+                         f"failed: {exc}")
+
+            if resp is None:
+                _log(f"[agent] All retries failed at turn {turn + 1}")
+                break
+
+            # ── Protect response parsing ──────────────────────────────
+            # A malformed LLM response (missing choices, no message, etc.)
+            # must not kill the loop — we still have turns/time left.
+            try:
+                choice = resp["choices"][0]
+                assistant_msg = choice["message"]
+                finish_reason = choice.get("finish_reason", "")
+                tool_calls = assistant_msg.get("tool_calls")
+            except (KeyError, IndexError, TypeError) as exc:
+                _log(f"[agent] Malformed LLM response at turn {turn + 1}: {exc}")
+                _log(f"[agent] Response type/keys: "
+                     f"{list(resp.keys()) if isinstance(resp, dict) else type(resp)}")
+                continue
+
+            # No tool calls → the LLM wants to talk. Append and continue.
+            # NOTE: we do NOT also branch on ``finish_reason == "stop"`` — some
+            # OpenAI-compatible servers (notably certain Kimi deployments) return
+            # ``finish_reason="stop"`` alongside a populated ``tool_calls`` list.
+            # Short-circuiting on finish_reason would silently drop those tool
+            # calls and leave an assistant message with unresolved tool_calls in
+            # the history, which the next /v1/chat/completions call would reject.
+            if not tool_calls:
+                content = assistant_msg.get("content") or ""
+                _log(f"[agent] Text response ({len(content)} chars, "
+                     f"finish_reason={finish_reason}): {content[:200]}...")
+                messages.append(assistant_msg)
+
+                # Fallback: if the LLM dumped code in a text response instead of
+                # calling validate_code, capture it so the round still has
+                # something to submit. Track structurally-ok code even when the
+                # FLOPs gate rejects it — the harness pre_validate only checks
+                # structure, so shipping a mis-sized model beats shipping nothing.
+                fallback_code = _extract_code_block(content)
+                if fallback_code:
+                    ok, errors = validation.validate_code(fallback_code, challenge)
+                    if ok:
+                        _log("[agent] Text response contained fully valid code")
+                        last_validated_code = fallback_code
                         last_proposed_code = fallback_code
                     else:
-                        _log(f"[agent] Text code block unusable: {errors}")
-
-            # If this is the last turn, the loop ends
-            if turn == MAX_TURNS - 1:
-                break
-            # Nudge the agent to take action
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Continue using your tools. If you have code ready, "
-                    "call validate_code on it, then submit. "
-                    "Check time_remaining if unsure how much time you have left."
-                ),
-            })
-            continue
-
-        # Process tool calls
-        messages.append(assistant_msg)
-
-        for tc in tool_calls:
-            func = tc["function"]
-            fn_name = func["name"]
-            call_id = tc["id"]
-
-            try:
-                kwargs = json.loads(func.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                kwargs = {}
-
-            handler = tool_handlers.get(fn_name)
-            if handler is None:
-                result_str = f"Unknown tool: '{fn_name}'. Available tools: {', '.join(tool_handlers.keys())}"
-                _log(f"[agent] Unknown tool: {fn_name}")
-            else:
-                # Capture any code the LLM ran through validate_code/submit so
-                # we have a fallback when the loop ends without a successful
-                # submit — even if full validation failed on FLOPs grounds.
-                if fn_name in ("validate_code", "submit"):
-                    candidate = kwargs.get("code", "")
-                    if candidate:
-                        struct_ok, _ = _structural_ok(candidate, challenge)
+                        struct_ok, _ = _structural_ok(fallback_code, challenge)
                         if struct_ok:
-                            last_proposed_code = candidate
+                            _log("[agent] Text code block is structurally ok "
+                                 f"(full validation failed: {errors}) — "
+                                 "tracked as last_proposed_code")
+                            last_proposed_code = fallback_code
+                        else:
+                            _log(f"[agent] Text code block unusable: {errors}")
+
+                # If this is the last turn, the loop ends
+                if turn == MAX_TURNS - 1:
+                    break
+                # Nudge the agent to take action
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Continue using your tools. If you have code ready, "
+                        "call validate_code on it, then submit. "
+                        "Check time_remaining if unsure how much time you have left."
+                    ),
+                })
+                continue
+
+            # Process tool calls
+            messages.append(assistant_msg)
+
+            for tc in tool_calls:
+                # ── Protect per-tool-call parsing ─────────────────────
+                # One malformed tool call must not abort the whole turn —
+                # append an error tool result and continue to the next tc.
                 try:
-                    result_str = str(handler(**kwargs))
-                    _log(f"[agent] Tool {fn_name} → {len(result_str)} chars")
-
-                    # Track fully-validated code separately (preferred path)
-                    if fn_name == "validate_code" and result_str.startswith("PASSED"):
-                        last_validated_code = kwargs.get("code", "")
-                        validation_failures.clear()  # Reset on success
-
-                    # Track repeated validation failures to escalate below
-                    if fn_name == "validate_code" and result_str.startswith("FAILED"):
-                        validation_failures.append(result_str)
-                except SubmitSignal as sig:
-                    _log(f"[agent] SUBMITTED: {sig.name}")
-                    return {
-                        "code": sig.code,
-                        "name": sig.name,
-                        "motivation": sig.motivation,
-                    }
-                except Exception as exc:
-                    result_str = f"Tool error: {exc}"
-                    _log(f"[agent] Tool {fn_name} raised: {exc}")
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": result_str,
-            })
-
-            # ── Escalate on repeated identical validation failures ──
-            if (
-                fn_name == "validate_code"
-                and result_str.startswith("FAILED")
-                and len(validation_failures) >= 3
-            ):
-                recent = validation_failures[-3:]
-                # Extract the first error line from each failure
-                first_errors = []
-                for f in recent:
-                    lines = [l.strip("- ") for l in f.split("\n") if l.startswith("- ")]
-                    if lines:
-                        first_errors.append(lines[0])
-
-                # If the same error appears in all 3 recent failures
-                if (
-                    len(first_errors) >= 3
-                    and first_errors[-1] == first_errors[-2] == first_errors[-3]
-                ):
-                    _log(f"[agent] Same error 3x in a row: {first_errors[-1][:100]}")
+                    func = tc["function"]
+                    fn_name = func["name"]
+                    call_id = tc["id"]
+                except (KeyError, TypeError) as exc:
+                    _log(f"[agent] Malformed tool call at turn {turn + 1}: {exc}")
                     messages.append({
-                        "role": "user",
-                        "content": (
-                            "ESCALATION: You have hit the SAME validation error 3 times "
-                            "in a row. Your current approach is not working. Do NOT make "
-                            "another small tweak — step back and try a FUNDAMENTALLY "
-                            "different approach:\n"
-                            f"Repeated error: {first_errors[-1]}\n\n"
-                            "Options:\n"
-                            "- If it's a shape mismatch: use `trace_architecture` to see "
-                            "where the shape goes wrong, or use `check_output_shape` for "
-                            "a targeted diagnosis\n"
-                            "- If it's a FLOPs error: use `estimate_layer_flops` to cost "
-                            "individual layers and redesign from scratch\n"
-                            "- If it's a structural error: re-read the task constraints "
-                            "and start with a minimal skeleton\n"
-                            "- Consider using `analyze_task` to re-examine the task "
-                            "requirements if you haven't already"
+                        "role": "tool",
+                        "tool_call_id": (
+                            tc.get("id", "unknown")
+                            if isinstance(tc, dict) else "unknown"
                         ),
+                        "content": f"Tool call parsing error: {exc}",
                     })
+                    continue
+
+                try:
+                    kwargs = json.loads(func.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    kwargs = {}
+
+                handler = tool_handlers.get(fn_name)
+                if handler is None:
+                    result_str = f"Unknown tool: '{fn_name}'. Available tools: {', '.join(tool_handlers.keys())}"
+                    _log(f"[agent] Unknown tool: {fn_name}")
+                else:
+                    # Capture any code the LLM ran through validate_code/submit so
+                    # we have a fallback when the loop ends without a successful
+                    # submit — even if full validation failed on FLOPs grounds.
+                    if fn_name in ("validate_code", "submit"):
+                        candidate = kwargs.get("code", "")
+                        if candidate:
+                            struct_ok, _ = _structural_ok(candidate, challenge)
+                            if struct_ok:
+                                last_proposed_code = candidate
+                    # Catch BaseException minus SubmitSignal: covers
+                    # TypeError from bad kwarg unpacking, arbitrary handler
+                    # errors, etc. Only SubmitSignal bypasses this to end
+                    # the loop successfully.
+                    try:
+                        result_str = str(handler(**kwargs))
+                        _log(f"[agent] Tool {fn_name} → {len(result_str)} chars")
+
+                        # Track fully-validated code separately (preferred path)
+                        if fn_name == "validate_code" and result_str.startswith("PASSED"):
+                            last_validated_code = kwargs.get("code", "")
+                            validation_failures.clear()  # Reset on success
+
+                        # Track repeated validation failures to escalate below
+                        if fn_name == "validate_code" and result_str.startswith("FAILED"):
+                            validation_failures.append(result_str)
+                    except SubmitSignal as sig:
+                        _log(f"[agent] SUBMITTED: {sig.name}")
+                        return {
+                            "code": sig.code,
+                            "name": sig.name,
+                            "motivation": sig.motivation,
+                        }
+                    except Exception as exc:
+                        result_str = f"Tool error: {exc}"
+                        _log(f"[agent] Tool {fn_name} raised: {exc}")
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result_str,
+                })
+
+                # ── Escalate on repeated identical validation failures ──
+                if (
+                    fn_name == "validate_code"
+                    and result_str.startswith("FAILED")
+                    and len(validation_failures) >= 3
+                ):
+                    recent = validation_failures[-3:]
+                    # Extract the first error line from each failure
+                    first_errors = []
+                    for f in recent:
+                        lines = [l.strip("- ") for l in f.split("\n") if l.startswith("- ")]
+                        if lines:
+                            first_errors.append(lines[0])
+
+                    # If the same error appears in all 3 recent failures
+                    if (
+                        len(first_errors) >= 3
+                        and first_errors[-1] == first_errors[-2] == first_errors[-3]
+                    ):
+                        _log(f"[agent] Same error 3x in a row: {first_errors[-1][:100]}")
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "ESCALATION: You have hit the SAME validation error 3 times "
+                                "in a row. Your current approach is not working. Do NOT make "
+                                "another small tweak — step back and try a FUNDAMENTALLY "
+                                "different approach:\n"
+                                f"Repeated error: {first_errors[-1]}\n\n"
+                                "Options:\n"
+                                "- If it's a shape mismatch: use `trace_architecture` to see "
+                                "where the shape goes wrong, or use `check_output_shape` for "
+                                "a targeted diagnosis\n"
+                                "- If it's a FLOPs error: use `estimate_layer_flops` to cost "
+                                "individual layers and redesign from scratch\n"
+                                "- If it's a structural error: re-read the task constraints "
+                                "and start with a minimal skeleton\n"
+                                "- Consider using `analyze_task` to re-examine the task "
+                                "requirements if you haven't already"
+                            ),
+                        })
+        except SubmitSignal:
+            # Success path — let it propagate (handled upstream).
+            raise
+        except Exception as exc:
+            _log(f"[agent] Turn {turn + 1} crashed: {exc} — continuing to next turn")
+            continue
 
     # Loop ended without an explicit submit. Prefer fully-validated code;
     # otherwise try to fully validate any structurally-ok proposal before
