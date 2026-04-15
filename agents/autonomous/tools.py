@@ -777,7 +777,23 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
     def validate_code_handler(code: str) -> str:
         ok, errors = validation.validate_code(code, challenge)
         if ok:
-            return "PASSED: Code is valid and FLOPs are within budget."
+            # Run a shape check to report the actual output shape
+            task = challenge.get("task", {}) or {}
+            tp = task.get("task_params", {}) or {}
+            constraints = task.get("constraints", []) or []
+            expected = infer_output_shape(tp, constraints)
+
+            if expected is not None:
+                sink = []
+                estimate_flops(code, challenge, sink)
+                if sink:
+                    shape_str = f"Output shape {tuple(sink[0])} matches expected."
+                else:
+                    shape_str = "Output shape could not be captured but no mismatch detected."
+            else:
+                shape_str = "No output shape constraint to check."
+
+            return f"PASSED: Code is valid, FLOPs within budget, {shape_str}"
         return "FAILED:\n" + "\n".join(f"- {e}" for e in errors)
 
     # ── State handlers ────────────────────────────────────────────

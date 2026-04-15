@@ -214,9 +214,9 @@ def _build_system_prompt(challenge: dict, strategy: dict | None = None) -> str:
         "if you're confident. But prototyping with `estimate_layer_flops` and "
         "`sketch_architecture` is cheap and catches mistakes early.\n\n"
         "## TIME MANAGEMENT (CRITICAL)\n"
-        "- You MUST have validated code by the halfway point of your time budget\n"
+        "- You should have validated code by 85% of your time budget. "
+        "Use the earlier portion for research, prototyping, and iterating on your design.\n"
         "- Generate and validate a working model FIRST, then iterate to improve\n"
-        "- Do NOT spend more than 2-3 turns on research before generating code\n"
         "- If validate_code fails on FLOPs, follow the resize suggestion immediately\n"
         "- If time is running low, submit what you have rather than researching more\n"
         "- A submitted model that passes validation always beats no submission"
@@ -287,8 +287,8 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
     calls submit, or None if time/turns run out without a submission.
 
     Time management checkpoints:
-      - At 50% time used with no validated code: inject urgent nudge
-      - At 75% time used with no validated code: auto-generate fallback
+      - At 85% time used with no validated code: inject urgent nudge
+      - At 93% time used with no validated code: auto-generate fallback
     """
     llm_url = challenge.get("llm_url", "")
     if not llm_url:
@@ -302,8 +302,9 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
 
     start_time = time.time()
     total_budget = deadline - start_time
-    nudged_50pct = False           # Have we injected the 50% warning?
-    fallback_injected = False      # Have we injected the 75% fallback?
+    nudged_85pct = False           # Have we injected the 85% warning?
+    fallback_injected = False      # Have we injected the 93% fallback?
+    validation_failures: list[str] = []  # Track error strings across turns
 
     for turn in range(MAX_TURNS):
         remaining = deadline - time.time()
@@ -314,24 +315,24 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
         elapsed = time.time() - start_time
         pct_used = elapsed / total_budget if total_budget > 0 else 1.0
 
-        # ── 50% checkpoint: force code generation if nothing yet ──
-        if pct_used >= 0.50 and not nudged_50pct and not last_validated_code:
-            nudged_50pct = True
-            _log("[agent] 50% time checkpoint — no validated code yet, injecting urgency")
+        # ── 85% checkpoint: force code generation if nothing yet ──
+        if pct_used >= 0.85 and not nudged_85pct and not last_validated_code:
+            nudged_85pct = True
+            _log("[agent] 85% time checkpoint — no validated code yet, injecting urgency")
             messages.append({
                 "role": "user",
                 "content": (
-                    "WARNING: You have used over half your time with no validated "
+                    "WARNING: You have used 85% of your time with no validated "
                     "code. Generate and validate code NOW. You can iterate after "
                     "you have a working baseline. Call validate_code with your "
                     "best code immediately."
                 ),
             })
 
-        # ── 75% checkpoint: auto-generate fallback if still nothing ──
-        if pct_used >= 0.75 and not fallback_injected and not last_validated_code:
+        # ── 93% checkpoint: auto-generate fallback if still nothing ──
+        if pct_used >= 0.93 and not fallback_injected and not last_validated_code:
             fallback_injected = True
-            _log("[agent] 75% time checkpoint — generating fallback template")
+            _log("[agent] 93% time checkpoint — generating fallback template")
             try:
                 fb_code = generate_fallback(challenge)
                 ok, errors = validation.validate_code(fb_code, challenge)
@@ -473,6 +474,11 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
                     # Track fully-validated code separately (preferred path)
                     if fn_name == "validate_code" and result_str.startswith("PASSED"):
                         last_validated_code = kwargs.get("code", "")
+                        validation_failures.clear()  # Reset on success
+
+                    # Track repeated validation failures to escalate below
+                    if fn_name == "validate_code" and result_str.startswith("FAILED"):
+                        validation_failures.append(result_str)
                 except SubmitSignal as sig:
                     _log(f"[agent] SUBMITTED: {sig.name}")
                     return {
@@ -489,6 +495,47 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
                 "tool_call_id": call_id,
                 "content": result_str,
             })
+
+            # ── Escalate on repeated identical validation failures ──
+            if (
+                fn_name == "validate_code"
+                and result_str.startswith("FAILED")
+                and len(validation_failures) >= 3
+            ):
+                recent = validation_failures[-3:]
+                # Extract the first error line from each failure
+                first_errors = []
+                for f in recent:
+                    lines = [l.strip("- ") for l in f.split("\n") if l.startswith("- ")]
+                    if lines:
+                        first_errors.append(lines[0])
+
+                # If the same error appears in all 3 recent failures
+                if (
+                    len(first_errors) >= 3
+                    and first_errors[-1] == first_errors[-2] == first_errors[-3]
+                ):
+                    _log(f"[agent] Same error 3x in a row: {first_errors[-1][:100]}")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "ESCALATION: You have hit the SAME validation error 3 times "
+                            "in a row. Your current approach is not working. Do NOT make "
+                            "another small tweak — step back and try a FUNDAMENTALLY "
+                            "different approach:\n"
+                            f"Repeated error: {first_errors[-1]}\n\n"
+                            "Options:\n"
+                            "- If it's a shape mismatch: use `trace_architecture` to see "
+                            "where the shape goes wrong, or use `check_output_shape` for "
+                            "a targeted diagnosis\n"
+                            "- If it's a FLOPs error: use `estimate_layer_flops` to cost "
+                            "individual layers and redesign from scratch\n"
+                            "- If it's a structural error: re-read the task constraints "
+                            "and start with a minimal skeleton\n"
+                            "- Consider using `analyze_task` to re-examine the task "
+                            "requirements if you haven't already"
+                        ),
+                    })
 
     # Loop ended without an explicit submit. Prefer fully-validated code;
     # otherwise try to fully validate any structurally-ok proposal before
