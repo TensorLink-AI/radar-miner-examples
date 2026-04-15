@@ -32,8 +32,11 @@ from core.history import (
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
-from core.prompt_builder import format_frontier
 from core.trace import trace_architecture, format_trace
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
@@ -189,21 +192,37 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "get_frontier_details",
+            "name": "list_frontier",
             "description": (
-                "Get detailed information about the current Pareto frontier — "
-                "the models you need to beat. Returns their objectives, code, "
-                "and motivations. Study these to find improvement opportunities."
+                "List all frontier members with their metrics and architecture "
+                "type. Returns a compact summary — no code. Use "
+                "get_frontier_member(index) to retrieve a specific member's "
+                "code when you need implementation details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_frontier_member",
+            "description": (
+                "Get a specific frontier member's code and metrics by index. "
+                "Call list_frontier first to see available members."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "max_entries": {
+                    "index": {
                         "type": "integer",
-                        "description": "Max frontier members to return (default 5)",
+                        "description": "Member index from list_frontier output",
                     },
                 },
-                "required": [],
+                "required": ["index"],
             },
         },
     },
@@ -428,6 +447,36 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         except (TypeError, ValueError):
             return str(data)
 
+    def _fetch_frontier() -> list:
+        """Fetch frontier from DB API, fall back to challenge dict."""
+        if db_url:
+            try:
+                result = client.get_json(f"{db_url.rstrip('/')}/frontier")
+                if isinstance(result, list) and result:
+                    return result
+            except Exception as exc:
+                _log(f"[tools] GET /frontier failed: {exc}")
+        # Fallback to challenge dict
+        frontier = challenge.get("feasible_frontier", [])
+        if not frontier:
+            frontier = challenge.get("pareto_frontier", [])
+        return frontier if isinstance(frontier, list) else []
+
+    def _detect_arch_type(code: str) -> str:
+        """Infer architecture type by scanning code for operation classes."""
+        if not code:
+            return "unknown"
+        types = []
+        if "MultiheadAttention" in code or "TransformerEncoder" in code:
+            types.append("attention")
+        if "Conv1d" in code or "Conv2d" in code:
+            types.append("conv")
+        if "GRU" in code or "LSTM" in code:
+            types.append("recurrence")
+        if not types and "Linear" in code:
+            types.append("MLP")
+        return "+".join(types) if types else "custom"
+
     # ── Research handlers ─────────────────────────────────────────
 
     def search_papers(query: str, max_results: int = 5) -> str:
@@ -553,10 +602,8 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
                 f"Per input×output element: ~{per_elem:.2f} ops"
             )
 
-        # Frontier gap analysis
-        frontier = challenge.get("feasible_frontier") or challenge.get(
-            "pareto_frontier"
-        ) or []
+        # Frontier gap analysis — lean summary only, no code
+        frontier = _fetch_frontier()
         if frontier:
             gap = scan_frontier_ops(frontier)
             lines.append(f"\n## Frontier Ops\n{gap}")
@@ -698,13 +745,53 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         )
         return "\n".join(lines)
 
-    def get_frontier_details(max_entries: int = 5) -> str:
-        frontier = challenge.get("feasible_frontier", [])
+    def list_frontier_handler() -> str:
+        frontier = _fetch_frontier()
         if not frontier:
-            frontier = challenge.get("pareto_frontier", [])
+            return "No frontier exists — you are bootstrapping the first model."
+
+        lines = [f"Frontier has {len(frontier)} member(s):\n"]
+        for i, member in enumerate(frontier):
+            metrics = member.get("objectives", {})
+            metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+            code = member.get("code", "")
+            arch = _detect_arch_type(code)
+            lines.append(
+                f"  [{i}] {metric_str} | arch={arch} | "
+                f"code_len={len(code)}"
+            )
+        lines.append(
+            "\nCall get_frontier_member(index=N) to read a member's code."
+        )
+        return "\n".join(lines)
+
+    def get_frontier_member_handler(index: int) -> str:
+        frontier = _fetch_frontier()
         if not frontier:
-            return "No frontier exists yet — you are bootstrapping the first model."
-        return format_frontier(frontier, max_entries=max_entries)
+            return "No frontier available."
+        if index < 0 or index >= len(frontier):
+            return (f"Invalid index {index}. Frontier has "
+                    f"{len(frontier)} members (0-{len(frontier)-1}).")
+
+        member = frontier[index]
+        metrics = member.get("objectives", {})
+        metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
+        code = member.get("code", "")
+        motivation = member.get("motivation", "")
+
+        if len(code) > 3000:
+            code = (code[:3000] +
+                    f"\n# ... (truncated — full code is {len(code)} chars)")
+
+        parts = [f"## Frontier Member [{index}]",
+                 f"Metrics: {metric_str}"]
+        if motivation:
+            parts.append(f"Motivation: {motivation}")
+        if code:
+            parts.append(f"```python\n{code}\n```")
+        else:
+            parts.append("(no code available)")
+        return "\n".join(parts)
 
     def estimate_model_flops(code: str) -> str:
         estimated, err = estimate_flops(code, challenge)
@@ -848,7 +935,8 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         "analyze_task": analyze_task_handler,
         "estimate_layer_flops": estimate_layer_flops_handler,
         "sketch_architecture": sketch_architecture_handler,
-        "get_frontier_details": get_frontier_details,
+        "list_frontier": list_frontier_handler,
+        "get_frontier_member": get_frontier_member_handler,
         "estimate_model_flops": estimate_model_flops,
         "trace_architecture": trace_architecture_handler,
         "check_output_shape": check_output_shape_handler,

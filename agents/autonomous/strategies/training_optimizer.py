@@ -13,7 +13,8 @@ def build_strategy(challenge: dict, state: dict) -> dict:
 
     workflow = (
         "## Strategy Workflow\n"
-        "- `get_frontier_details` — read the best frontier code.\n"
+        "- `list_frontier` then `get_frontier_member(index)` — read the "
+        "best frontier code.\n"
         "- Copy the model class exactly. Do not rename, reshape, or "
         "renumber layers.\n"
         "- Modify ONLY the optional hooks:\n"

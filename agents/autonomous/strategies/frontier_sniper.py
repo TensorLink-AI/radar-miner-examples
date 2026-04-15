@@ -40,7 +40,8 @@ def build_strategy(challenge: dict, state: dict) -> dict:
 
     workflow = (
         "## Strategy Workflow\n"
-        "- Use `get_frontier_details` to read the best frontier code.\n"
+        "- Use `list_frontier` to see all members, then "
+        "`get_frontier_member(index)` to read the best one's code.\n"
         "- Identify the ONE thing you will change. Write it down in a "
         "code comment.\n"
         "- Sketch it with `sketch_architecture` if your change alters "

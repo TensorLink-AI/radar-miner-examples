@@ -42,8 +42,9 @@ def build_strategy(challenge: dict, state: dict) -> dict:
 
     workflow = (
         "## Strategy Workflow\n"
-        "- `get_frontier_details` — find the frontier's weakest member "
-        "on each secondary objective.\n"
+        "- `list_frontier` to see metrics across all members; use "
+        "`get_frontier_member(index)` to inspect the weakest one on each "
+        "secondary objective.\n"
         "- Decide which secondary metrics you can realistically improve "
         "given the task's objective list (read from the challenge).\n"
         "- Sketch a design with `sketch_architecture`; verify it fits "
