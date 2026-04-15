@@ -20,8 +20,8 @@ def build_strategy(challenge: dict, state: dict) -> dict:
 
     workflow = (
         "## Strategy Workflow\n"
-        "- `get_frontier_details` with a generous `max_entries` to see "
-        "all members.\n"
+        "- `list_frontier` to see all members at a glance, then "
+        "`get_frontier_member(index)` on each one you want to study.\n"
         "- For each member, identify: (a) which metric it wins on, and "
         "(b) the specific architectural choice responsible.\n"
         "- Sketch a synthesis with `sketch_architecture`, cherry-picking "

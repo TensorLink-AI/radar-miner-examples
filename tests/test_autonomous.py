@@ -166,7 +166,8 @@ class TestToolDefinitions:
     def test_expected_tools_present(self):
         tool_names = {t["function"]["name"] for t in TOOLS}
         expected = {
-            "search_papers", "query_db", "get_frontier_details",
+            "search_papers", "query_db",
+            "list_frontier", "get_frontier_member",
             "estimate_model_flops", "trace_architecture", "check_output_shape",
             "validate_code", "read_scratchpad", "write_scratchpad",
             "submit", "time_remaining",
@@ -197,7 +198,8 @@ class TestToolHandlers:
     def test_all_handlers_present(self):
         handlers = self._make_handlers()
         expected = {
-            "search_papers", "query_db", "get_frontier_details",
+            "search_papers", "query_db",
+            "list_frontier", "get_frontier_member",
             "estimate_model_flops", "trace_architecture", "check_output_shape",
             "validate_code", "read_scratchpad", "write_scratchpad",
             "submit", "time_remaining",
@@ -231,17 +233,39 @@ class TestToolHandlers:
         assert "Estimated FLOPs" in result
         assert "Budget" in result
 
-    def test_frontier_details_empty(self):
+    def test_list_frontier_empty(self):
         handlers = self._make_handlers()
-        result = handlers["get_frontier_details"]()
+        result = handlers["list_frontier"]()
         assert "bootstrapping" in result.lower() or "no frontier" in result.lower()
 
-    def test_frontier_details_with_data(self):
+    def test_list_frontier_with_data(self):
         frontier = [{"objectives": {"crps": 0.4}, "code": "x=1"}]
         challenge = _make_challenge(frontier=frontier)
         handlers = self._make_handlers(challenge=challenge)
-        result = handlers["get_frontier_details"]()
+        result = handlers["list_frontier"]()
         assert "0.4" in result
+        # List view should NOT contain the code itself
+        assert "x=1" not in result
+
+    def test_get_frontier_member_returns_code(self):
+        frontier = [{"objectives": {"crps": 0.4}, "code": "x=1"}]
+        challenge = _make_challenge(frontier=frontier)
+        handlers = self._make_handlers(challenge=challenge)
+        result = handlers["get_frontier_member"](index=0)
+        assert "0.4" in result
+        assert "x=1" in result
+
+    def test_get_frontier_member_invalid_index(self):
+        frontier = [{"objectives": {"crps": 0.4}, "code": "x=1"}]
+        challenge = _make_challenge(frontier=frontier)
+        handlers = self._make_handlers(challenge=challenge)
+        result = handlers["get_frontier_member"](index=5)
+        assert "invalid" in result.lower() or "0-0" in result
+
+    def test_get_frontier_member_no_frontier(self):
+        handlers = self._make_handlers()
+        result = handlers["get_frontier_member"](index=0)
+        assert "no frontier" in result.lower()
 
     def test_scratchpad_empty_first_round(self):
         with tempfile.TemporaryDirectory() as tmp:
