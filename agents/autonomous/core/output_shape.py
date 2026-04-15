@@ -1,16 +1,17 @@
 """Generic output shape inference and verification.
 
 Purpose: catch "model outputs wrong shape" failures BEFORE submission, so
-training doesn't die on tensor-size mismatches like
-``size of tensor a (96) must match the size of tensor b (64)``.
+training doesn't die on tensor-size mismatches during training.
 
 Strategy (task-agnostic):
   1. Parse the task's ``constraints`` strings for a pattern like
-     ``Output[...]: (batch, prediction_len, num_variates, len(quantiles))``.
+     ``Output[...]: (batch, D1, D2, len(some_list))``. The dimension names
+     come from whatever the challenge declares — no task-specific names
+     are baked in.
   2. Resolve each non-batch dimension against ``task_params``:
-       - literal integer        → ``96``
-       - direct key             → ``prediction_len`` → ``tp["prediction_len"]``
-       - ``len(...)``           → ``len(quantiles)`` → ``len(tp["quantiles"])``
+       - literal integer        → e.g. ``96``
+       - direct key             → ``key_name`` → ``tp["key_name"]``
+       - ``len(...)``           → ``len(some_list)`` → ``len(tp["some_list"])``
        - unresolved name        → wildcard (``-1``) — skipped during compare
   3. Compare against the actual tensor shape the model produces on a dummy
      forward pass. Works for 2D, 3D, 4D, or any rank that the constraint

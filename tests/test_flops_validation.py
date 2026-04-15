@@ -4,14 +4,14 @@ import pytest
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "frontier_sniper"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "agents", "autonomous"))
 # Clear cached core modules to ensure correct resolution
 for _k in list(sys.modules.keys()):
     if _k == "core" or _k.startswith("core."):
         del sys.modules[_k]
 
 from core.flops_estimator import estimate_flops
-from core.validation import validate
+from core.validation import validate_code as validate
 
 
 # Standard task_params matching GIFT-Eval production

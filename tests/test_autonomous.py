@@ -170,6 +170,7 @@ class TestToolDefinitions:
             "estimate_model_flops", "trace_architecture", "check_output_shape",
             "validate_code", "read_scratchpad", "write_scratchpad",
             "submit", "time_remaining",
+            "analyze_task", "estimate_layer_flops", "sketch_architecture",
         }
         assert expected == tool_names
 
@@ -200,6 +201,7 @@ class TestToolHandlers:
             "estimate_model_flops", "trace_architecture", "check_output_shape",
             "validate_code", "read_scratchpad", "write_scratchpad",
             "submit", "time_remaining",
+            "analyze_task", "estimate_layer_flops", "sketch_architecture",
         }
         assert set(handlers.keys()) == expected
 
