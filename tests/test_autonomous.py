@@ -860,9 +860,9 @@ class TestSubmitSignal:
 # ══════════════════════════════════════════════════════════════════
 
 class TestConstants:
-    def test_max_turns_is_25(self):
-        """MAX_TURNS should be 25 (leaves 5 headroom from 30-request limit)."""
-        assert MAX_TURNS == 25
+    def test_max_turns_is_50(self):
+        """MAX_TURNS should be 50 — ~30s/call × 50 fits a 1500s budget."""
+        assert MAX_TURNS == 50
 
     def test_time_buffer_is_positive(self):
         assert _mod.TIME_BUFFER_SECONDS > 0
