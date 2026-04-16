@@ -447,20 +447,41 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         except (TypeError, ValueError):
             return str(data)
 
+    # ── Frontier caching ─────────────────────────────────────────
+    # Frontier data is immutable within a round — fetch once and reuse.
+    _frontier_cache: dict = {"data": None, "fetched": False}
+    # Track which frontier members the LLM has already pulled code for.
+    _fetched_members: set = set()
+    _MAX_MEMBER_FETCHES = 3  # Enough to study; more just bloats context.
+
     def _fetch_frontier() -> list:
-        """Fetch frontier from DB API, fall back to challenge dict."""
+        """Fetch frontier from DB API, fall back to challenge dict.
+
+        Cached per round — subsequent calls return the stored result
+        without making another HTTP request.
+        """
+        if _frontier_cache["fetched"]:
+            return _frontier_cache["data"]
+
+        result: list = []
         if db_url:
             try:
                 result = client.get_json(f"{db_url.rstrip('/')}/frontier")
-                if isinstance(result, list) and result:
-                    return result
+                if not (isinstance(result, list) and result):
+                    result = []
             except Exception as exc:
                 _log(f"[tools] GET /frontier failed: {exc}")
-        # Fallback to challenge dict
-        frontier = challenge.get("feasible_frontier", [])
-        if not frontier:
-            frontier = challenge.get("pareto_frontier", [])
-        return frontier if isinstance(frontier, list) else []
+                result = []
+
+        if not result:
+            frontier = challenge.get("feasible_frontier", [])
+            if not frontier:
+                frontier = challenge.get("pareto_frontier", [])
+            result = frontier if isinstance(frontier, list) else []
+
+        _frontier_cache["data"] = result
+        _frontier_cache["fetched"] = True
+        return result
 
     def _detect_arch_type(code: str) -> str:
         """Infer architecture type by scanning code for operation classes."""
@@ -766,6 +787,21 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         return "\n".join(lines)
 
     def get_frontier_member_handler(index: int) -> str:
+        # ── Dedup: don't re-fetch a member already in context ────
+        if index in _fetched_members:
+            return (
+                f"Frontier member [{index}] was already retrieved this round. "
+                "Refer to the earlier tool result instead of re-fetching."
+            )
+
+        # ── Cap: limit total member fetches to control context size ──
+        if len(_fetched_members) >= _MAX_MEMBER_FETCHES:
+            return (
+                f"Already fetched {_MAX_MEMBER_FETCHES} frontier members "
+                f"(indices {sorted(_fetched_members)}). Use what you have — "
+                "additional fetches add context bloat without new insight."
+            )
+
         frontier = _fetch_frontier()
         if not frontier:
             return "No frontier available."
@@ -773,14 +809,16 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
             return (f"Invalid index {index}. Frontier has "
                     f"{len(frontier)} members (0-{len(frontier)-1}).")
 
+        _fetched_members.add(index)
+
         member = frontier[index]
         metrics = member.get("objectives", {})
         metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items())
         code = member.get("code", "")
         motivation = member.get("motivation", "")
 
-        if len(code) > 3000:
-            code = (code[:3000] +
+        if len(code) > 2000:
+            code = (code[:2000] +
                     f"\n# ... (truncated — full code is {len(code)} chars)")
 
         parts = [f"## Frontier Member [{index}]",
