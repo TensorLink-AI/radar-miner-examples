@@ -263,6 +263,48 @@ def _build_kickoff_message(challenge: dict, strategy: dict | None = None) -> str
     return base
 
 
+def _compact_messages(messages: list[dict], keep_recent: int = 6) -> None:
+    """Trim old tool-result messages in-place to cap prompt size.
+
+    Preserves the system prompt (index 0), the kickoff user message
+    (index 1), and the most recent *keep_recent* messages untouched.
+    Everything else that is a ``role: tool`` message longer than 200
+    chars gets shortened to the first 150 chars + a ``[trimmed]``
+    marker. This removes the raw frontier dumps / DB responses that
+    the LLM has already processed, preventing them from bloating
+    subsequent LLM calls.
+    """
+    if len(messages) <= 2 + keep_recent:
+        return
+
+    compact_end = len(messages) - keep_recent
+    chars_saved = 0
+    for i in range(2, compact_end):
+        msg = messages[i]
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        if len(content) <= 200:
+            continue
+        original_len = len(content)
+        summary = content[:150].rstrip() + "\n... [trimmed]"
+        messages[i] = {**msg, "content": summary}
+        chars_saved += original_len - len(summary)
+
+    if chars_saved > 0:
+        _log(f"[agent] Compacted messages: trimmed ~{chars_saved:,} chars "
+             f"from tool results older than last {keep_recent} messages")
+
+
+def _tool_content_size(messages: list[dict]) -> int:
+    """Total chars across all tool-result messages."""
+    return sum(
+        len(m.get("content", "") or "")
+        for m in messages
+        if m.get("role") == "tool"
+    )
+
+
 def _structural_ok(code: str, challenge: dict | None) -> tuple[bool, list[str]]:
     """Lenient structural check used for final fallback acceptance.
 
@@ -574,6 +616,15 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
                                 "requirements if you haven't already"
                             ),
                         })
+
+            # ── Compact old tool results to prevent context bloat ──
+            # Frontier dumps, DB responses, etc. that the LLM has already
+            # seen don't need to sit in full in the prompt for subsequent
+            # turns. Compact them once the accumulated tool output crosses
+            # a threshold, keeping only recent results intact.
+            if _tool_content_size(messages) > 12000:
+                _compact_messages(messages)
+
         except SubmitSignal:
             # Success path — let it propagate (handled upstream).
             raise
