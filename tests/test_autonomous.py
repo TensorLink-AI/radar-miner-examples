@@ -422,8 +422,8 @@ class TestCircuitBreaker:
         r3 = handlers["get_frontier_member"](index=99)
 
         assert r1 == r2, "Two identical bad calls should produce identical errors"
-        assert "returned the same error" in r3.lower()
-        assert "do not call it again" in r3.lower()
+        assert "circuit open" in r3.lower()
+        assert "do not call this tool again" in r3.lower()
 
     def test_recovers_after_successful_call(self):
         """A successful (long) response resets the counter."""
@@ -440,7 +440,7 @@ class TestCircuitBreaker:
 
         # After reset, next call should fail normally — not trip breaker
         r = handlers["get_frontier_member"](index=99)
-        assert "returned the same error" not in r.lower()
+        assert "circuit open" not in r.lower()
 
     def test_different_tools_tracked_independently(self):
         challenge = _make_challenge()
@@ -454,7 +454,7 @@ class TestCircuitBreaker:
         assert "unavailable" in s1.lower()
         # Third identical query_db call trips its breaker.
         r3 = handlers["query_db"](path="/x")
-        assert "returned the same error" in r3.lower()
+        assert "circuit open" in r3.lower()
 
 
 # ══════════════════════════════════════════════════════════════════
