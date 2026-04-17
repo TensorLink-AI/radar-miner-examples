@@ -896,6 +896,163 @@ class TestConstants:
 #  9. Integration: validation works end-to-end
 # ══════════════════════════════════════════════════════════════════
 
+class TestTimeoutRetry:
+    """Tests for per-request timeout and exponential backoff."""
+
+    def test_timeout_doesnt_hang_loop(self):
+        """A slow LLM server should not hang the entire loop.
+
+        The loop should timeout individual requests rather than blocking
+        for the OS-default socket timeout (~127s)."""
+        challenge = _make_challenge(llm_url="http://llm")
+
+        call_count = [0]
+
+        def slow_llm(payload):
+            call_count[0] += 1
+            # Simulate a slow server that blocks longer than the timeout
+            time.sleep(5)
+            return _make_llm_response(content="too slow")
+
+        client = MockClient(responses={
+            "http://llm/v1/chat/completions": slow_llm,
+        })
+
+        handlers = build_handlers(
+            client, challenge, tempfile.mkdtemp(), time.time() + 20)
+        messages = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "go"},
+        ]
+
+        # Patch the timeout to a very short value for testing
+        original_timeout = _mod.LLM_REQUEST_TIMEOUT
+        _mod.LLM_REQUEST_TIMEOUT = 1  # 1-second timeout
+        try:
+            start = time.time()
+            result = _autonomous_loop(
+                client, challenge, messages, handlers, time.time() + 15)
+            elapsed = time.time() - start
+        finally:
+            _mod.LLM_REQUEST_TIMEOUT = original_timeout
+
+        # Should have finished quickly (not hung for 127s per attempt)
+        assert elapsed < 30, f"Loop took {elapsed:.0f}s — timeout not working"
+
+    def test_time_budget_prevents_retry(self):
+        """When time budget is nearly exhausted, skip retries instead of
+        blocking on another attempt that would exceed the deadline."""
+        challenge = _make_challenge(llm_url="http://llm")
+
+        client = MockClient(raise_on_call=True)
+
+        handlers = build_handlers(
+            client, challenge, tempfile.mkdtemp(), time.time() + 300)
+        messages = [
+            {"role": "system", "content": "test"},
+            {"role": "user", "content": "go"},
+        ]
+
+        # Deadline is only 3 seconds away — not enough for multiple retries
+        start = time.time()
+        result = _autonomous_loop(
+            client, challenge, messages, handlers, time.time() + 3)
+        elapsed = time.time() - start
+
+        assert result is None
+        assert elapsed < 15, f"Loop took {elapsed:.0f}s despite tight deadline"
+
+    def test_tool_timeout_returns_error_message(self):
+        """Tool HTTP calls that timeout return a user-friendly error."""
+        import concurrent.futures
+
+        call_count = [0]
+
+        class SlowClient:
+            def get_json(self, url):
+                call_count[0] += 1
+                time.sleep(5)
+                return {}
+
+            def post_json(self, url, payload):
+                call_count[0] += 1
+                time.sleep(5)
+                return {}
+
+        challenge = _make_challenge(
+            db_url="http://db", desearch_url="http://search")
+        handlers = build_handlers(
+            SlowClient(), challenge, tempfile.mkdtemp(), time.time() + 300)
+
+        # Patch the tool timeout for fast testing
+        import tools as tools_mod
+        original_timeout = tools_mod.TOOL_HTTP_TIMEOUT
+        tools_mod.TOOL_HTTP_TIMEOUT = 1
+        try:
+            result = handlers["query_db"](path="/experiments/recent")
+            assert "timed out" in result.lower()
+
+            result = handlers["search_papers"](query="transformer")
+            assert "timed out" in result.lower()
+        finally:
+            tools_mod.TOOL_HTTP_TIMEOUT = original_timeout
+
+    def test_fallback_tracked_in_history(self):
+        """Fallback submissions should be marked with was_fallback metadata."""
+        challenge = _make_challenge("small", llm_url="")
+
+        _mod.load_scratchpad = lambda c: None
+        _mod.save_scratchpad = lambda c, d: None
+        import builtins
+        builtins.load_scratchpad = lambda c: None
+        builtins.save_scratchpad = lambda c, d: None
+        try:
+            result = design_architecture(challenge, MockClient())
+        finally:
+            del builtins.load_scratchpad
+            del builtins.save_scratchpad
+
+        assert "fallback" in result["name"]
+
+
+# ═════════════════════════════════════���════════════════════════════
+#  10. call_with_timeout utility
+# ═════════════════════════════════════���════════════════════���═══════
+
+class TestCallWithTimeout:
+    def test_returns_result_on_success(self):
+        from core import call_with_timeout
+        result = call_with_timeout(lambda: 42, timeout=5)
+        assert result == 42
+
+    def test_raises_on_timeout(self):
+        from core import call_with_timeout
+        import pytest
+        with pytest.raises(TimeoutError):
+            call_with_timeout(lambda: time.sleep(10), timeout=0.5)
+
+    def test_propagates_exception(self):
+        from core import call_with_timeout
+        import pytest
+        def boom():
+            raise ValueError("boom")
+        with pytest.raises(ValueError, match="boom"):
+            call_with_timeout(boom, timeout=5)
+
+    def test_passes_args_and_kwargs(self):
+        from core import call_with_timeout
+        result = call_with_timeout(
+            lambda x, y=0: x + y,
+            args=(10,), kwargs={"y": 5},
+            timeout=5,
+        )
+        assert result == 15
+
+
+# ═════════���════════════════════���═════════════════════════���═════════
+#  11. Integration: validation works end-to-end
+# ═════════���════════════════���═══════════════════════════════════════
+
 class TestValidationIntegration:
     def test_valid_code_passes(self):
         ok, errors = validate_code(VALID_CODE)

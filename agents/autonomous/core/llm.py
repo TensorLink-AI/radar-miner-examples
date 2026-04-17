@@ -11,12 +11,15 @@ Key design decisions:
 
 import json
 import sys
+import time
 
+from core import call_with_timeout
 from core.validation import validate_code
 from core.prompt_builder import build_system_prompt, build_user_prompt
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 MAX_LLM_ATTEMPTS = 15  # up to 15 turns — half the 30-request rate limit
+LLM_REQUEST_TIMEOUT = 45  # seconds per LLM HTTP request
 
 
 def chat(client, llm_url: str, messages: list[dict], *,
@@ -36,7 +39,11 @@ def chat(client, llm_url: str, messages: list[dict], *,
     print(f"[llm] calling {llm_url}/v1/chat/completions model={model} "
           f"msgs={len(messages)} temp={temperature}", file=sys.stderr)
 
-    resp = client.post_json(f"{llm_url}/v1/chat/completions", payload)
+    resp = call_with_timeout(
+        client.post_json,
+        args=(f"{llm_url}/v1/chat/completions", payload),
+        timeout=LLM_REQUEST_TIMEOUT,
+    )
     content = resp["choices"][0]["message"]["content"]
     print(f"[llm] response received: {len(content)} chars", file=sys.stderr)
     return content
@@ -89,13 +96,24 @@ def chat_with_tools(
             file=sys.stderr,
         )
 
-        # Retry loop for transient HTTP failures within a single round.
+        # Retry loop with per-request timeout and exponential backoff.
         last_err: Exception | None = None
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = client.post_json(url, payload)
+                resp = call_with_timeout(
+                    client.post_json, args=(url, payload),
+                    timeout=LLM_REQUEST_TIMEOUT,
+                )
                 break
+            except TimeoutError:
+                last_err = TimeoutError(
+                    f"timed out after {LLM_REQUEST_TIMEOUT}s")
+                print(
+                    f"[llm] round {round_idx + 1} attempt {attempt + 1}/{max_retries} "
+                    f"timed out after {LLM_REQUEST_TIMEOUT}s",
+                    file=sys.stderr,
+                )
             except Exception as exc:
                 last_err = exc
                 print(
@@ -103,6 +121,9 @@ def chat_with_tools(
                     f"failed: {exc}",
                     file=sys.stderr,
                 )
+            if attempt < max_retries - 1:
+                backoff = 2 ** (attempt + 1)
+                time.sleep(backoff)
 
         if resp is None:
             raise RuntimeError(

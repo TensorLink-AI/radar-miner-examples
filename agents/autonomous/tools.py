@@ -32,7 +32,11 @@ from core.history import (
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
+from core import call_with_timeout
 from core.trace import trace_architecture, format_trace
+
+TOOL_HTTP_TIMEOUT = 15   # seconds per research/DB request
+FRONTIER_HTTP_TIMEOUT = 10  # seconds for frontier fetch
 
 
 def _log(msg: str) -> None:
@@ -466,9 +470,16 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         result: list = []
         if db_url:
             try:
-                result = client.get_json(f"{db_url.rstrip('/')}/frontier")
+                result = call_with_timeout(
+                    client.get_json,
+                    args=(f"{db_url.rstrip('/')}/frontier",),
+                    timeout=FRONTIER_HTTP_TIMEOUT,
+                )
                 if not (isinstance(result, list) and result):
                     result = []
+            except TimeoutError:
+                _log(f"[tools] GET /frontier timed out after {FRONTIER_HTTP_TIMEOUT}s")
+                result = []
             except Exception as exc:
                 _log(f"[tools] GET /frontier failed: {exc}")
                 result = []
@@ -504,9 +515,11 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         if not desearch_url:
             return "Paper search unavailable (no desearch_url)."
         try:
-            resp = client.post_json(
-                f"{desearch_url}/search",
-                {"query": query, "max_results": max_results},
+            resp = call_with_timeout(
+                client.post_json,
+                args=(f"{desearch_url}/search",
+                      {"query": query, "max_results": max_results}),
+                timeout=TOOL_HTTP_TIMEOUT,
             )
             results = resp.get("results", [])
             if not results:
@@ -519,6 +532,8 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
                     lines.append(abstract[:500])
                 lines.append("")
             return "\n".join(lines)
+        except TimeoutError:
+            return f"Paper search timed out after {TOOL_HTTP_TIMEOUT}s."
         except Exception as exc:
             return f"Paper search failed: {exc}"
 
@@ -533,9 +548,15 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         url = f"{base}{path}"
         try:
             if method.upper() == "POST":
-                result = client.post_json(url, body or {})
+                result = call_with_timeout(
+                    client.post_json, args=(url, body or {}),
+                    timeout=TOOL_HTTP_TIMEOUT,
+                )
             else:
-                result = client.get_json(url)
+                result = call_with_timeout(
+                    client.get_json, args=(url,),
+                    timeout=TOOL_HTTP_TIMEOUT,
+                )
             if isinstance(result, dict) and "error" in result:
                 return f"DB returned error: {result['error']}"
             formatted = _fmt(result)
@@ -543,6 +564,9 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
             if len(formatted) > 8000:
                 formatted = formatted[:8000] + "\n... (truncated, try a more specific query)"
             return formatted
+        except TimeoutError:
+            print(f"[tools] query_db {method} {path} timed out", file=sys.stderr)
+            return f"DB query timed out after {TOOL_HTTP_TIMEOUT}s — try a simpler query."
         except Exception as exc:
             print(f"[tools] query_db {method} {path} failed: {exc}",
                   file=sys.stderr)

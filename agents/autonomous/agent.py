@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 
-from core import history, validation
+from core import call_with_timeout, history, validation
 from core.arch_knowledge import build_arch_guidance
 from core.fallback_templates import generate_fallback
 from core.history import extract_flops_budget, identify_bucket
@@ -31,6 +31,13 @@ MAX_TURNS = 50
 
 # Minimum seconds to reserve for final submission overhead.
 TIME_BUFFER_SECONDS = 10
+
+# Per-request timeout for LLM calls (prevents OS-default ~127s socket timeout
+# from eating the entire time budget on a single failed request).
+LLM_REQUEST_TIMEOUT = 45
+
+# Exponential backoff delays between LLM retry attempts (seconds).
+LLM_RETRY_BACKOFF = [2, 4]
 
 
 def _log(msg: str) -> None:
@@ -424,15 +431,41 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
             _log(f"[agent] Turn {turn + 1}/{MAX_TURNS}, "
                  f"{remaining:.0f}s remaining, {len(messages)} messages")
 
-            # LLM call with retries for transient failures
+            # LLM call with per-request timeout and exponential backoff
             resp = None
             for attempt in range(max_retries):
-                try:
-                    resp = client.post_json(url, payload)
+                remaining = deadline - time.time()
+                if remaining < TIME_BUFFER_SECONDS:
+                    _log(f"[agent] Not enough time for LLM attempt {attempt + 1}")
                     break
+
+                req_timeout = min(LLM_REQUEST_TIMEOUT,
+                                  remaining - TIME_BUFFER_SECONDS)
+                if req_timeout < 5:
+                    _log(f"[agent] Request timeout too short "
+                         f"({req_timeout:.0f}s), skipping")
+                    break
+
+                try:
+                    resp = call_with_timeout(
+                        client.post_json, args=(url, payload),
+                        timeout=req_timeout,
+                    )
+                    break
+                except TimeoutError:
+                    _log(f"[agent] Turn {turn + 1} attempt "
+                         f"{attempt + 1}/{max_retries} timed out "
+                         f"after {req_timeout:.0f}s")
                 except Exception as exc:
-                    _log(f"[agent] Turn {turn + 1} attempt {attempt + 1}/{max_retries} "
-                         f"failed: {exc}")
+                    _log(f"[agent] Turn {turn + 1} attempt "
+                         f"{attempt + 1}/{max_retries} failed: {exc}")
+
+                if attempt < max_retries - 1:
+                    backoff = LLM_RETRY_BACKOFF[
+                        min(attempt, len(LLM_RETRY_BACKOFF) - 1)]
+                    remaining = deadline - time.time()
+                    if remaining > backoff + TIME_BUFFER_SECONDS:
+                        time.sleep(backoff)
 
             if resp is None:
                 _log(f"[agent] All retries failed at turn {turn + 1}")
@@ -668,6 +701,32 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
     return None
 
 
+def _try_save_scratchpad(challenge, scratch_dir, retries=2):
+    """Attempt scratchpad upload with retry and 403-specific diagnostics.
+
+    A 403 on write typically means the agent overran its time budget and
+    the validator revoked write permission.  Retrying once catches
+    transient auth-token races between load and save.
+    """
+    for attempt in range(retries):
+        try:
+            save_scratchpad(challenge, scratch_dir)  # noqa: F821 — injected
+            _log("[agent] Scratchpad saved successfully")
+            return True
+        except Exception as exc:
+            exc_str = str(exc)
+            if "403" in exc_str:
+                _log(f"[agent] Scratchpad save got 403 "
+                     f"(attempt {attempt + 1}/{retries}) — "
+                     f"auth may have expired or budget overrun")
+            else:
+                _log(f"[agent] Scratchpad save failed "
+                     f"(attempt {attempt + 1}/{retries}): {exc}")
+            if attempt < retries - 1:
+                time.sleep(1)
+    return False
+
+
 def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness."""
 
@@ -733,7 +792,19 @@ def design_architecture(challenge: dict, client) -> dict:
         except Exception as exc:
             _log(f"[agent] Autonomous loop failed: {exc}")
 
+    # ── Early scratchpad checkpoint ─────────────────────────────────
+    # Save agent notes IMMEDIATELY after the loop, before time-budget
+    # expiry can cause 403 on the scratchpad PUT.  The final save below
+    # adds the history entry; this checkpoint preserves write_scratchpad
+    # notes even if the final save fails.
+    if hasattr(tool_handlers.get("submit", None), "_state_holder"):
+        state = tool_handlers["submit"]._state_holder["state"]
+    scratch_dir = scratch_dir or tempfile.mkdtemp()
+    history.save_state(scratch_dir, state)
+    _try_save_scratchpad(challenge, scratch_dir)
+
     # ── Prepare output ────────────────────────────────────────────
+    was_fallback = False
     if result:
         code = result["code"]
         name = result["name"]
@@ -741,6 +812,7 @@ def design_architecture(challenge: dict, client) -> dict:
         _log(f"[agent] Submitting: {name}")
     else:
         # Last-resort fallback: generate a guaranteed-valid model
+        was_fallback = True
         _log(f"[agent] No result from loop — trying fallback template for {bucket}")
         try:
             fb_code = generate_fallback(challenge)
@@ -785,23 +857,15 @@ def design_architecture(challenge: dict, client) -> dict:
                 _log(f"[agent] Submitting despite non-structural issues: "
                      f"{full_errors}")
 
-    # ── Save scratchpad ───────────────────────────────────────────
-    # Prefer the tool-handler state (it may have been updated by the agent via
-    # write_scratchpad); otherwise keep the state we loaded at the start.
-    if hasattr(tool_handlers.get("submit", None), "_state_holder"):
-        state = tool_handlers["submit"]._state_holder["state"]
-
+    # ── Save scratchpad (final, with history entry) ───────────────
     state = history.add_entry(
         state, name=name, code=code, motivation=motivation,
         bucket=bucket, flops=int(flops_max * 0.6) if flops_max else 0,
         strategy=strategy_name,
+        metadata={"was_fallback": was_fallback},
     )
 
-    scratch_dir = scratch_dir or tempfile.mkdtemp()
     history.save_state(scratch_dir, state)
-    try:
-        save_scratchpad(challenge, scratch_dir)  # noqa: F821 — injected global
-    except Exception as exc:
-        _log(f"[agent] Scratchpad save failed: {exc}")
+    _try_save_scratchpad(challenge, scratch_dir)
 
     return {"code": code, "name": name, "motivation": motivation}
