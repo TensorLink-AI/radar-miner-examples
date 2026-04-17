@@ -10,6 +10,8 @@ The LLM is the controller. It chooses when to research papers, query the DB,
 look at the frontier, generate code, validate it, fix errors, and submit.
 """
 
+import contextlib
+import functools
 import json
 import os
 import sys
@@ -53,6 +55,23 @@ LLM_RETRY_BACKOFF = [2, 4]
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _route_stdout_to_stderr(fn):
+    """Route anything written to sys.stdout during ``fn`` to sys.stderr.
+
+    The harness prints the returned dict as JSON on stdout AFTER the agent
+    function returns. A single stray print() that reaches stdout during the
+    run — typically from ``exec()``'d LLM-generated code that slipped a
+    debug print into ``build_model()`` — corrupts that JSON and the
+    validator rejects the entire proposal. Funneling stdout to stderr for
+    the lifetime of the call guarantees the harness's stdout stays clean.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with contextlib.redirect_stdout(sys.stderr):
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _resolve_agent_budget(challenge: dict) -> int:
@@ -802,6 +821,7 @@ def _try_save_scratchpad(challenge, scratch_dir, retries=2):
     return False
 
 
+@_route_stdout_to_stderr
 def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness."""
 

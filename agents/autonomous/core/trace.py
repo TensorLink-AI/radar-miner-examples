@@ -16,12 +16,18 @@ Memory discipline:
     (batch=1) inferred from ``task_params``.
 """
 
+import contextlib
 import sys
 
 import torch
 import torch.nn as nn
 
 from core.input_shape import infer_input
+
+
+def _silence_user_stdout():
+    """Route stdout → stderr while user code runs. See flops_estimator."""
+    return contextlib.redirect_stdout(sys.stderr)
 
 
 # Same ceiling used by flops_estimator — 512 MB of params. Anything bigger
@@ -80,90 +86,91 @@ def trace_architecture(code: str, challenge: dict,
     constraints = task.get("constraints", []) or []
 
     namespace: dict = {}
-    try:
-        exec(compile(code, "<generated>", "exec"), namespace)
-    except Exception as exc:
-        return [], f"Code execution failed: {exc}"
+    with _silence_user_stdout():
+        try:
+            exec(compile(code, "<generated>", "exec"), namespace)
+        except Exception as exc:
+            return [], f"Code execution failed: {exc}"
 
-    build_model_fn = namespace.get("build_model")
-    if not callable(build_model_fn):
-        return [], "build_model not found or not callable"
+        build_model_fn = namespace.get("build_model")
+        if not callable(build_model_fn):
+            return [], "build_model not found or not callable"
 
-    try:
-        model = build_model_fn(**tp)
-    except Exception as exc:
-        return [], f"build_model() raised: {exc}"
+        try:
+            model = build_model_fn(**tp)
+        except Exception as exc:
+            return [], f"build_model() raised: {exc}"
 
-    if not isinstance(model, nn.Module):
-        return [], "build_model() did not return an nn.Module"
+        if not isinstance(model, nn.Module):
+            return [], "build_model() did not return an nn.Module"
 
-    param_bytes = _count_param_bytes(model)
-    if param_bytes > _MAX_PARAM_BYTES:
-        del model
-        return [], (
-            f"Model parameters use {param_bytes / (1024**2):.0f} MB, "
-            f"exceeding the {_MAX_PARAM_BYTES // (1024**2)} MB safety limit"
-        )
+        param_bytes = _count_param_bytes(model)
+        if param_bytes > _MAX_PARAM_BYTES:
+            del model
+            return [], (
+                f"Model parameters use {param_bytes / (1024**2):.0f} MB, "
+                f"exceeding the {_MAX_PARAM_BYTES // (1024**2)} MB safety limit"
+            )
 
-    input_shape, input_dtype = infer_input(tp, constraints)
-    try:
-        if input_dtype == torch.long:
-            vocab = tp.get("vocab_size", tp.get("n_vocab", 1000))
-            dummy = torch.randint(0, int(vocab), input_shape)
-        else:
-            dummy = torch.randn(*input_shape)
-    except Exception as exc:
-        del model
-        return [], f"Failed to create dummy input: {exc}"
+        input_shape, input_dtype = infer_input(tp, constraints)
+        try:
+            if input_dtype == torch.long:
+                vocab = tp.get("vocab_size", tp.get("n_vocab", 1000))
+                dummy = torch.randint(0, int(vocab), input_shape)
+            else:
+                dummy = torch.randn(*input_shape)
+        except Exception as exc:
+            del model
+            return [], f"Failed to create dummy input: {exc}"
 
-    entries: list[dict] = []
-    hooks: list = []
-    overflow = {"hit": False}
+        entries: list[dict] = []
+        hooks: list = []
+        overflow = {"hit": False}
 
-    def _make_hook(qualified_name: str, module: nn.Module):
-        def _hook(mod, inp, out):
-            # Early-out once we've hit the cap. We still let the forward
-            # pass complete — cheaper than detaching hooks mid-flight.
-            if len(entries) >= max_entries:
-                overflow["hit"] = True
-                return
-            entries.append({
-                "idx": len(entries),
-                "name": qualified_name or "<root>",
-                "op": type(mod).__name__,
-                "input_shape": _shape_of(inp),
-                "output_shape": _shape_of(out),
-                "params": _count_module_params(mod),
-            })
-        return _hook
+        def _make_hook(qualified_name: str, module: nn.Module):
+            def _hook(mod, inp, out):
+                # Early-out once we've hit the cap. We still let the forward
+                # pass complete — cheaper than detaching hooks mid-flight.
+                if len(entries) >= max_entries:
+                    overflow["hit"] = True
+                    return
+                entries.append({
+                    "idx": len(entries),
+                    "name": qualified_name or "<root>",
+                    "op": type(mod).__name__,
+                    "input_shape": _shape_of(inp),
+                    "output_shape": _shape_of(out),
+                    "params": _count_module_params(mod),
+                })
+            return _hook
 
-    # Attach hooks to leaf modules only.
-    for name, module in model.named_modules():
-        if module is model:
-            continue  # skip the top-level container (its trace = final output)
-        if isinstance(module, _CONTAINER_TYPES):
-            continue
-        # A module is "leaf" if it has no submodules we'd already hook.
-        has_hookable_children = any(
-            not isinstance(child, _CONTAINER_TYPES)
-            for child in module.children()
-        )
-        if has_hookable_children:
-            continue
-        hooks.append(module.register_forward_hook(_make_hook(name, module)))
+        # Attach hooks to leaf modules only.
+        for name, module in model.named_modules():
+            if module is model:
+                continue  # skip the top-level container (its trace = final output)
+            if isinstance(module, _CONTAINER_TYPES):
+                continue
+            # A module is "leaf" if it has no submodules we'd already hook.
+            has_hookable_children = any(
+                not isinstance(child, _CONTAINER_TYPES)
+                for child in module.children()
+            )
+            if has_hookable_children:
+                continue
+            hooks.append(module.register_forward_hook(_make_hook(name, module)))
 
-    try:
-        model.eval()
-        with torch.no_grad():
-            model(dummy)
-    except Exception as exc:
-        for h in hooks:
-            h.remove()
-        del model
-        return [], f"Forward pass failed during trace: {exc}"
-    finally:
-        for h in hooks:
-            h.remove()
+        try:
+            model.eval()
+            with torch.no_grad():
+                model(dummy)
+        except Exception as exc:
+            for h in hooks:
+                h.remove()
+            del model
+            return [], f"Forward pass failed during trace: {exc}"
+        finally:
+            for h in hooks:
+                h.remove()
 
     if overflow["hit"]:
         _log(

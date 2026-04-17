@@ -15,6 +15,7 @@ actually does. The LLM is free to use any PyTorch operation, standard or
 custom.
 """
 
+import contextlib
 import copy
 import json
 import sys
@@ -736,35 +737,38 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
             return "FlopCounterMode not available in this torch version."
 
         namespace: dict = {"torch": torch, "nn": nn}
-        try:
-            exec(compile(code, "<layer_snippet>", "exec"), namespace)
-        except Exception as exc:
-            return f"Layer code execution failed: {exc}"
+        # Keep any stdout the layer code writes (exec + forward) off the
+        # harness's JSON channel.
+        with contextlib.redirect_stdout(sys.stderr):
+            try:
+                exec(compile(code, "<layer_snippet>", "exec"), namespace)
+            except Exception as exc:
+                return f"Layer code execution failed: {exc}"
 
-        layer = namespace.get("layer")
-        if layer is None:
-            return (
-                "Snippet did not assign a variable named `layer`. "
-                "Example: `layer = nn.Conv1d(7, 32, 5)`."
-            )
-        if not isinstance(layer, nn.Module):
-            return f"`layer` is not an nn.Module (got {type(layer).__name__})."
+            layer = namespace.get("layer")
+            if layer is None:
+                return (
+                    "Snippet did not assign a variable named `layer`. "
+                    "Example: `layer = nn.Conv1d(7, 32, 5)`."
+                )
+            if not isinstance(layer, nn.Module):
+                return f"`layer` is not an nn.Module (got {type(layer).__name__})."
 
-        shape = [int(d) for d in input_shape]
-        try:
-            dummy = torch.randn(*shape)
-        except Exception as exc:
-            return f"Failed to build dummy input of shape {shape}: {exc}"
+            shape = [int(d) for d in input_shape]
+            try:
+                dummy = torch.randn(*shape)
+            except Exception as exc:
+                return f"Failed to build dummy input of shape {shape}: {exc}"
 
-        try:
-            layer.eval()
-            with torch.no_grad():
-                counter = FlopCounterMode(display=False)
-                with counter:
-                    out = layer(dummy)
-                total = int(counter.get_total_flops())
-        except Exception as exc:
-            return f"Forward pass failed: {exc}"
+            try:
+                layer.eval()
+                with torch.no_grad():
+                    counter = FlopCounterMode(display=False)
+                    with counter:
+                        out = layer(dummy)
+                    total = int(counter.get_total_flops())
+            except Exception as exc:
+                return f"Forward pass failed: {exc}"
 
         out_shape = tuple(out.shape) if isinstance(out, torch.Tensor) else "(non-tensor)"
         param_count = sum(p.numel() for p in layer.parameters())

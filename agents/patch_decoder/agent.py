@@ -14,6 +14,8 @@ Architecture:
   6. RevIN denormalisation (applied per-quantile to preserve last-dim = num_variates)
 """
 
+import contextlib
+import functools
 import sys
 import tempfile
 import textwrap
@@ -23,6 +25,23 @@ from core import validation, history
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _route_stdout_to_stderr(fn):
+    """Route anything written to sys.stdout during ``fn`` to sys.stderr.
+
+    The harness prints the returned dict as JSON on stdout AFTER the agent
+    returns. Any print() that leaks to stdout during the call — most often
+    from a stray debug print inside ``exec()``'d user code — corrupts that
+    JSON and the validator rejects the proposal. Funneling stdout to
+    stderr for the lifetime of the call keeps stdout reserved for the
+    harness's JSON output.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with contextlib.redirect_stdout(sys.stderr):
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 # ── Dynamic scaling ─────────────────────────────────────────────
@@ -281,6 +300,7 @@ def _generate_code(cfg: dict, task_params: dict | None = None) -> str:
     """)
 
 
+@_route_stdout_to_stderr
 def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness.  Deterministic — no LLM calls."""
 

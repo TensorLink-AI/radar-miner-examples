@@ -8,6 +8,7 @@ Fallback 2: Forward-pass hooks (the previous primary method, kept as last resort
 Fallback 3: Static module-tree walk (approximate but safe).
 """
 
+import contextlib
 import math
 import sys
 
@@ -15,6 +16,18 @@ import torch
 import torch.nn as nn
 
 from core.input_shape import infer_input
+
+
+def _silence_user_stdout():
+    """Route stdout → stderr while user code (exec + forward) runs.
+
+    LLM-generated code occasionally contains debug ``print()`` calls that
+    would otherwise leak to the harness's stdout and corrupt the proposal
+    JSON. The agent entrypoint already wraps the whole run in the same
+    redirection, but we keep this local guard so direct callers (tests,
+    tools) also stay clean.
+    """
+    return contextlib.redirect_stdout(sys.stderr)
 
 # Maximum parameter memory (bytes) we'll allow build_model to allocate.
 # 512 MB covers even the largest bucket (125M FLOPs) with headroom.
@@ -275,82 +288,85 @@ def estimate_flops(code: str, challenge: dict,
     tp = task.get("task_params", {})
     constraints = task.get("constraints", [])
 
-    # Execute the code in a restricted namespace
+    # Execute the code in a restricted namespace. Keep any stdout the user
+    # code writes out of the harness's JSON channel — this covers exec,
+    # build_model, and every forward pass below.
     namespace = {}
-    try:
-        exec(compile(code, "<generated>", "exec"), namespace)
-    except Exception as exc:
-        return None, f"Code execution failed: {exc}"
+    with _silence_user_stdout():
+        try:
+            exec(compile(code, "<generated>", "exec"), namespace)
+        except Exception as exc:
+            return None, f"Code execution failed: {exc}"
 
-    build_model_fn = namespace.get("build_model")
-    if not callable(build_model_fn):
-        return None, "build_model not found or not callable"
+        build_model_fn = namespace.get("build_model")
+        if not callable(build_model_fn):
+            return None, "build_model not found or not callable"
 
-    # Instantiate the model using task_params from the challenge
-    try:
-        model = build_model_fn(**tp)
-    except Exception as exc:
-        return None, f"build_model() raised: {exc}"
+        # Instantiate the model using task_params from the challenge
+        try:
+            model = build_model_fn(**tp)
+        except Exception as exc:
+            return None, f"build_model() raised: {exc}"
 
-    if not isinstance(model, nn.Module):
-        return None, "build_model() did not return an nn.Module"
+        if not isinstance(model, nn.Module):
+            return None, "build_model() did not return an nn.Module"
 
-    # Safety check: reject models that are absurdly large
-    param_bytes = _count_param_bytes(model)
-    if param_bytes > _MAX_PARAM_BYTES:
-        del model
-        return None, (
-            f"Model parameters use {param_bytes / (1024**2):.0f} MB, "
-            f"exceeding the {_MAX_PARAM_BYTES // (1024**2)} MB safety limit"
-        )
+        # Safety check: reject models that are absurdly large
+        param_bytes = _count_param_bytes(model)
+        if param_bytes > _MAX_PARAM_BYTES:
+            del model
+            return None, (
+                f"Model parameters use {param_bytes / (1024**2):.0f} MB, "
+                f"exceeding the {_MAX_PARAM_BYTES // (1024**2)} MB safety limit"
+            )
 
-    # Infer input shape and dtype generically from task_params
-    input_shape, input_dtype = infer_input(tp, constraints)
+        # Infer input shape and dtype generically from task_params
+        input_shape, input_dtype = infer_input(tp, constraints)
 
-    # Build dummy input tensor
-    try:
-        if input_dtype == torch.long:
-            vocab = tp.get("vocab_size", tp.get("n_vocab", 1000))
-            dummy = torch.randint(0, int(vocab), input_shape)
-        else:
-            dummy = torch.randn(*input_shape)
-    except Exception as exc:
-        del model
-        return None, f"Failed to create dummy input: {exc}"
+        # Build dummy input tensor
+        try:
+            if input_dtype == torch.long:
+                vocab = tp.get("vocab_size", tp.get("n_vocab", 1000))
+                dummy = torch.randint(0, int(vocab), input_shape)
+            else:
+                dummy = torch.randn(*input_shape)
+        except Exception as exc:
+            del model
+            return None, f"Failed to create dummy input: {exc}"
 
-    # ── Primary: FlopCounterMode (same as validator) ─────────────
-    total_flops, err = _flopcounter_mode_flops(model, dummy, out_shape_sink)
-    if not err and total_flops > 0:
-        _log(f"[flops] FlopCounterMode: {total_flops:,}")
+        # ── Primary: FlopCounterMode (same as validator) ─────────────
+        total_flops, err = _flopcounter_mode_flops(model, dummy, out_shape_sink)
+        if not err and total_flops > 0:
+            _log(f"[flops] FlopCounterMode: {total_flops:,}")
+            del model
+            return total_flops, ""
+
+        if err:
+            _log(f"[flops] FlopCounterMode failed, trying fallbacks: {err}")
+
+        # ── Fallback 1: JIT trace + FlopCounterMode ──────────────────
+        total_flops, err2 = _jit_trace_flops(model, dummy, out_shape_sink)
+        if not err2 and total_flops > 0:
+            _log(f"[flops] JIT+FlopCounterMode: {total_flops:,}")
+            del model
+            return total_flops, ""
+
+        if err2:
+            _log(f"[flops] JIT fallback also failed: {err2}")
+
+        # ── Fallback 2: Forward-pass hooks ───────────────────────────
+        total_flops, err3 = _forward_pass_flops(model, input_shape, input_dtype)
+        if not err3 and total_flops >= 0:
+            _log(f"[flops] Hook-based fallback: {total_flops:,} "
+                 "(WARNING: may diverge from validator's FlopCounterMode)")
+            del model
+            return total_flops, ""
+
+        # ── Fallback 3: Static module-tree walk ──────────────────────
+        int_vals = [v for v in tp.values() if isinstance(v, int)]
+        seq_len = int_vals[1] if len(int_vals) > 1 else max(int_vals[0], 1) if int_vals else 1
+        total_flops = _walk_flops(model, seq_len)
+        _log(f"[flops] Static walk fallback: {total_flops:,} (approximate)")
+
         del model
         return total_flops, ""
-
-    if err:
-        _log(f"[flops] FlopCounterMode failed, trying fallbacks: {err}")
-
-    # ── Fallback 1: JIT trace + FlopCounterMode ──────────────────
-    total_flops, err2 = _jit_trace_flops(model, dummy, out_shape_sink)
-    if not err2 and total_flops > 0:
-        _log(f"[flops] JIT+FlopCounterMode: {total_flops:,}")
-        del model
-        return total_flops, ""
-
-    if err2:
-        _log(f"[flops] JIT fallback also failed: {err2}")
-
-    # ── Fallback 2: Forward-pass hooks ───────────────────────────
-    total_flops, err3 = _forward_pass_flops(model, input_shape, input_dtype)
-    if not err3 and total_flops >= 0:
-        _log(f"[flops] Hook-based fallback: {total_flops:,} "
-             "(WARNING: may diverge from validator's FlopCounterMode)")
-        del model
-        return total_flops, ""
-
-    # ── Fallback 3: Static module-tree walk ──────────────────────
-    int_vals = [v for v in tp.values() if isinstance(v, int)]
-    seq_len = int_vals[1] if len(int_vals) > 1 else max(int_vals[0], 1) if int_vals else 1
-    total_flops = _walk_flops(model, seq_len)
-    _log(f"[flops] Static walk fallback: {total_flops:,} (approximate)")
-
-    del model
-    return total_flops, ""

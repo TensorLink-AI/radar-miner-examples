@@ -4,8 +4,21 @@ Primary method: forward-pass hooks that observe actual tensor shapes.
 Fallback: static module-tree walk (approximate but safe).
 """
 
+import contextlib
+import sys
+
 import torch
 import torch.nn as nn
+
+
+def _silence_user_stdout():
+    """Route stdout → stderr while user code runs.
+
+    A debug ``print()`` in exec'd user code would leak to the harness's
+    stdout (reserved for the proposal JSON). Redirecting to stderr keeps
+    that channel clean for any direct caller of ``estimate_flops``.
+    """
+    return contextlib.redirect_stdout(sys.stderr)
 
 # Maximum parameter memory (bytes) we'll allow build_model to allocate.
 # 512 MB covers even the largest bucket (125M FLOPs) with headroom.
@@ -211,47 +224,50 @@ def estimate_flops(code: str, challenge: dict) -> tuple[int | None, str]:
     task = challenge.get("task", {})
     tp = task.get("task_params", {})
 
-    # Execute the code in a restricted namespace
+    # Execute the code in a restricted namespace. Keep any stdout the user
+    # code writes (exec + build_model + forward) off the harness's JSON
+    # channel — a debug print would otherwise corrupt the proposal.
     namespace = {}
-    try:
-        exec(compile(code, "<generated>", "exec"), namespace)
-    except Exception as exc:
-        return None, f"Code execution failed: {exc}"
+    with _silence_user_stdout():
+        try:
+            exec(compile(code, "<generated>", "exec"), namespace)
+        except Exception as exc:
+            return None, f"Code execution failed: {exc}"
 
-    build_model_fn = namespace.get("build_model")
-    if not callable(build_model_fn):
-        return None, "build_model not found or not callable"
+        build_model_fn = namespace.get("build_model")
+        if not callable(build_model_fn):
+            return None, "build_model not found or not callable"
 
-    # Instantiate the model using task_params from the challenge (never hardcode)
-    try:
-        model = build_model_fn(**tp)
-    except Exception as exc:
-        return None, f"build_model() raised: {exc}"
+        # Instantiate the model using task_params from the challenge (never hardcode)
+        try:
+            model = build_model_fn(**tp)
+        except Exception as exc:
+            return None, f"build_model() raised: {exc}"
 
-    if not isinstance(model, nn.Module):
-        return None, "build_model() did not return an nn.Module"
+        if not isinstance(model, nn.Module):
+            return None, "build_model() did not return an nn.Module"
 
-    # Safety check: reject models that are absurdly large
-    param_bytes = _count_param_bytes(model)
-    if param_bytes > _MAX_PARAM_BYTES:
-        del model
-        return None, (
-            f"Model parameters use {param_bytes / (1024**2):.0f} MB, "
-            f"exceeding the {_MAX_PARAM_BYTES // (1024**2)} MB safety limit"
-        )
-
-    # Primary: forward-pass hooks (accurate for models that reshape internally)
-    input_shape = _infer_input_shape(tp)
-    if input_shape is not None:
-        total_flops, fwd_err = _forward_pass_flops(model, input_shape)
-        if not fwd_err and total_flops >= 0:
+        # Safety check: reject models that are absurdly large
+        param_bytes = _count_param_bytes(model)
+        if param_bytes > _MAX_PARAM_BYTES:
             del model
-            return total_flops, ""
+            return None, (
+                f"Model parameters use {param_bytes / (1024**2):.0f} MB, "
+                f"exceeding the {_MAX_PARAM_BYTES // (1024**2)} MB safety limit"
+            )
 
-    # Fallback: static module-tree walk
-    int_vals = [v for v in tp.values() if isinstance(v, int)]
-    seq_len = int_vals[1] if len(int_vals) > 1 else max(int_vals[0], 1) if int_vals else 1
-    total_flops = _walk_flops(model, seq_len)
+        # Primary: forward-pass hooks (accurate for models that reshape internally)
+        input_shape = _infer_input_shape(tp)
+        if input_shape is not None:
+            total_flops, fwd_err = _forward_pass_flops(model, input_shape)
+            if not fwd_err and total_flops >= 0:
+                del model
+                return total_flops, ""
 
-    del model
-    return total_flops, ""
+        # Fallback: static module-tree walk
+        int_vals = [v for v in tp.values() if isinstance(v, int)]
+        seq_len = int_vals[1] if len(int_vals) > 1 else max(int_vals[0], 1) if int_vals else 1
+        total_flops = _walk_flops(model, seq_len)
+
+        del model
+        return total_flops, ""
