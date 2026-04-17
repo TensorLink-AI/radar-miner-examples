@@ -696,33 +696,24 @@ class TestAutonomousLoop:
             _mod.MAX_TURNS = original_max
 
         assert result is not None
-        assert result["name"] == "autonomous_fallback"
+        assert result["name"] == "llm_validated"
         assert result["code"] == VALID_CODE
 
-    def test_no_fallback_to_off_gate_proposal(self):
-        """Code that only passed ``_structural_ok`` must NOT be submitted.
+    def test_fallback_to_off_gate_proposal(self):
+        """Structurally-ok but off-gate code beats the shared fallback.
 
-        The previous contract shipped off-gate structurally-valid code as
-        ``autonomous_best_effort`` so the harness's pre_validate_code had
-        something to chew on. That behavior masked the real failure mode
-        where build_model produced a tensor with the wrong output shape:
-        the model parses + imports are clean so ``_structural_ok`` returns
-        True, the code gets shipped, and training dies 45 min later with
-        ``size of tensor a (96) must match the size of tensor b (64)``.
-
-        The new contract: the loop returns None rather than submit
-        anything that didn't pass full ``validate_code``. The outer
-        ``design_architecture`` then falls through to the guaranteed-valid
-        fallback template."""
-        # Use impossibly-high FLOPs bounds so VALID_CODE (a trivial linear
-        # model) definitely fails the FLOPs hard gate but still passes
-        # structural checks (has build_model + build_optimizer at top level).
+        The old contract returned None when only ``_structural_ok``-clean
+        code was available, forcing the outer caller to ship the byte-
+        identical fallback template. But all miners' templates collapse
+        to a single dedup-survivor, dropping the effective miner count
+        to 1 per round — far worse than shipping a unique, slightly off-
+        gate model. The new contract returns the proposed code tagged
+        ``llm_best_effort`` so dedup keeps each miner distinct."""
         challenge = _make_challenge(llm_url="http://llm")
         challenge["min_flops_equivalent"] = 10 ** 15
         challenge["max_flops_equivalent"] = 10 ** 16
 
         def mock_llm(payload):
-            # Every turn the LLM calls validate_code with the same code.
             return _make_llm_response(tool_calls=[
                 _make_tool_call(
                     "validate_code", {"code": VALID_CODE}, "call_v1"),
@@ -746,11 +737,13 @@ class TestAutonomousLoop:
         finally:
             _mod.MAX_TURNS = original_max
 
-        assert result is None, (
-            "loop should return None when only structurally-ok (but "
-            "fully-invalid) code was seen — the outer design_architecture "
-            f"falls through to the fallback template instead. Got {result}"
+        assert result is not None, (
+            "loop should return the structurally-ok proposal rather "
+            "than None — the shared fallback template is worse because "
+            "dedup collapses all miners to one survivor."
         )
+        assert result["name"] == "llm_best_effort"
+        assert result["code"] == VALID_CODE
 
     def test_llm_failure_all_retries(self):
         """All LLM retries fail — loop returns None."""

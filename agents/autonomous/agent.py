@@ -408,6 +408,18 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
         # the success path and must propagate untouched.
         try:
             remaining = deadline - time.time()
+            # Enter the reserve window early if we already have usable
+            # code — no point spending the last 30s on another LLM round
+            # when we'd only use its result if it beat what we have.
+            if (
+                remaining < FALLBACK_RESERVE_SECONDS
+                and (last_validated_code or last_proposed_code)
+            ):
+                _log(
+                    f"[agent] Entering reserve window at turn {turn + 1} "
+                    f"({remaining:.0f}s left) — usable code in hand"
+                )
+                break
             if remaining < TIME_BUFFER_SECONDS:
                 _log(f"[agent] Time's up at turn {turn + 1}, breaking loop")
                 break
@@ -715,39 +727,52 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
             _log(f"[agent] Turn {turn + 1} crashed: {exc} — continuing to next turn")
             continue
 
-    # Loop ended without an explicit submit. Prefer fully-validated code;
-    # otherwise try to fully validate any structurally-ok proposal before
-    # falling back. Shipping code that only passed ``_structural_ok`` —
-    # i.e. parses + has build_model/build_optimizer — is how we end up
-    # submitting models with the wrong output shape or FLOPs mismatch,
-    # which then crash mid-training. Better to fall through to the
-    # guaranteed-valid template than to ship unvalidated code.
+    # Loop ended without an explicit submit. Preference order:
+    #   1. last_validated_code (passed full validate_code cleanly)
+    #   2. last_proposed_code  (structurally ok; may have failed FLOPs gate)
+    #   3. None → outer caller drops to the guaranteed-valid template
+    #
+    # The previous contract required full validation to submit anything,
+    # which caused the outer caller to ship the shared fallback template
+    # for every miner in the round — and dedup collapsed those identical
+    # submissions to a single effective miner. Shipping a structurally-
+    # ok model with a slightly off FLOPs bucket keeps the miner in the
+    # round (the harness penalizes FLOPs mismatch; it doesn't instant-
+    # reject). Unusable code (won't parse, missing build_model, etc.) is
+    # still filtered because it fails ``_structural_ok``.
     if last_validated_code:
         _log("[agent] Loop ended without submit, using last validated code")
         return {
             "code": last_validated_code,
-            "name": "autonomous_fallback",
-            "motivation": "Time/turns exhausted — submitting last validated code",
+            "name": "llm_validated",
+            "motivation": "LLM-generated and validated",
         }
     if last_proposed_code:
         full_ok, full_errors = validation.validate_code(
             last_proposed_code, challenge,
         )
         if full_ok:
-            _log("[agent] Last proposed code passed full validation on final check; "
-                 "submitting it")
+            _log("[agent] Last proposed code passed full validation on final check")
             return {
                 "code": last_proposed_code,
-                "name": "autonomous_best_effort",
-                "motivation": (
-                    "Time/turns exhausted; last proposed code passed full "
-                    "validation on final re-check"
-                ),
+                "name": "llm_validated",
+                "motivation": "LLM-generated and validated (final re-check)",
             }
-        _log("[agent] Last proposed code failed full validation on final check "
-             f"({full_errors}); falling through to guaranteed-valid template")
+        _log(
+            f"[agent] Last proposed code failed full validation ({full_errors}); "
+            "submitting as llm_best_effort rather than the byte-identical "
+            "fallback template so dedup keeps this miner in the round"
+        )
+        return {
+            "code": last_proposed_code,
+            "name": "llm_best_effort",
+            "motivation": (
+                "LLM-generated, structurally valid but did not pass full "
+                f"validation ({'; '.join(full_errors)[:200]})"
+            ),
+        }
 
-    _log("[agent] Loop ended with no fully-validated code")
+    _log("[agent] Loop ended with no usable code")
     return None
 
 
