@@ -25,6 +25,29 @@ MAX_LLM_ATTEMPTS = 15  # up to 15 turns — half the 30-request rate limit
 # on calls that would have succeeded.
 LLM_REQUEST_TIMEOUT = 180
 
+# Exponential-backoff base delay between retry attempts.
+RETRY_BASE_DELAY = 2.0
+
+# Substrings (lowercased) that mark an exception as a retryable transient
+# error — network/overload/timeout. Everything else (4xx, validation, bad
+# payload, etc.) is raised immediately because retrying won't help.
+TRANSIENT_TOKENS = (
+    "rate limit", "429", "500", "502", "503", "504", "529",
+    "timeout", "timed out", "connection", "overloaded",
+    "eof", "reset by peer", "broken pipe", "unreachable",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True when the exception string looks like a retryable transient.
+
+    Covers OS-level socket failures, HTTP 5xx/429, and common overload
+    markers. A 4xx (auth, bad-request, validation) is intentionally NOT
+    transient — burning retry budget on them just delays the real failure.
+    """
+    s = str(exc).lower()
+    return any(tok in s for tok in TRANSIENT_TOKENS)
+
 
 def chat(client, llm_url: str, messages: list[dict], *,
          temperature: float = 0.7, max_tokens: int = 4096,
@@ -83,9 +106,8 @@ def chat_with_tools(
         raise RuntimeError("No llm_url provided")
 
     url = f"{llm_url}/v1/chat/completions"
-    # 2 attempts × LLM_REQUEST_TIMEOUT (45s) = 90s worst case per round, which
-    # fits inside a 300s round budget even with backoff. Three attempts
-    # produced 135s+ and routinely blew the budget.
+    # Retry only on transient network/overload errors. Non-transient failures
+    # (4xx, bad payload) raise on first attempt — no point burning budget.
     max_retries = 2
 
     for round_idx in range(max_rounds):
@@ -106,8 +128,6 @@ def chat_with_tools(
             file=sys.stderr,
         )
 
-        # Retry loop with per-request timeout and exponential backoff.
-        last_err: Exception | None = None
         resp = None
         for attempt in range(max_retries):
             try:
@@ -116,32 +136,48 @@ def chat_with_tools(
                     timeout=LLM_REQUEST_TIMEOUT,
                 )
                 break
-            except TimeoutError:
-                last_err = TimeoutError(
-                    f"timed out after {LLM_REQUEST_TIMEOUT}s")
-                print(
-                    f"[llm] round {round_idx + 1} attempt {attempt + 1}/{max_retries} "
-                    f"timed out after {LLM_REQUEST_TIMEOUT}s",
-                    file=sys.stderr,
-                )
             except Exception as exc:
-                last_err = exc
-                print(
-                    f"[llm] round {round_idx + 1} attempt {attempt + 1}/{max_retries} "
-                    f"failed: {exc}",
-                    file=sys.stderr,
-                )
-            if attempt < max_retries - 1:
-                backoff = 2 ** (attempt + 1)
-                # Only sleep if the round has enough budget left. Without
-                # this check, a backoff can push us past the deadline and
-                # waste the retry that follows. Mirrors agent.py's version.
-                if deadline is None or (deadline - time.time()) > backoff:
-                    time.sleep(backoff)
+                transient = _is_transient(exc)
+                is_last = attempt >= max_retries - 1
+                if transient and not is_last:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    remaining = (
+                        (deadline - time.time()) if deadline is not None
+                        else float("inf")
+                    )
+                    if remaining > delay + 10:
+                        print(
+                            f"[llm] round {round_idx + 1} attempt "
+                            f"{attempt + 1} transient: {exc} — "
+                            f"sleeping {delay:.0f}s",
+                            file=sys.stderr,
+                        )
+                        time.sleep(delay)
+                        continue
+                    print(
+                        f"[llm] round {round_idx + 1} attempt "
+                        f"{attempt + 1} transient but no time to retry "
+                        f"({remaining:.0f}s left): {exc}",
+                        file=sys.stderr,
+                    )
+                    raise
+                if transient:
+                    print(
+                        f"[llm] round {round_idx + 1} attempt "
+                        f"{attempt + 1} transient (final): {exc}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"[llm] round {round_idx + 1} attempt "
+                        f"{attempt + 1} non-transient: {exc}",
+                        file=sys.stderr,
+                    )
+                raise
 
         if resp is None:
             raise RuntimeError(
-                f"LLM call failed after {max_retries} attempts: {last_err}"
+                f"LLM call returned no response after {max_retries} attempts"
             )
 
         choice = resp["choices"][0]
@@ -301,7 +337,18 @@ def reason_and_generate(client, challenge: dict,
                     )})
 
         except Exception as exc:
-            print(f"[llm] attempt {attempt + 1} error: {exc}", file=sys.stderr)
+            transient = _is_transient(exc)
+            print(
+                f"[llm] attempt {attempt + 1} error "
+                f"({'transient' if transient else 'non-transient'}): {exc}",
+                file=sys.stderr,
+            )
+            # Non-transient errors (4xx, bad payload, etc.) won't improve by
+            # retrying — stop immediately so the caller can fall back.
+            if not transient:
+                print("[llm] non-transient error — aborting retry loop",
+                      file=sys.stderr)
+                break
             if attempt < MAX_LLM_ATTEMPTS - 1:
                 messages.append({"role": "user", "content": (
                     "Previous request failed. Please try again with a single "

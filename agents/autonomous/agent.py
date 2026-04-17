@@ -17,6 +17,7 @@ import tempfile
 import time
 
 from core import call_with_timeout, history, validation
+from core.llm import _is_transient
 from core.arch_knowledge import build_arch_guidance
 from core.fallback_templates import fallback_name_for, generate_fallback
 from core.history import extract_flops_budget, identify_bucket
@@ -486,19 +487,28 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
                          f"({req_timeout:.0f}s), skipping")
                     break
 
+                last_exc: Exception | None = None
                 try:
                     resp = call_with_timeout(
                         client.post_json, args=(url, payload),
                         timeout=req_timeout,
                     )
                     break
-                except TimeoutError:
+                except TimeoutError as exc:
+                    last_exc = exc
                     _log(f"[agent] Turn {turn + 1} attempt "
                          f"{attempt + 1}/{max_retries} timed out "
                          f"after {req_timeout:.0f}s")
                 except Exception as exc:
+                    last_exc = exc
+                    transient = _is_transient(exc)
                     _log(f"[agent] Turn {turn + 1} attempt "
-                         f"{attempt + 1}/{max_retries} failed: {exc}")
+                         f"{attempt + 1}/{max_retries} "
+                         f"{'transient' if transient else 'non-transient'}: {exc}")
+                    # Non-transient (4xx, bad-payload, etc.) won't improve
+                    # on retry — bail out of the attempt loop now.
+                    if not transient:
+                        break
 
                 if attempt < max_retries - 1:
                     backoff = LLM_RETRY_BACKOFF[
