@@ -38,9 +38,53 @@ from core.trace import trace_architecture, format_trace
 TOOL_HTTP_TIMEOUT = 15   # seconds per research/DB request
 FRONTIER_HTTP_TIMEOUT = 10  # seconds for frontier fetch
 
+# Circuit breaker for tools that keep returning the same short error.
+# The agent loop can fixate on a broken tool (e.g. calling get_frontier_member
+# 3-4 times in a row with invalid indices) without learning. After 2 identical
+# short error responses, further calls short-circuit to a hard-stop message.
+# Short = ≤200 chars, which matches typical error strings from the handlers.
+CIRCUIT_BREAKER_ERROR_MAX_LEN = 200
+CIRCUIT_BREAKER_THRESHOLD = 2
+
+# Keyed by tool name. Cleared at the start of each round in ``build_handlers``.
+_tool_error_counters: dict = {}
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _apply_circuit_breaker(tool_name: str, result: str) -> str:
+    """Update the circuit-breaker counter for a tool and return either the
+    original result or a hard-stop message when the breaker trips.
+
+    Semantics:
+    - A long result (>200 chars) is treated as success → counter resets.
+    - A short result matching the previous short result increments the
+      counter; a different short result restarts it at 1.
+    - Once the same short error has been returned more than
+      CIRCUIT_BREAKER_THRESHOLD times in a row, the breaker trips and the
+      tool's result is replaced with a hard-stop message telling the LLM
+      to try a different approach.
+    """
+    if len(result) > CIRCUIT_BREAKER_ERROR_MAX_LEN:
+        _tool_error_counters.pop(tool_name, None)
+        return result
+
+    state = _tool_error_counters.get(tool_name)
+    if state is None or state["last"] != result:
+        _tool_error_counters[tool_name] = {"last": result, "count": 1}
+        return result
+
+    state["count"] += 1
+    if state["count"] > CIRCUIT_BREAKER_THRESHOLD:
+        n = state["count"]
+        _log(f"[tools] circuit breaker tripped on {tool_name} after {n} identical errors")
+        return (
+            f"Tool {tool_name} has returned the same error {n} times. "
+            "Do not call it again this round — try a different approach."
+        )
+    return result
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format)
@@ -991,7 +1035,7 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
     # Expose state_holder so the agent loop can persist state after the loop
     submit_handler._state_holder = state_holder
 
-    return {
+    raw_handlers = {
         "search_papers": search_papers,
         "query_db": query_db,
         "analyze_task": analyze_task_handler,
@@ -1008,6 +1052,29 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
         "submit": submit_handler,
         "time_remaining": time_remaining_handler,
     }
+
+    # ── Circuit breaker wrapping ──────────────────────────────────
+    # Reset per-round counters so state from the previous round doesn't
+    # bleed into this one. Wrap each handler to short-circuit after 2
+    # identical short errors, and to update counters on every result.
+    # ``submit`` is exempt — it raises SubmitSignal on success, which
+    # must not be swallowed or counted.
+    _tool_error_counters.clear()
+
+    def _wrap(tool_name: str, handler):
+        if tool_name == "submit":
+            return handler
+
+        def wrapped(*args, **kwargs):
+            result = str(handler(*args, **kwargs))
+            return _apply_circuit_breaker(tool_name, result)
+        # Preserve submit_handler-style attributes on any wrapped handler
+        for attr in ("_state_holder",):
+            if hasattr(handler, attr):
+                setattr(wrapped, attr, getattr(handler, attr))
+        return wrapped
+
+    return {name: _wrap(name, h) for name, h in raw_handlers.items()}
 
 
 def build_tools(challenge: dict | None = None) -> list[dict]:
