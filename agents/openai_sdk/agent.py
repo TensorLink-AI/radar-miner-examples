@@ -29,9 +29,21 @@ from core.fallback_templates import fallback_name_for, generate_fallback
 from core.history import extract_flops_budget, identify_bucket
 from core.validation import validate_code
 
-from .llm_client import chat
-from .prompts import build_system_prompt, build_user_prompt
-from .tools import TOOLS, SubmitSignal, build_handlers
+# Package mode (tests import ``agents.openai_sdk``) uses relative imports so
+# the chat/tool modules resolve to ``agents.openai_sdk.*`` and test mocks
+# patching those dotted paths actually apply. Standalone mode (harness loads
+# this file via ``spec.loader.exec_module``) has no ``__package__``, so the
+# relative form raises ``ImportError`` and we fall back to the sibling-on-
+# sys.path form — the agent's directory is already on ``sys.path`` in both
+# modes (harness adds it; ``__init__.py`` adds it in package mode).
+try:
+    from .llm_client import chat
+    from .prompts import build_system_prompt, build_user_prompt
+    from .tools import TOOLS, SubmitSignal, build_handlers
+except ImportError:
+    from llm_client import chat
+    from prompts import build_system_prompt, build_user_prompt
+    from tools import TOOLS, SubmitSignal, build_handlers
 
 
 FALLBACK_RESERVE_SECONDS = 30

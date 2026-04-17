@@ -40,17 +40,21 @@ Three phases:
 
 ```
 agents/openai_sdk/
-├── __init__.py        # adds agents/autonomous/ to sys.path so we reuse core/
+├── __init__.py        # puts this dir on sys.path for package-mode imports
 ├── agent.py           # entry point — design_architecture
 ├── llm_client.py      # cached OpenAI client + retry/failover
 ├── prompts.py         # system/user prompt builders
 ├── tools.py           # tool schemas + handlers (OpenAI function-call format)
 ├── validation.py      # re-export of core.validation.validate_code
+├── core/              # FLOPs / validation / history / fallback helpers
 └── README.md          # this file
 ```
 
-The `core/` modules live in `agents/autonomous/core/` and are reused
-verbatim — the package's `__init__.py` puts them on `sys.path`.
+`core/` lives inside this package (copied from
+`agents/autonomous/core/`) so the harness can ship the directory
+flat to `/workspace/agent/` and `from core.X import Y` resolves
+without any package-import plumbing — exactly like the autonomous
+agent is deployed.
 
 ## Reused from `agents/autonomous/core/`
 
