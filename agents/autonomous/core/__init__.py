@@ -1,16 +1,18 @@
 # Autonomous Agent Core Modules
 
-import concurrent.futures
-
 
 def call_with_timeout(fn, args=(), kwargs=None, timeout=15):
-    """Call *fn* with a per-request timeout (seconds).
+    """Call fn with a timeout passed through to the underlying blocking call.
 
-    Raises TimeoutError if the call does not complete within *timeout*.
-    Prevents OS-default socket timeouts (~127s) from eating the agent's
-    entire time budget on a single failed request.
+    Previously used ThreadPoolExecutor, but `with ThreadPoolExecutor` calls
+    `shutdown(wait=True)` on exit, which blocks until the worker thread
+    completes even when `future.result(timeout=...)` raises TimeoutError.
+    Python threads cannot be killed, so the 'timeout' was a lie — the real
+    wall-clock was whatever the OS socket timeout was (~127s).
+
+    Instead, pass timeout through to the callee. GatedClient.post_json,
+    get, etc. all accept a `timeout=` kwarg that reaches urllib.urlopen.
     """
-    kwargs = kwargs or {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, *args, **kwargs)
-        return future.result(timeout=timeout)
+    kwargs = dict(kwargs or {})
+    kwargs.setdefault("timeout", timeout)
+    return fn(*args, **kwargs)

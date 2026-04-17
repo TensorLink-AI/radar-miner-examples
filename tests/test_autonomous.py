@@ -47,7 +47,7 @@ class MockClient:
         self.raise_on_call = raise_on_call
         self.calls = []
 
-    def get_json(self, url):
+    def get_json(self, url, **kwargs):
         self.calls.append(("GET", url))
         if self.raise_on_call:
             raise RuntimeError("mock error")
@@ -57,7 +57,7 @@ class MockClient:
                 return val
         return {}
 
-    def post_json(self, url, payload):
+    def post_json(self, url, payload, **kwargs):
         self.calls.append(("POST", url, payload))
         if self.raise_on_call:
             raise RuntimeError("mock error")
@@ -394,6 +394,67 @@ class TestToolHandlers:
         )
         assert "REJECTED" in result
         assert "validation" in result.lower()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  2b. Circuit breaker
+# ══════════════════════════════════════════════════════════════════
+
+class TestCircuitBreaker:
+    """After 2 identical short error responses, a tool should short-circuit."""
+
+    def _make_handlers(self, challenge=None, client=None, scratch_dir=None):
+        challenge = challenge or _make_challenge()
+        client = client or MockClient()
+        scratch_dir = scratch_dir or tempfile.mkdtemp()
+        deadline = time.time() + 300
+        return build_handlers(client, challenge, scratch_dir, deadline)
+
+    def test_trips_on_repeated_identical_errors(self):
+        """Calling a tool with the same failing args returns a hard-stop
+        message on the third call instead of running it again."""
+        frontier = [{"objectives": {"crps": 0.4}, "code": "x=1"}]
+        challenge = _make_challenge(frontier=frontier)
+        handlers = self._make_handlers(challenge=challenge)
+
+        r1 = handlers["get_frontier_member"](index=99)
+        r2 = handlers["get_frontier_member"](index=99)
+        r3 = handlers["get_frontier_member"](index=99)
+
+        assert r1 == r2, "Two identical bad calls should produce identical errors"
+        assert "returned the same error" in r3.lower()
+        assert "do not call it again" in r3.lower()
+
+    def test_recovers_after_successful_call(self):
+        """A successful (long) response resets the counter."""
+        frontier = [{"objectives": {"crps": 0.4}, "code": "x=1" * 100}]
+        challenge = _make_challenge(frontier=frontier)
+        handlers = self._make_handlers(challenge=challenge)
+
+        # Two bad calls
+        handlers["get_frontier_member"](index=99)
+        handlers["get_frontier_member"](index=99)
+        # One successful call (returns code >200 chars) — resets counter
+        good = handlers["get_frontier_member"](index=0)
+        assert len(good) > 200
+
+        # After reset, next call should fail normally — not trip breaker
+        r = handlers["get_frontier_member"](index=99)
+        assert "returned the same error" not in r.lower()
+
+    def test_different_tools_tracked_independently(self):
+        challenge = _make_challenge()
+        handlers = self._make_handlers(challenge=challenge)
+        # No db_url — query_db returns a short "unavailable" error
+        r1 = handlers["query_db"](path="/x")
+        r2 = handlers["query_db"](path="/x")
+        # search_papers also returns "unavailable" but on a different tool,
+        # so its counter is independent and it should still run normally.
+        s1 = handlers["search_papers"](query="foo")
+        assert "unavailable" in s1.lower()
+        # Third identical query_db call trips its breaker.
+        r3 = handlers["query_db"](path="/x")
+        assert "returned the same error" in r3.lower()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -963,19 +1024,28 @@ class TestTimeoutRetry:
         assert elapsed < 15, f"Loop took {elapsed:.0f}s despite tight deadline"
 
     def test_tool_timeout_returns_error_message(self):
-        """Tool HTTP calls that timeout return a user-friendly error."""
-        import concurrent.futures
+        """Tool HTTP calls that timeout return a user-friendly error.
 
+        With the new call_with_timeout that threads timeout= through to
+        the callee, the underlying HTTP client is responsible for raising
+        TimeoutError when it can't complete the call in time. This mock
+        simulates that behavior: if the passed timeout is shorter than
+        the simulated work, it raises TimeoutError just like urllib would.
+        """
         call_count = [0]
 
         class SlowClient:
-            def get_json(self, url):
+            def get_json(self, url, timeout=None, **kwargs):
                 call_count[0] += 1
+                if timeout is not None and timeout < 5:
+                    raise TimeoutError(f"timed out after {timeout}s")
                 time.sleep(5)
                 return {}
 
-            def post_json(self, url, payload):
+            def post_json(self, url, payload, timeout=None, **kwargs):
                 call_count[0] += 1
+                if timeout is not None and timeout < 5:
+                    raise TimeoutError(f"timed out after {timeout}s")
                 time.sleep(5)
                 return {}
 
@@ -1020,21 +1090,36 @@ class TestTimeoutRetry:
 # ═════════════════════════════════════���════════════════════���═══════
 
 class TestCallWithTimeout:
+    """Tests for the new pass-through call_with_timeout.
+
+    The implementation now threads ``timeout`` into the callee's kwargs
+    rather than wrapping the call in a ThreadPoolExecutor (which couldn't
+    actually cancel the underlying urllib call and merely delayed the OS
+    socket timeout). These tests verify that contract.
+    """
+
     def test_returns_result_on_success(self):
         from core import call_with_timeout
-        result = call_with_timeout(lambda: 42, timeout=5)
+        result = call_with_timeout(lambda timeout=None: 42, timeout=5)
         assert result == 42
 
-    def test_raises_on_timeout(self):
+    def test_raises_when_callee_times_out(self):
+        """Timeout enforcement now comes from the callee — we just thread
+        the value through. When the callee raises TimeoutError, it
+        propagates."""
         from core import call_with_timeout
         import pytest
+
+        def slow(timeout=None):
+            raise TimeoutError(f"simulated timeout at {timeout}s")
+
         with pytest.raises(TimeoutError):
-            call_with_timeout(lambda: time.sleep(10), timeout=0.5)
+            call_with_timeout(slow, timeout=0.5)
 
     def test_propagates_exception(self):
         from core import call_with_timeout
         import pytest
-        def boom():
+        def boom(timeout=None):
             raise ValueError("boom")
         with pytest.raises(ValueError, match="boom"):
             call_with_timeout(boom, timeout=5)
@@ -1042,11 +1127,44 @@ class TestCallWithTimeout:
     def test_passes_args_and_kwargs(self):
         from core import call_with_timeout
         result = call_with_timeout(
-            lambda x, y=0: x + y,
+            lambda x, y=0, timeout=None: x + y,
             args=(10,), kwargs={"y": 5},
             timeout=5,
         )
         assert result == 15
+
+    def test_threads_timeout_into_kwargs(self):
+        """The timeout parameter is passed through to the callee as a
+        keyword argument so the callee can honor it (e.g. urllib.urlopen)."""
+        from core import call_with_timeout
+        captured = {}
+
+        def recorder(url, payload, timeout=None):
+            captured["url"] = url
+            captured["payload"] = payload
+            captured["timeout"] = timeout
+            return {"ok": True}
+
+        result = call_with_timeout(
+            recorder, args=("http://x", {"a": 1}), timeout=17,
+        )
+        assert result == {"ok": True}
+        assert captured["timeout"] == 17
+
+    def test_explicit_kwarg_timeout_wins(self):
+        """If the caller already put a ``timeout`` in kwargs, don't clobber it."""
+        from core import call_with_timeout
+        captured = {}
+
+        def recorder(timeout=None):
+            captured["timeout"] = timeout
+            return timeout
+
+        result = call_with_timeout(
+            recorder, kwargs={"timeout": 99}, timeout=5,
+        )
+        assert result == 99
+        assert captured["timeout"] == 99
 
 
 # ═════════���════════════════════���═════════════════════════���═════════

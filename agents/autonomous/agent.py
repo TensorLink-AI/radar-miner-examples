@@ -17,7 +17,7 @@ import time
 
 from core import call_with_timeout, history, validation
 from core.arch_knowledge import build_arch_guidance
-from core.fallback_templates import generate_fallback
+from core.fallback_templates import fallback_name_for, generate_fallback
 from core.history import extract_flops_budget, identify_bucket
 from core.prompt_builder import _format_task_params, _compute_sizing_guidance
 from strategies import build_strategy, select_strategy
@@ -348,7 +348,10 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
         return None
 
     url = f"{llm_url}/v1/chat/completions"
-    max_retries = 3
+    # 2 attempts × LLM_REQUEST_TIMEOUT (45s) = 90s worst case per turn, which
+    # fits inside a 300s round budget. Three attempts produced 135s+ and
+    # routinely blew the budget, especially when combined with backoff sleeps.
+    max_retries = 2
     last_validated_code = None     # Passed validate_code cleanly (preferred)
     last_proposed_code = None      # Structurally ok but may have failed FLOPs
 
@@ -819,7 +822,7 @@ def design_architecture(challenge: dict, client) -> dict:
             fb_ok, fb_errors = _structural_ok(fb_code, challenge)
             if fb_ok:
                 code = fb_code
-                name = f"fallback_{bucket}"
+                name = fallback_name_for(challenge)
                 motivation = (
                     "Autonomous agent could not produce LLM-generated code; "
                     "using auto-sized fallback template"

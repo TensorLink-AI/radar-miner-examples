@@ -4,7 +4,9 @@ When the LLM fails to produce a model that passes validation within the
 time/turn budget, this module generates a minimal but valid model that:
 
   1. Reads task_params generically from the challenge (no hardcoded keys)
-  2. Sizes itself to ~60% of max_flops
+  2. Sizes itself to ~80% of max_flops (pushes against the upper bound so
+     we harvest the full size bucket — a 75M large-bucket model left 33%
+     of the FLOPs budget on the floor)
   3. Passes both pre_validate_code (structure) AND the size gate (FLOPs)
   4. Works for ANY task because it derives the build_model signature and
      I/O shapes from the challenge
@@ -15,7 +17,7 @@ This is the safety net — it should ALWAYS produce submittable code.
 import math
 import textwrap
 
-from core.history import extract_flops_budget
+from core.history import extract_flops_budget, identify_bucket
 from core.input_shape import (
     _CHANNEL_KEYS,
     _FEATURE_KEYS,
@@ -27,6 +29,25 @@ from core.input_shape import (
     infer_input,
 )
 from core.output_shape import infer_output_shape
+
+# Target ~80% of the bucket's upper FLOPs bound so fallback submissions use
+# the whole size bucket rather than parking at 60% and leaving FLOPs unspent.
+FALLBACK_FLOPS_TARGET_FRACTION = 0.8
+
+# Version suffix makes this template's submissions distinguishable from the
+# older 60%-target, hardcoded-shape fallback so the DB can tell them apart.
+FALLBACK_VERSION = "v2"
+
+
+def fallback_name_for(challenge: dict) -> str:
+    """Return a bucket-tagged, versioned name for the fallback submission.
+
+    e.g. ``fallback_large_v2``. Makes it possible to distinguish fallback
+    submissions across rounds and size buckets in the experiment DB.
+    """
+    flops_min, flops_max = extract_flops_budget(challenge)
+    bucket = identify_bucket(flops_min, flops_max)
+    return f"fallback_{bucket}_{FALLBACK_VERSION}"
 
 
 def _has_recognized_continuous_keys(tp: dict) -> bool:
@@ -57,7 +78,10 @@ def generate_fallback(challenge: dict) -> str:
     tp = task.get("task_params", {})
     constraints = task.get("constraints", [])
     flops_min, flops_max = extract_flops_budget(challenge)
-    target_flops = int(flops_max * 0.6) if flops_max else 300_000
+    target_flops = (
+        int(flops_max * FALLBACK_FLOPS_TARGET_FRACTION)
+        if flops_max else 300_000
+    )
 
     # Build the function signature from task_params keys
     param_names = list(tp.keys()) if tp else []

@@ -60,6 +60,7 @@ def chat_with_tools(
     max_tokens: int = 4096,
     max_rounds: int = 8,
     model: str = DEFAULT_MODEL,
+    deadline: float | None = None,
 ) -> str:
     """Multi-round tool-calling loop using the OpenAI chat completions format.
 
@@ -70,13 +71,18 @@ def chat_with_tools(
     text response (``finish_reason == "stop"``) or *max_rounds* is exhausted.
 
     Unlike ``chat()``, this function retries transient HTTP failures internally
-    (up to 3 attempts per round) so callers don't need their own retry wrapper.
+    (up to 2 attempts per round) so callers don't need their own retry wrapper.
+    Pass ``deadline`` (absolute time.time() value) to skip backoff sleeps that
+    would blow the round's time budget.
     """
     if not llm_url:
         raise RuntimeError("No llm_url provided")
 
     url = f"{llm_url}/v1/chat/completions"
-    max_retries = 3
+    # 2 attempts × LLM_REQUEST_TIMEOUT (45s) = 90s worst case per round, which
+    # fits inside a 300s round budget even with backoff. Three attempts
+    # produced 135s+ and routinely blew the budget.
+    max_retries = 2
 
     for round_idx in range(max_rounds):
         payload = {
@@ -123,7 +129,11 @@ def chat_with_tools(
                 )
             if attempt < max_retries - 1:
                 backoff = 2 ** (attempt + 1)
-                time.sleep(backoff)
+                # Only sleep if the round has enough budget left. Without
+                # this check, a backoff can push us past the deadline and
+                # waste the retry that follows. Mirrors agent.py's version.
+                if deadline is None or (deadline - time.time()) > backoff:
+                    time.sleep(backoff)
 
         if resp is None:
             raise RuntimeError(
