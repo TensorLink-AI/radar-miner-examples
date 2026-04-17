@@ -11,11 +11,13 @@ look at the frontier, generate code, validate it, fix errors, and submit.
 """
 
 import json
+import os
 import sys
 import tempfile
 import time
 
 from core import call_with_timeout, history, validation
+from core.llm import _is_transient
 from core.arch_knowledge import build_arch_guidance
 from core.fallback_templates import fallback_name_for, generate_fallback
 from core.history import extract_flops_budget, identify_bucket
@@ -25,16 +27,25 @@ from tools import TOOLS, SubmitSignal, build_handlers, build_tools
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 
-# Each loop iteration is 1 LLM call. With ~30s average per call and a 1500s
-# budget, this allows ~50 turns with buffer.
-MAX_TURNS = 50
+# Force focused reasoning per round. The old MAX_TURNS=50 let the LLM sprawl
+# across dozens of tool calls instead of committing to a design; evoloop's
+# TOOL_MAX_ROUNDS=8 pattern shows that aggressive caps force a focused loop.
+MAX_TURNS = 12
 
 # Minimum seconds to reserve for final submission overhead.
 TIME_BUFFER_SECONDS = 10
 
-# Per-request timeout for LLM calls (prevents OS-default ~127s socket timeout
-# from eating the entire time budget on a single failed request).
-LLM_REQUEST_TIMEOUT = 45
+# Reserve at the tail of the agent budget for fallback generation + submit.
+# Without this, a slow final LLM call times out and the round ships whatever
+# ugly default the harness has — even when a previous turn already produced
+# usable code.
+FALLBACK_RESERVE_SECONDS = 30
+
+# Per-request timeout for LLM calls. Must exceed the validator proxy's 60s
+# upstream-read timeout, plus a buffer for reasoning models that take a few
+# extra seconds to produce their first token. 45s was shorter than the proxy
+# window and made the miner give up on calls that would have succeeded.
+LLM_REQUEST_TIMEOUT = 180
 
 # Exponential backoff delays between LLM retry attempts (seconds).
 LLM_RETRY_BACKOFF = [2, 4]
@@ -42,6 +53,33 @@ LLM_RETRY_BACKOFF = [2, 4]
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _resolve_agent_budget(challenge: dict) -> int:
+    """Resolve the seconds available to this agent (Phase A, design).
+
+    ``challenge["agent_seconds"]`` is the correct source — it is the budget
+    the harness allots to the design call itself. If absent, we fall back to
+    an env override, and only as a last resort do we use
+    ``task.time_budget`` (the TRAINER's Phase B budget, a different number),
+    emitting a warning so misconfiguration is loud rather than silent.
+    """
+    task = challenge.get("task", {}) or {}
+    agent_budget = int(challenge.get("agent_seconds") or 0)
+    if agent_budget <= 0:
+        env_budget = os.environ.get("AGENT_BUDGET_SECONDS", "")
+        try:
+            agent_budget = int(env_budget) if env_budget else 0
+        except ValueError:
+            agent_budget = 0
+    if agent_budget <= 0:
+        agent_budget = int(task.get("time_budget", 300) or 300)
+        _log(
+            f"[agent] WARNING: using task.time_budget={agent_budget} as "
+            f"agent budget — this is the trainer's budget, not the agent's. "
+            f"Set challenge.agent_seconds or AGENT_BUDGET_SECONDS env."
+        )
+    return agent_budget
 
 
 def _extract_code_block(text: str) -> str:
@@ -254,7 +292,7 @@ def _build_kickoff_message(challenge: dict, strategy: dict | None = None) -> str
     if not frontier:
         frontier = challenge.get("pareto_frontier", [])
 
-    time_budget = task.get("time_budget", 300)
+    time_budget = _resolve_agent_budget(challenge)
 
     base = (
         f"New round started. Task: {task_name}, Bucket: {bucket}, "
@@ -370,6 +408,18 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
         # the success path and must propagate untouched.
         try:
             remaining = deadline - time.time()
+            # Enter the reserve window early if we already have usable
+            # code — no point spending the last 30s on another LLM round
+            # when we'd only use its result if it beat what we have.
+            if (
+                remaining < FALLBACK_RESERVE_SECONDS
+                and (last_validated_code or last_proposed_code)
+            ):
+                _log(
+                    f"[agent] Entering reserve window at turn {turn + 1} "
+                    f"({remaining:.0f}s left) — usable code in hand"
+                )
+                break
             if remaining < TIME_BUFFER_SECONDS:
                 _log(f"[agent] Time's up at turn {turn + 1}, breaking loop")
                 break
@@ -449,19 +499,28 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
                          f"({req_timeout:.0f}s), skipping")
                     break
 
+                last_exc: Exception | None = None
                 try:
                     resp = call_with_timeout(
                         client.post_json, args=(url, payload),
                         timeout=req_timeout,
                     )
                     break
-                except TimeoutError:
+                except TimeoutError as exc:
+                    last_exc = exc
                     _log(f"[agent] Turn {turn + 1} attempt "
                          f"{attempt + 1}/{max_retries} timed out "
                          f"after {req_timeout:.0f}s")
                 except Exception as exc:
+                    last_exc = exc
+                    transient = _is_transient(exc)
                     _log(f"[agent] Turn {turn + 1} attempt "
-                         f"{attempt + 1}/{max_retries} failed: {exc}")
+                         f"{attempt + 1}/{max_retries} "
+                         f"{'transient' if transient else 'non-transient'}: {exc}")
+                    # Non-transient (4xx, bad-payload, etc.) won't improve
+                    # on retry — bail out of the attempt loop now.
+                    if not transient:
+                        break
 
                 if attempt < max_retries - 1:
                     backoff = LLM_RETRY_BACKOFF[
@@ -668,39 +727,52 @@ def _autonomous_loop(client, challenge: dict, messages: list[dict],
             _log(f"[agent] Turn {turn + 1} crashed: {exc} — continuing to next turn")
             continue
 
-    # Loop ended without an explicit submit. Prefer fully-validated code;
-    # otherwise try to fully validate any structurally-ok proposal before
-    # falling back. Shipping code that only passed ``_structural_ok`` —
-    # i.e. parses + has build_model/build_optimizer — is how we end up
-    # submitting models with the wrong output shape or FLOPs mismatch,
-    # which then crash mid-training. Better to fall through to the
-    # guaranteed-valid template than to ship unvalidated code.
+    # Loop ended without an explicit submit. Preference order:
+    #   1. last_validated_code (passed full validate_code cleanly)
+    #   2. last_proposed_code  (structurally ok; may have failed FLOPs gate)
+    #   3. None → outer caller drops to the guaranteed-valid template
+    #
+    # The previous contract required full validation to submit anything,
+    # which caused the outer caller to ship the shared fallback template
+    # for every miner in the round — and dedup collapsed those identical
+    # submissions to a single effective miner. Shipping a structurally-
+    # ok model with a slightly off FLOPs bucket keeps the miner in the
+    # round (the harness penalizes FLOPs mismatch; it doesn't instant-
+    # reject). Unusable code (won't parse, missing build_model, etc.) is
+    # still filtered because it fails ``_structural_ok``.
     if last_validated_code:
         _log("[agent] Loop ended without submit, using last validated code")
         return {
             "code": last_validated_code,
-            "name": "autonomous_fallback",
-            "motivation": "Time/turns exhausted — submitting last validated code",
+            "name": "llm_validated",
+            "motivation": "LLM-generated and validated",
         }
     if last_proposed_code:
         full_ok, full_errors = validation.validate_code(
             last_proposed_code, challenge,
         )
         if full_ok:
-            _log("[agent] Last proposed code passed full validation on final check; "
-                 "submitting it")
+            _log("[agent] Last proposed code passed full validation on final check")
             return {
                 "code": last_proposed_code,
-                "name": "autonomous_best_effort",
-                "motivation": (
-                    "Time/turns exhausted; last proposed code passed full "
-                    "validation on final re-check"
-                ),
+                "name": "llm_validated",
+                "motivation": "LLM-generated and validated (final re-check)",
             }
-        _log("[agent] Last proposed code failed full validation on final check "
-             f"({full_errors}); falling through to guaranteed-valid template")
+        _log(
+            f"[agent] Last proposed code failed full validation ({full_errors}); "
+            "submitting as llm_best_effort rather than the byte-identical "
+            "fallback template so dedup keeps this miner in the round"
+        )
+        return {
+            "code": last_proposed_code,
+            "name": "llm_best_effort",
+            "motivation": (
+                "LLM-generated, structurally valid but did not pass full "
+                f"validation ({'; '.join(full_errors)[:200]})"
+            ),
+        }
 
-    _log("[agent] Loop ended with no fully-validated code")
+    _log("[agent] Loop ended with no usable code")
     return None
 
 
@@ -741,9 +813,15 @@ def design_architecture(challenge: dict, client) -> dict:
 
     # ── Time budget ───────────────────────────────────────────────
     task = challenge.get("task", {})
-    time_budget = task.get("time_budget", 300)
+    agent_budget = _resolve_agent_budget(challenge)
+    # Reserve a window at the tail so a slow final LLM call can't time
+    # out past the deadline and leave us with nothing to submit.
+    time_budget = max(60, agent_budget - FALLBACK_RESERVE_SECONDS)
     deadline = time.time() + time_budget
-    _log(f"[agent] Time budget: {time_budget}s")
+    _log(
+        f"[agent] Time budget: {time_budget}s "
+        f"(agent_seconds={agent_budget}, reserve={FALLBACK_RESERVE_SECONDS}s)"
+    )
 
     # ── Load scratchpad ───────────────────────────────────────────
     scratch_dir = None

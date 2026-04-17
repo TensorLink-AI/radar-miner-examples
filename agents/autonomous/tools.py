@@ -38,13 +38,20 @@ from core.trace import trace_architecture, format_trace
 TOOL_HTTP_TIMEOUT = 15   # seconds per research/DB request
 FRONTIER_HTTP_TIMEOUT = 10  # seconds for frontier fetch
 
-# Circuit breaker for tools that keep returning the same short error.
-# The agent loop can fixate on a broken tool (e.g. calling get_frontier_member
-# 3-4 times in a row with invalid indices) without learning. After 2 identical
-# short error responses, further calls short-circuit to a hard-stop message.
-# Short = ≤200 chars, which matches typical error strings from the handlers.
+# Circuit breaker for tools that keep returning the same error. The agent
+# loop can fixate on a broken tool (e.g. calling get_frontier_member 3-4
+# times in a row with invalid indices) without learning. After 2 identical
+# error responses, further calls short-circuit to a hard-stop message.
+#
+# An "error" is either a short response (≤200 chars, typical for compact
+# handler errors) OR a longer response that contains one of the error
+# markers below. The content check catches verbose error payloads (e.g.
+# a multi-line traceback) that would otherwise slip past the length check.
 CIRCUIT_BREAKER_ERROR_MAX_LEN = 200
 CIRCUIT_BREAKER_THRESHOLD = 2
+CIRCUIT_BREAKER_ERROR_MARKERS = (
+    "error", "failed", "not found", "timeout", "rejected", "unavailable",
+)
 
 # Keyed by tool name. Cleared at the start of each round in ``build_handlers``.
 _tool_error_counters: dict = {}
@@ -54,20 +61,32 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _looks_like_error(result: str) -> bool:
+    """True when the tool result looks like an error response.
+
+    Short results are treated as errors (most handler error paths return
+    <200 chars), and longer results are scanned for common error markers.
+    """
+    if len(result) <= CIRCUIT_BREAKER_ERROR_MAX_LEN:
+        return True
+    low = result.lower()
+    return any(m in low for m in CIRCUIT_BREAKER_ERROR_MARKERS)
+
+
 def _apply_circuit_breaker(tool_name: str, result: str) -> str:
     """Update the circuit-breaker counter for a tool and return either the
     original result or a hard-stop message when the breaker trips.
 
     Semantics:
-    - A long result (>200 chars) is treated as success → counter resets.
-    - A short result matching the previous short result increments the
-      counter; a different short result restarts it at 1.
-    - Once the same short error has been returned more than
+    - A result that doesn't look like an error resets the counter.
+    - A repeated identical error-looking result increments the counter;
+      a different error restarts it at 1.
+    - Once the same error has been returned more than
       CIRCUIT_BREAKER_THRESHOLD times in a row, the breaker trips and the
       tool's result is replaced with a hard-stop message telling the LLM
       to try a different approach.
     """
-    if len(result) > CIRCUIT_BREAKER_ERROR_MAX_LEN:
+    if not _looks_like_error(result):
         _tool_error_counters.pop(tool_name, None)
         return result
 
@@ -81,8 +100,9 @@ def _apply_circuit_breaker(tool_name: str, result: str) -> str:
         n = state["count"]
         _log(f"[tools] circuit breaker tripped on {tool_name} after {n} identical errors")
         return (
-            f"Tool {tool_name} has returned the same error {n} times. "
-            "Do not call it again this round — try a different approach."
+            f"[CIRCUIT OPEN] Tool {tool_name} returned identical errors "
+            f"{n} times. Do NOT call this tool again this round — try a "
+            "different approach."
         )
     return result
 
