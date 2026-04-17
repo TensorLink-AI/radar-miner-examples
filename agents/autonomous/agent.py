@@ -11,6 +11,7 @@ look at the frontier, generate code, validate it, fix errors, and submit.
 """
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -25,16 +26,25 @@ from tools import TOOLS, SubmitSignal, build_handlers, build_tools
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 
-# Each loop iteration is 1 LLM call. With ~30s average per call and a 1500s
-# budget, this allows ~50 turns with buffer.
-MAX_TURNS = 50
+# Force focused reasoning per round. The old MAX_TURNS=50 let the LLM sprawl
+# across dozens of tool calls instead of committing to a design; evoloop's
+# TOOL_MAX_ROUNDS=8 pattern shows that aggressive caps force a focused loop.
+MAX_TURNS = 12
 
 # Minimum seconds to reserve for final submission overhead.
 TIME_BUFFER_SECONDS = 10
 
-# Per-request timeout for LLM calls (prevents OS-default ~127s socket timeout
-# from eating the entire time budget on a single failed request).
-LLM_REQUEST_TIMEOUT = 45
+# Reserve at the tail of the agent budget for fallback generation + submit.
+# Without this, a slow final LLM call times out and the round ships whatever
+# ugly default the harness has — even when a previous turn already produced
+# usable code.
+FALLBACK_RESERVE_SECONDS = 30
+
+# Per-request timeout for LLM calls. Must exceed the validator proxy's 60s
+# upstream-read timeout, plus a buffer for reasoning models that take a few
+# extra seconds to produce their first token. 45s was shorter than the proxy
+# window and made the miner give up on calls that would have succeeded.
+LLM_REQUEST_TIMEOUT = 180
 
 # Exponential backoff delays between LLM retry attempts (seconds).
 LLM_RETRY_BACKOFF = [2, 4]
@@ -42,6 +52,33 @@ LLM_RETRY_BACKOFF = [2, 4]
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _resolve_agent_budget(challenge: dict) -> int:
+    """Resolve the seconds available to this agent (Phase A, design).
+
+    ``challenge["agent_seconds"]`` is the correct source — it is the budget
+    the harness allots to the design call itself. If absent, we fall back to
+    an env override, and only as a last resort do we use
+    ``task.time_budget`` (the TRAINER's Phase B budget, a different number),
+    emitting a warning so misconfiguration is loud rather than silent.
+    """
+    task = challenge.get("task", {}) or {}
+    agent_budget = int(challenge.get("agent_seconds") or 0)
+    if agent_budget <= 0:
+        env_budget = os.environ.get("AGENT_BUDGET_SECONDS", "")
+        try:
+            agent_budget = int(env_budget) if env_budget else 0
+        except ValueError:
+            agent_budget = 0
+    if agent_budget <= 0:
+        agent_budget = int(task.get("time_budget", 300) or 300)
+        _log(
+            f"[agent] WARNING: using task.time_budget={agent_budget} as "
+            f"agent budget — this is the trainer's budget, not the agent's. "
+            f"Set challenge.agent_seconds or AGENT_BUDGET_SECONDS env."
+        )
+    return agent_budget
 
 
 def _extract_code_block(text: str) -> str:
@@ -254,7 +291,7 @@ def _build_kickoff_message(challenge: dict, strategy: dict | None = None) -> str
     if not frontier:
         frontier = challenge.get("pareto_frontier", [])
 
-    time_budget = task.get("time_budget", 300)
+    time_budget = _resolve_agent_budget(challenge)
 
     base = (
         f"New round started. Task: {task_name}, Bucket: {bucket}, "
@@ -741,9 +778,15 @@ def design_architecture(challenge: dict, client) -> dict:
 
     # ── Time budget ───────────────────────────────────────────────
     task = challenge.get("task", {})
-    time_budget = task.get("time_budget", 300)
+    agent_budget = _resolve_agent_budget(challenge)
+    # Reserve a window at the tail so a slow final LLM call can't time
+    # out past the deadline and leave us with nothing to submit.
+    time_budget = max(60, agent_budget - FALLBACK_RESERVE_SECONDS)
     deadline = time.time() + time_budget
-    _log(f"[agent] Time budget: {time_budget}s")
+    _log(
+        f"[agent] Time budget: {time_budget}s "
+        f"(agent_seconds={agent_budget}, reserve={FALLBACK_RESERVE_SECONDS}s)"
+    )
 
     # ── Load scratchpad ───────────────────────────────────────────
     scratch_dir = None

@@ -19,7 +19,11 @@ from core.prompt_builder import build_system_prompt, build_user_prompt
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 MAX_LLM_ATTEMPTS = 15  # up to 15 turns — half the 30-request rate limit
-LLM_REQUEST_TIMEOUT = 45  # seconds per LLM HTTP request
+# Must exceed the validator proxy's 60s upstream-read timeout, plus buffer
+# for reasoning models that take a few extra seconds to produce their first
+# token. The old 45s was shorter than the proxy window, so the miner gave up
+# on calls that would have succeeded.
+LLM_REQUEST_TIMEOUT = 180
 
 
 def chat(client, llm_url: str, messages: list[dict], *,

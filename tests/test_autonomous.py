@@ -945,9 +945,12 @@ class TestSubmitSignal:
 # ══════════════════════════════════════════════════════════════════
 
 class TestConstants:
-    def test_max_turns_is_50(self):
-        """MAX_TURNS should be 50 — ~30s/call × 50 fits a 1500s budget."""
-        assert MAX_TURNS == 50
+    def test_max_turns_is_focused(self):
+        """MAX_TURNS caps the tool-calling loop at a focused budget.
+
+        We moved from 50 → ~12 so the LLM commits to a design instead of
+        sprawling. Anything below 20 is considered 'focused'."""
+        assert MAX_TURNS <= 20
 
     def test_time_buffer_is_positive(self):
         assert _mod.TIME_BUFFER_SECONDS > 0
