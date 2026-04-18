@@ -66,16 +66,24 @@ _cached_client: OpenAI | None = None
 _cached_config: tuple | None = None
 
 
-def get_client() -> OpenAI:
+def get_client(llm_url: str = "") -> OpenAI:
     """Return a cached OpenAI client pointed at the validator proxy.
 
-    The cache key includes ``LLM_URL``, ``AGENT_TOKEN``, ``MINER_UID`` and
-    the read timeout — if any of those change between calls, a fresh
-    client is built.
+    The caller (agent) should pass ``challenge["llm_url"]`` — that's the
+    authoritative source. The ``LLM_URL`` env var is kept as a fallback so
+    scripts and manual invocations still work. The cache key includes the
+    resolved URL plus token/uid/timeout, so changing any of them builds a
+    fresh client.
     """
     global _cached_client, _cached_config
 
-    base_url = os.environ["LLM_URL"].rstrip("/") + "/v1"
+    url = llm_url or os.environ.get("LLM_URL", "")
+    if not url:
+        raise RuntimeError(
+            "No LLM URL: challenge['llm_url'] empty and LLM_URL env var unset"
+        )
+
+    base_url = url.rstrip("/") + "/v1"
     token = os.environ.get("AGENT_TOKEN", "")
     uid = os.environ.get("MINER_UID", "0")
     read_timeout = int(os.environ.get("LLM_READ_TIMEOUT", "180"))
@@ -114,6 +122,7 @@ def get_client() -> OpenAI:
 def chat(
     messages: list[dict],
     *,
+    llm_url: str = "",
     model: str | Iterable[str] = "moonshotai/Kimi-K2.5-TEE",
     temperature: float = 0.7,
     max_tokens: int = 4096,
@@ -135,7 +144,7 @@ def chat(
     Returns the raw ``ChatCompletion`` object — the caller pulls out
     ``.choices[0].message`` (and ``.tool_calls`` if any).
     """
-    client = get_client()
+    client = get_client(llm_url)
     pool = [model] if isinstance(model, str) else list(model)
     if not pool:
         raise ValueError("model pool is empty")
