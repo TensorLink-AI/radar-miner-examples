@@ -347,7 +347,7 @@ class TestToolSchema:
             "search_papers", "query_db", "estimate_layer_flops",
             "sketch_architecture", "trace_architecture",
             "check_output_shape", "read_scratchpad", "write_scratchpad",
-            "list_files", "read_file", "write_file",
+            "list_files", "read_file", "write_file", "search_files",
             "time_remaining",
         } == names
 
@@ -498,6 +498,40 @@ class TestFileTools:
         assert "unavailable" in handlers["write_file"](
             name="x.md", content="y",
         )
+
+    def test_search_files_finds_matches(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["write_file"](
+            name="design.md",
+            content="# Plan\nUse TRANSFORMER backbone\nkeep it tiny",
+        )
+        handlers["write_file"](
+            name="notes.md", content="no hits here",
+        )
+        result = handlers["search_files"](query="transformer")
+        assert "[design.md]" in result
+        assert "transformer" in result.lower()
+        assert "[notes.md]" not in result
+
+    def test_search_files_no_match(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["write_file"](name="a.md", content="hello world")
+        result = handlers["search_files"](query="nonexistent")
+        assert "no matches" in result
+
+    def test_search_files_empty_query(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        result = handlers["search_files"](query="")
+        assert result.startswith("error:")
 
     def test_overwrite_does_not_hit_count_limit(self, tmp_path):
         from agents.openai_sdk.tools import build_handlers

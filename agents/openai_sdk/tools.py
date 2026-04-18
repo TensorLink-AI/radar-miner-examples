@@ -45,6 +45,8 @@ FRONTIER_HTTP_TIMEOUT = 10   # seconds for frontier fetch
 # burning the whole budget on one file.
 FILE_MAX_BYTES = 256 * 1024           # 256 KiB per file
 FILE_MAX_COUNT = 50                   # total user-written files
+FILE_SEARCH_MAX_MATCHES_PER_FILE = 5  # keep hits-per-file output bounded
+FILE_SEARCH_MAX_TOTAL_MATCHES = 30    # global cap across all files
 # ``state.json`` is owned by the history module and the ``_scratchpad``
 # notes file is owned by write_scratchpad — don't let the LLM clobber
 # either from the generic file tools.
@@ -440,6 +442,30 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": ["name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": (
+                "Case-insensitive substring search across all scratchpad "
+                "files. Returns matching file names and the surrounding "
+                "lines with line numbers. Use to find notes on a topic "
+                "without rereading every file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Substring to search for (case-insensitive)."
+                        ),
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -1022,6 +1048,50 @@ def build_handlers(
             )
         return data
 
+    def _search_files(query: str = "", **_kwargs) -> str:
+        if scratch_dir is None:
+            return "files unavailable (no scratchpad directory)"
+        if not query or not isinstance(query, str):
+            return "error: query is required"
+        needle = query.lower()
+        try:
+            entries = sorted(os.listdir(scratch_dir))
+        except FileNotFoundError:
+            return "no files yet"
+        except OSError as exc:
+            return f"error: could not list files: {exc}"
+
+        lines_out: list[str] = []
+        total = 0
+        for entry in entries:
+            if total >= FILE_SEARCH_MAX_TOTAL_MATCHES:
+                lines_out.append("... (match cap reached)")
+                break
+            if entry in RESERVED_FILE_NAMES:
+                continue
+            full = os.path.join(scratch_dir, entry)
+            if not os.path.isfile(full):
+                continue
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read(FILE_MAX_BYTES)
+            except OSError:
+                continue
+            hits: list[str] = []
+            for i, line in enumerate(text.splitlines(), start=1):
+                if needle in line.lower():
+                    hits.append(f"  {i}: {line.strip()[:200]}")
+                    if len(hits) >= FILE_SEARCH_MAX_MATCHES_PER_FILE:
+                        hits.append("  ... (more matches in this file)")
+                        break
+            if hits:
+                lines_out.append(f"[{entry}]")
+                lines_out.extend(hits)
+                total += len(hits)
+        if not lines_out:
+            return f"no matches for {query!r}"
+        return "\n".join(lines_out)
+
     def _write_file(name: str = "", content: str = "", **_kwargs) -> str:
         path, err = _safe_file_path(name)
         if err:
@@ -1093,6 +1163,7 @@ def build_handlers(
         "list_files": _list_files,
         "read_file": _read_file,
         "write_file": _write_file,
+        "search_files": _search_files,
         "submit": _submit,
         "time_remaining": _time_remaining,
     }
