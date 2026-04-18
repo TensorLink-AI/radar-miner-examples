@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sys
 import time
 
@@ -38,6 +39,16 @@ from core.validation import validate_code
 
 TOOL_HTTP_TIMEOUT = 15       # seconds per research/DB request
 FRONTIER_HTTP_TIMEOUT = 10   # seconds for frontier fetch
+
+# Scratchpad file tool limits. The scratchpad upload itself is capped by
+# ``challenge["scratchpad_max_mb"]``; these caps keep a single round from
+# burning the whole budget on one file.
+FILE_MAX_BYTES = 256 * 1024           # 256 KiB per file
+FILE_MAX_COUNT = 50                   # total user-written files
+# ``state.json`` is owned by the history module and the ``_scratchpad``
+# notes file is owned by write_scratchpad — don't let the LLM clobber
+# either from the generic file tools.
+RESERVED_FILE_NAMES = frozenset({"state.json"})
 
 # ── Schema (OpenAI function-calling format) ───────────────────────────
 
@@ -360,6 +371,75 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "List files you have written to the scratchpad directory "
+                "in previous rounds. Good for keeping structured markdown "
+                "notes (design.md, task-notes.md, etc.) alongside the "
+                "free-form scratchpad string."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read a file you previously wrote to the scratchpad "
+                "directory. Use `list_files` first to see what's there."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "File name (basename only, no slashes or "
+                            "parent references). Example: 'design.md'."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Write a text file to the scratchpad directory (persists "
+                "across rounds). Use for markdown notes, plans, or any "
+                "structured text you want to keep. Overwrites if the file "
+                "exists."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "File name (basename only, no slashes or "
+                            "parent references). Example: 'design.md'."
+                        ),
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full file contents as text.",
+                    },
+                },
+                "required": ["name", "content"],
             },
         },
     },
@@ -874,6 +954,109 @@ def build_handlers(
         state_holder["state"] = state
         return "scratchpad updated"
 
+    # ── Files (scratchpad directory) ─────────────────────────────
+
+    def _safe_file_path(name: str) -> tuple[str | None, str | None]:
+        """Resolve ``name`` to an absolute path inside ``scratch_dir``.
+
+        Returns ``(path, None)`` on success or ``(None, error)`` when the
+        name is unsafe or the scratch directory is unavailable. Only
+        simple basenames are allowed — no slashes, no parent refs, no
+        absolute paths. Reserved names are rejected.
+        """
+        if scratch_dir is None:
+            return None, "files unavailable (no scratchpad directory)"
+        if not name or not isinstance(name, str):
+            return None, "error: name is required"
+        if name != os.path.basename(name) or name in (".", ".."):
+            return None, (
+                f"error: {name!r} is not a plain filename "
+                "(no path separators, no '.' or '..')"
+            )
+        if name in RESERVED_FILE_NAMES:
+            return None, f"error: '{name}' is reserved"
+        return os.path.join(scratch_dir, name), None
+
+    def _list_files(**_kwargs) -> str:
+        if scratch_dir is None:
+            return "files unavailable (no scratchpad directory)"
+        try:
+            entries = sorted(os.listdir(scratch_dir))
+        except FileNotFoundError:
+            return "no files yet"
+        except OSError as exc:
+            return f"error: could not list files: {exc}"
+        items = []
+        for entry in entries:
+            if entry in RESERVED_FILE_NAMES:
+                continue
+            full = os.path.join(scratch_dir, entry)
+            if not os.path.isfile(full):
+                continue
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                size = 0
+            items.append({"name": entry, "size": size})
+        if not items:
+            return "no files yet"
+        return json.dumps(items, indent=2)
+
+    def _read_file(name: str = "", **_kwargs) -> str:
+        path, err = _safe_file_path(name)
+        if err:
+            return err
+        if not os.path.isfile(path):
+            return f"error: '{name}' not found"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = f.read(FILE_MAX_BYTES + 1)
+        except OSError as exc:
+            return f"error: could not read '{name}': {exc}"
+        except UnicodeDecodeError:
+            return f"error: '{name}' is not valid UTF-8 text"
+        if len(data) > FILE_MAX_BYTES:
+            return (
+                data[:FILE_MAX_BYTES]
+                + f"\n... (truncated at {FILE_MAX_BYTES} bytes)"
+            )
+        return data
+
+    def _write_file(name: str = "", content: str = "", **_kwargs) -> str:
+        path, err = _safe_file_path(name)
+        if err:
+            return err
+        if not isinstance(content, str):
+            return "error: content must be a string"
+        encoded = content.encode("utf-8")
+        if len(encoded) > FILE_MAX_BYTES:
+            return (
+                f"error: content is {len(encoded)} bytes, max is "
+                f"{FILE_MAX_BYTES}"
+            )
+        # Enforce max file count only when creating a new file.
+        if not os.path.exists(path):
+            try:
+                existing = [
+                    e for e in os.listdir(scratch_dir)
+                    if e not in RESERVED_FILE_NAMES
+                    and os.path.isfile(os.path.join(scratch_dir, e))
+                ]
+            except OSError:
+                existing = []
+            if len(existing) >= FILE_MAX_COUNT:
+                return (
+                    f"error: file limit reached ({FILE_MAX_COUNT}); "
+                    "delete or overwrite an existing file"
+                )
+        try:
+            os.makedirs(scratch_dir, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(encoded)
+        except OSError as exc:
+            return f"error: could not write '{name}': {exc}"
+        return f"wrote {name} ({len(encoded)} bytes)"
+
     # ── Control ──────────────────────────────────────────────────
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
@@ -907,6 +1090,9 @@ def build_handlers(
         "validate_code": _validate_code,
         "read_scratchpad": _read_scratchpad,
         "write_scratchpad": _write_scratchpad,
+        "list_files": _list_files,
+        "read_file": _read_file,
+        "write_file": _write_file,
         "submit": _submit,
         "time_remaining": _time_remaining,
     }

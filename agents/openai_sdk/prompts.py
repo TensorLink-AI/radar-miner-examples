@@ -43,7 +43,12 @@ def build_system_prompt(challenge: dict, bucket: str | None = None) -> str:
         "  3. Draft model code. Call `validate_code` on it. If it fails, "
         "iterate.\n"
         "  4. Call `submit` with the final code, a short name, and a "
-        "motivation."
+        "motivation.\n\n"
+        "Persistent state: `read_scratchpad` / `write_scratchpad` hold a "
+        "single free-form notes string plus your submission history. For "
+        "structured notes (design.md, task-notes.md, etc.) use "
+        "`list_files`, `read_file`, and `write_file` — these persist "
+        "across rounds alongside the scratchpad."
     )
 
     parts.append(
