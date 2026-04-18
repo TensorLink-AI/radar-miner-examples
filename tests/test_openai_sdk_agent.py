@@ -133,6 +133,34 @@ class TestLlmClientCaching:
         assert kwargs["default_headers"]["X-Agent-Token"] == "test-token"
         assert kwargs["default_headers"]["X-Miner-UID"] == "42"
 
+    def test_get_client_prefers_arg_over_env(self, mock_openai, monkeypatch):
+        """URL passed as an argument should take precedence over LLM_URL."""
+        from agents.openai_sdk.llm_client import get_client
+        monkeypatch.setenv("LLM_URL", "http://from-env/llm")
+        get_client("http://from-arg/llm")
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs["base_url"] == "http://from-arg/llm/v1"
+
+    def test_get_client_falls_back_to_env_when_no_arg(self, mock_openai):
+        """If no arg is passed, the LLM_URL env var is still respected
+        (backward compat for scripts/manual invocations)."""
+        from agents.openai_sdk.llm_client import get_client
+        get_client()
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs["base_url"] == "http://test/llm/v1"
+
+    def test_get_client_raises_when_no_url_anywhere(
+        self, mock_openai, monkeypatch
+    ):
+        """Neither arg nor env → RuntimeError with a clear message, not
+        a raw KeyError that looks like a network failure."""
+        _reset_llm_client_cache()
+        monkeypatch.delenv("LLM_URL", raising=False)
+        from agents.openai_sdk.llm_client import get_client
+        with pytest.raises(RuntimeError) as exc:
+            get_client()
+        assert "LLM URL" in str(exc.value)
+
 
 class TestTransientClassification:
     def test_timeout_is_transient(self):
@@ -481,6 +509,57 @@ class TestDesignArchitecture:
         # Fallback path → bucket-tagged template name
         assert "fallback" in result["name"]
         assert result["code"] != ""
+        # Honest failure motivation — not the generic template message.
+        assert "LLM chat failed" in result["motivation"]
+
+    def test_missing_llm_url_shows_config_error_motivation(
+        self, mock_openai, monkeypatch
+    ):
+        """With no challenge['llm_url'] and no LLM_URL env var, the
+        startup check should trip, skip both phases, and ship the
+        fallback with a config-error motivation (not the old generic
+        'could not produce code' message)."""
+        _reset_llm_client_cache()
+        monkeypatch.delenv("LLM_URL", raising=False)
+        from agents.openai_sdk import agent
+
+        ch = _make_challenge()
+        ch["agent_seconds"] = 60
+        # No llm_url key in challenge
+        result = agent.design_architecture(ch, _gated_client=None)
+
+        assert "fallback" in result["name"]
+        assert result["code"] != ""
+        assert "config error" in result["motivation"].lower()
+        # The chat client should never have been built or called.
+        assert not mock_openai.return_value.chat.completions.create.called
+
+    def test_challenge_llm_url_is_used(self, mock_openai, monkeypatch):
+        """challenge['llm_url'] should be preferred over the env var —
+        the harness passes the URL through the challenge dict."""
+        _reset_llm_client_cache()
+        monkeypatch.delenv("LLM_URL", raising=False)
+        from agents.openai_sdk import agent
+
+        tc = _make_tool_call("submit", {
+            "code": VALID_CODE,
+            "name": "from-challenge",
+            "motivation": "used challenge.llm_url",
+        })
+        completion = _make_completion(tool_calls=[tc])
+        mock_openai.return_value.chat.completions.create.return_value = (
+            completion
+        )
+
+        ch = _make_challenge(with_flops=False)
+        ch["agent_seconds"] = 60
+        ch["llm_url"] = "http://from-challenge/llm"
+        result = agent.design_architecture(ch, _gated_client=None)
+
+        assert result["name"] == "from-challenge"
+        # OpenAI was built with the challenge-supplied URL.
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs["base_url"] == "http://from-challenge/llm/v1"
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -37,11 +37,11 @@ from core.validation import validate_code
 # sys.path form — the agent's directory is already on ``sys.path`` in both
 # modes (harness adds it; ``__init__.py`` adds it in package mode).
 try:
-    from .llm_client import chat
+    from .llm_client import chat, get_client
     from .prompts import build_system_prompt, build_user_prompt
     from .tools import TOOLS, SubmitSignal, build_handlers
 except ImportError:
-    from llm_client import chat
+    from llm_client import chat, get_client
     from prompts import build_system_prompt, build_user_prompt
     from tools import TOOLS, SubmitSignal, build_handlers
 
@@ -143,6 +143,21 @@ def _serialize_assistant_message(msg) -> dict:
     return out
 
 
+def _is_config_error(exc: BaseException) -> bool:
+    """Detect config-class errors that won't resolve by retrying.
+
+    ``get_client()`` raises ``RuntimeError`` when no URL is resolvable.
+    ``KeyError('LLM_URL')`` can leak from legacy call paths. Both mean
+    the agent cannot reach the LLM at all — retrying across phases just
+    wastes the round.
+    """
+    if isinstance(exc, KeyError) and str(exc) in ("'LLM_URL'", "'AGENT_TOKEN'"):
+        return True
+    if isinstance(exc, RuntimeError) and "LLM URL" in str(exc):
+        return True
+    return False
+
+
 def _run_tool_loop(
     *,
     messages: list[dict],
@@ -151,16 +166,20 @@ def _run_tool_loop(
     deadline: float,
     max_rounds: int,
     phase: str,
+    llm_url: str = "",
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
 ):
     """Run tool-calling rounds until ``max_rounds``, deadline, or submit.
 
-    Returns ``(updated_messages, submitted_code_or_None)``. ``submit`` is
-    a terminal tool — if the model calls it, we stop and return the
-    code argument.
+    Returns ``(updated_messages, submitted_code, submit_sig, failure)``.
+    ``failure`` is a short reason string when the loop couldn't produce
+    anything useful (``"config: ..."``, ``"chat: timeout"``, etc.), or
+    ``None`` on clean exit. The caller uses it to set an honest fallback
+    motivation and, for config errors, to skip later phases.
     """
     submitted: str | None = None
+    failure: str | None = None
 
     for round_num in range(max_rounds):
         remaining = deadline - time.monotonic()
@@ -169,27 +188,40 @@ def _run_tool_loop(
                 f"[agent] {phase} round {round_num + 1}: "
                 f"only {remaining:.0f}s left, stopping"
             )
+            if failure is None:
+                failure = "deadline"
             break
 
         try:
             resp = chat(
                 messages=messages,
                 tools=tools,
+                llm_url=llm_url,
                 model=model,
                 temperature=temperature,
                 max_tokens=4096,
                 deadline=deadline,
             )
         except Exception as exc:
-            _log(
-                f"[agent] {phase} round {round_num + 1} chat failed: {exc}"
-            )
+            if _is_config_error(exc):
+                _log(
+                    f"[agent] {phase} round {round_num + 1} "
+                    f"CONFIG ERROR: {exc}"
+                )
+                failure = f"config: {exc}"
+            else:
+                _log(
+                    f"[agent] {phase} round {round_num + 1} "
+                    f"chat failed: {exc}"
+                )
+                failure = f"chat: {type(exc).__name__}: {exc}"
             break
 
         try:
             msg = resp.choices[0].message
         except (AttributeError, IndexError) as exc:
             _log(f"[agent] {phase} malformed response: {exc}")
+            failure = f"chat: malformed response ({exc})"
             break
 
         messages.append(_serialize_assistant_message(msg))
@@ -237,7 +269,7 @@ def _run_tool_loop(
                         f"[agent] {phase}: model submitted "
                         f"({len(submitted)} chars, name={sig.name})"
                     )
-                    return messages, submitted, sig
+                    return messages, submitted, sig, None
                 except Exception as exc:
                     result = f"tool error: {exc}"
 
@@ -248,7 +280,7 @@ def _run_tool_loop(
                 "content": str(result)[:4000],
             })
 
-    return messages, submitted, None
+    return messages, submitted, None, failure
 
 
 def design_architecture(challenge: dict, _gated_client) -> dict:
@@ -277,6 +309,20 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = identify_bucket(flops_min, flops_max)
     handlers = build_handlers(challenge)
+    llm_url = challenge.get("llm_url", "") or ""
+
+    # ── Startup config check ─────────────────────────────────────────
+    # Build the client once up front so a config failure (missing URL,
+    # bad env) shows as a distinct diagnostic instead of masquerading
+    # as a per-phase chat error on every phase.
+    config_broken = False
+    config_error: str | None = None
+    try:
+        get_client(llm_url)
+    except Exception as exc:
+        _log(f"[agent] startup config check failed: {exc}")
+        config_broken = True
+        config_error = f"config error: {exc}"
 
     messages: list[dict] = [
         {"role": "system", "content": build_system_prompt(challenge, bucket)},
@@ -285,50 +331,72 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
 
     last_validated_code: str | None = None
     last_proposed_code: str | None = None
+    last_validation_errors: list[str] = []
     submit_sig: SubmitSignal | None = None
+    research_failure: str | None = None
+    design_failure: str | None = None
 
-    # ── Phase 1: research ────────────────────────────────────────────
-    _log("[agent] phase=research")
-    messages, _candidate, submit_sig = _run_tool_loop(
-        messages=messages,
-        tools=TOOLS,
-        handlers=handlers,
-        deadline=research_deadline,
-        max_rounds=RESEARCH_MAX_ROUNDS,
-        phase="research",
-    )
-
-    # If the model already submitted in research (eager), accept it and
-    # skip straight to packaging.
-    if submit_sig is None:
-        # ── Phase 2: design ─────────────────────────────────────────
-        _log("[agent] phase=design")
-        messages.append({
-            "role": "user",
-            "content": (
-                "Now propose a model. Call validate_code on your "
-                "candidate; if it fails, iterate. When the code passes, "
-                "call submit with the final code, a short name, and a "
-                "motivation."
-            ),
-        })
-        messages, candidate_code, submit_sig = _run_tool_loop(
+    if config_broken:
+        # Skip both phases — nothing we can do without an LLM.
+        _log("[agent] config broken, skipping research+design phases")
+    else:
+        # ── Phase 1: research ────────────────────────────────────────
+        _log("[agent] phase=research")
+        messages, _candidate, submit_sig, research_failure = _run_tool_loop(
             messages=messages,
             tools=TOOLS,
             handlers=handlers,
-            deadline=deadline,
-            max_rounds=DESIGN_MAX_ROUNDS,
-            phase="design",
+            deadline=research_deadline,
+            max_rounds=RESEARCH_MAX_ROUNDS,
+            phase="research",
+            llm_url=llm_url,
         )
-        if candidate_code:
-            ok, errors = validate_code(candidate_code, challenge)
-            if ok:
-                last_validated_code = candidate_code
-            else:
-                last_proposed_code = candidate_code
-                _log(
-                    f"[agent] candidate code didn't fully validate: {errors}"
+        if research_failure and research_failure.startswith("config:"):
+            config_broken = True
+            config_error = research_failure.replace("config:", "config error:", 1)
+
+        # If the model already submitted in research (eager), accept it
+        # and skip straight to packaging. Otherwise run design unless
+        # config is broken.
+        if submit_sig is None and not config_broken:
+            # ── Phase 2: design ─────────────────────────────────────
+            _log("[agent] phase=design")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Now propose a model. Call validate_code on your "
+                    "candidate; if it fails, iterate. When the code "
+                    "passes, call submit with the final code, a short "
+                    "name, and a motivation."
+                ),
+            })
+            messages, candidate_code, submit_sig, design_failure = (
+                _run_tool_loop(
+                    messages=messages,
+                    tools=TOOLS,
+                    handlers=handlers,
+                    deadline=deadline,
+                    max_rounds=DESIGN_MAX_ROUNDS,
+                    phase="design",
+                    llm_url=llm_url,
                 )
+            )
+            if design_failure and design_failure.startswith("config:"):
+                config_broken = True
+                config_error = design_failure.replace(
+                    "config:", "config error:", 1,
+                )
+            if candidate_code:
+                ok, errors = validate_code(candidate_code, challenge)
+                if ok:
+                    last_validated_code = candidate_code
+                else:
+                    last_proposed_code = candidate_code
+                    last_validation_errors = list(errors)
+                    _log(
+                        f"[agent] candidate code didn't fully validate: "
+                        f"{errors}"
+                    )
 
     # ── Phase 3: reserve / finalize ──────────────────────────────────
     elapsed = time.monotonic() - t_start
@@ -345,25 +413,50 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
             "LLM-generated and validated",
         )
     if last_proposed_code:
+        joined = "; ".join(last_validation_errors)[:200]
         return _package(
             last_proposed_code,
             "openai_sdk_best_effort",
-            "LLM-generated, structurally valid (FLOPs may be off)",
+            f"LLM code failed validation: {joined}",
         )
 
-    _log("[agent] no LLM code produced — using fallback template")
+    # Pick the most specific failure motivation we have.
+    if config_error:
+        fallback_motivation = config_error
+    else:
+        # Prefer the later phase's failure; research-only failure is
+        # reported when design never ran.
+        failure = design_failure or research_failure
+        if failure and failure.startswith("chat:"):
+            detail = failure.split(":", 1)[1].strip()
+            if "timeout" in detail.lower() or "timed out" in detail.lower():
+                phase_name = (
+                    "design" if design_failure else "research"
+                )
+                fallback_motivation = (
+                    f"LLM timeout in {phase_name} phase"
+                )
+            else:
+                fallback_motivation = f"LLM chat failed: {detail}"
+        elif failure == "deadline":
+            fallback_motivation = (
+                "LLM returned no parseable code before deadline"
+            )
+        else:
+            fallback_motivation = (
+                f"LLM returned no parseable code after "
+                f"{RESEARCH_MAX_ROUNDS + DESIGN_MAX_ROUNDS} rounds"
+            )
+
+    _log(f"[agent] no LLM code produced — fallback: {fallback_motivation}")
     try:
         fb_code = generate_fallback(challenge)
         fb_name = fallback_name_for(challenge)
-        return _package(
-            fb_code,
-            fb_name,
-            "OpenAI-SDK agent could not produce code; template fallback",
-        )
+        return _package(fb_code, fb_name, fallback_motivation)
     except Exception as exc:
         _log(f"[agent] fallback generation failed: {exc}")
         return _package(
             "",
             f"skipped_{bucket}",
-            f"OpenAI-SDK agent failed; fallback also failed: {exc}",
+            f"{fallback_motivation}; fallback also failed: {exc}",
         )
