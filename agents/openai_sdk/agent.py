@@ -146,14 +146,26 @@ def _serialize_assistant_message(msg) -> dict:
 def _is_config_error(exc: BaseException) -> bool:
     """Detect config-class errors that won't resolve by retrying.
 
-    ``get_client()`` raises ``RuntimeError`` when no URL is resolvable.
-    ``KeyError('LLM_URL')`` can leak from legacy call paths. Both mean
-    the agent cannot reach the LLM at all — retrying across phases just
-    wastes the round.
+    ``get_client()`` raises ``RuntimeError`` when no URL / token is
+    resolvable. ``KeyError('LLM_URL')`` can leak from legacy call paths.
+    HTTP 401/403 from the proxy mean the agent token is missing or
+    invalid — also not something retrying another phase will fix. All of
+    these mean the agent cannot reach the LLM at all, so retrying across
+    phases just wastes the round.
     """
     if isinstance(exc, KeyError) and str(exc) in ("'LLM_URL'", "'AGENT_TOKEN'"):
         return True
-    if isinstance(exc, RuntimeError) and "LLM URL" in str(exc):
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        if "LLM URL" in msg or "agent token" in msg:
+            return True
+    status = getattr(exc, "status_code", None)
+    if status in (401, 403):
+        return True
+    s = str(exc).lower()
+    if "invalid agent token" in s or "permission denied" in s:
+        return True
+    if type(exc).__name__ in ("PermissionDeniedError", "AuthenticationError"):
         return True
     return False
 
@@ -167,6 +179,8 @@ def _run_tool_loop(
     max_rounds: int,
     phase: str,
     llm_url: str = "",
+    agent_token: str = "",
+    miner_uid: str = "",
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
 ):
@@ -197,6 +211,8 @@ def _run_tool_loop(
                 messages=messages,
                 tools=tools,
                 llm_url=llm_url,
+                agent_token=agent_token,
+                miner_uid=miner_uid,
                 model=model,
                 temperature=temperature,
                 max_tokens=4096,
@@ -310,16 +326,21 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
     bucket = identify_bucket(flops_min, flops_max)
     handlers = build_handlers(challenge)
     llm_url = challenge.get("llm_url", "") or ""
+    # The harness injects the token into challenge["agent_token"], not
+    # into the pod env — read it from there so every get_client/chat
+    # call has the credential and the proxy doesn't 403.
+    agent_token = challenge.get("agent_token", "") or ""
+    miner_uid = str(challenge.get("miner_uid", "") or "")
 
     # ── Startup config check ─────────────────────────────────────────
     # Build the client once up front so a config failure (missing URL,
-    # bad env) shows as a distinct diagnostic instead of masquerading
+    # bad token) shows as a distinct diagnostic instead of masquerading
     # as a per-phase chat error on every phase.
     config_broken = False
     config_error: str | None = None
     try:
-        get_client(llm_url)
-    except Exception as exc:
+        get_client(llm_url, agent_token, miner_uid)
+    except RuntimeError as exc:
         _log(f"[agent] startup config check failed: {exc}")
         config_broken = True
         config_error = f"config error: {exc}"
@@ -350,6 +371,8 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
             max_rounds=RESEARCH_MAX_ROUNDS,
             phase="research",
             llm_url=llm_url,
+            agent_token=agent_token,
+            miner_uid=miner_uid,
         )
         if research_failure and research_failure.startswith("config:"):
             config_broken = True
@@ -379,6 +402,8 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
                     max_rounds=DESIGN_MAX_ROUNDS,
                     phase="design",
                     llm_url=llm_url,
+                    agent_token=agent_token,
+                    miner_uid=miner_uid,
                 )
             )
             if design_failure and design_failure.startswith("config:"):
