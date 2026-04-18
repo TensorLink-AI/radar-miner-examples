@@ -23,8 +23,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
 
+from core import history
 from core.fallback_templates import fallback_name_for, generate_fallback
 from core.history import extract_flops_budget, identify_bucket
 from core.validation import validate_code
@@ -39,11 +41,11 @@ from core.validation import validate_code
 try:
     from .llm_client import chat, get_client
     from .prompts import build_system_prompt, build_user_prompt
-    from .tools import TOOLS, SubmitSignal, build_handlers
+    from .tools import SubmitSignal, build_handlers, build_tools
 except ImportError:
     from llm_client import chat, get_client
     from prompts import build_system_prompt, build_user_prompt
-    from tools import TOOLS, SubmitSignal, build_handlers
+    from tools import SubmitSignal, build_handlers, build_tools
 
 
 FALLBACK_RESERVE_SECONDS = 30
@@ -299,13 +301,15 @@ def _run_tool_loop(
     return messages, submitted, None, failure
 
 
-def design_architecture(challenge: dict, _gated_client) -> dict:
+def design_architecture(challenge: dict, gated_client=None) -> dict:
     """Entry point required by the harness.
 
-    ``_gated_client`` is intentionally ignored — egress to the LLM proxy
-    is enforced by iptables at the pod level, and using the OpenAI SDK
-    directly keeps the agent code small. The other agents in this repo
-    still use ``GatedClient``; this one doesn't.
+    LLM-proxy egress is enforced by iptables at the pod level, so the
+    agent talks to the LLM through the OpenAI SDK directly. ``gated_client``
+    IS used for the research tools (``search_papers``, ``query_db``) and
+    is the only allowed HTTP transport to the experiment DB and arxiv
+    mirror — those endpoints are not behind the iptables allowlist for
+    direct SDK traffic.
     """
     t_start = time.monotonic()
     budget = _agent_budget(challenge)
@@ -324,7 +328,27 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
 
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = identify_bucket(flops_min, flops_max)
-    handlers = build_handlers(challenge)
+
+    # ── Scratchpad load (via harness-injected globals) ────────────────
+    # The harness injects ``load_scratchpad``/``save_scratchpad`` into
+    # the agent module's globals. Outside the harness (unit tests,
+    # manual runs) those names don't exist, so catch ``NameError`` and
+    # run without scratchpad state.
+    scratch_dir: str | None = None
+    try:
+        scratch_dir = load_scratchpad(challenge)  # noqa: F821 — injected
+    except NameError:
+        _log("[agent] load_scratchpad not injected — running without scratchpad")
+    except Exception as exc:
+        _log(f"[agent] scratchpad load failed: {exc}")
+
+    handlers = build_handlers(
+        challenge,
+        client=gated_client,
+        scratch_dir=scratch_dir,
+        deadline=deadline,
+    )
+    tools = build_tools(challenge)
     llm_url = challenge.get("llm_url", "") or ""
     # The harness injects the token into challenge["agent_token"], not
     # into the pod env — read it from there so every get_client/chat
@@ -365,7 +389,7 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
         _log("[agent] phase=research")
         messages, _candidate, submit_sig, research_failure = _run_tool_loop(
             messages=messages,
-            tools=TOOLS,
+            tools=tools,
             handlers=handlers,
             deadline=research_deadline,
             max_rounds=RESEARCH_MAX_ROUNDS,
@@ -396,7 +420,7 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
             messages, candidate_code, submit_sig, design_failure = (
                 _run_tool_loop(
                     messages=messages,
-                    tools=TOOLS,
+                    tools=tools,
                     handlers=handlers,
                     deadline=deadline,
                     max_rounds=DESIGN_MAX_ROUNDS,
@@ -422,6 +446,27 @@ def design_architecture(challenge: dict, _gated_client) -> dict:
                         f"[agent] candidate code didn't fully validate: "
                         f"{errors}"
                     )
+
+    # ── Scratchpad save ──────────────────────────────────────────────
+    # Persist any notes the LLM stashed via ``write_scratchpad`` before
+    # we spend the reserve window on packaging. The submit handler is
+    # exempt from circuit-breaker wrapping but still exposes the
+    # ``_state_holder`` attribute via the wrapped callable.
+    try:
+        state_holder = getattr(
+            handlers.get("submit", None), "_state_holder", None,
+        )
+        if state_holder is not None:
+            scratch_dir = scratch_dir or tempfile.mkdtemp()
+            history.save_state(scratch_dir, state_holder["state"])
+            try:
+                save_scratchpad(challenge, scratch_dir)  # noqa: F821 — injected
+            except NameError:
+                pass  # Outside the harness — nothing to upload.
+            except Exception as exc:
+                _log(f"[agent] scratchpad save failed: {exc}")
+    except Exception as exc:
+        _log(f"[agent] scratchpad finalize crashed: {exc}")
 
     # ── Phase 3: reserve / finalize ──────────────────────────────────
     elapsed = time.monotonic() - t_start
