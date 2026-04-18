@@ -339,13 +339,15 @@ class TestToolSchema:
     def test_required_tools_present(self):
         from agents.openai_sdk.tools import TOOLS
         names = {t["function"]["name"] for t in TOOLS}
-        # Full parity with the autonomous agent's tool surface.
+        # Full parity with the autonomous agent's tool surface, plus
+        # the scratchpad-directory file tools.
         assert {
             "analyze_task", "validate_code", "estimate_flops",
             "list_frontier", "get_frontier_member", "submit",
             "search_papers", "query_db", "estimate_layer_flops",
             "sketch_architecture", "trace_architecture",
             "check_output_shape", "read_scratchpad", "write_scratchpad",
+            "list_files", "read_file", "write_file", "search_files",
             "time_remaining",
         } == names
 
@@ -420,6 +422,128 @@ class TestToolHandlers:
             )
         assert excinfo.value.code == VALID_CODE
         assert excinfo.value.name == "m"
+
+
+class TestFileTools:
+    def test_write_then_read_roundtrip(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        write_result = handlers["write_file"](
+            name="design.md", content="# plan\nfoo",
+        )
+        assert "wrote design.md" in write_result
+        read_result = handlers["read_file"](name="design.md")
+        assert read_result == "# plan\nfoo"
+
+    def test_list_files_excludes_state_json(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        (tmp_path / "state.json").write_text("{}")
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["write_file"](name="notes.md", content="hi")
+        listed = json.loads(handlers["list_files"]())
+        names = [item["name"] for item in listed]
+        assert "notes.md" in names
+        assert "state.json" not in names
+
+    def test_list_files_empty(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        assert handlers["list_files"]() == "no files yet"
+
+    def test_read_missing_file(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        result = handlers["read_file"](name="nope.md")
+        assert "not found" in result
+
+    def test_rejects_path_separators(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        for bad in ("../escape.md", "sub/file.md", "/abs.md", "..", "."):
+            result = handlers["write_file"](name=bad, content="x")
+            assert result.startswith("error:"), f"expected reject for {bad!r}"
+
+    def test_rejects_reserved_name(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        result = handlers["write_file"](name="state.json", content="{}")
+        assert "reserved" in result
+
+    def test_enforces_size_cap(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers, FILE_MAX_BYTES
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        big = "x" * (FILE_MAX_BYTES + 1)
+        result = handlers["write_file"](name="big.md", content=big)
+        assert result.startswith("error:") and "max" in result
+
+    def test_unavailable_without_scratch_dir(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(), scratch_dir=None)
+        assert "unavailable" in handlers["list_files"]()
+        assert "unavailable" in handlers["read_file"](name="x.md")
+        assert "unavailable" in handlers["write_file"](
+            name="x.md", content="y",
+        )
+
+    def test_search_files_finds_matches(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["write_file"](
+            name="design.md",
+            content="# Plan\nUse TRANSFORMER backbone\nkeep it tiny",
+        )
+        handlers["write_file"](
+            name="notes.md", content="no hits here",
+        )
+        result = handlers["search_files"](query="transformer")
+        assert "[design.md]" in result
+        assert "transformer" in result.lower()
+        assert "[notes.md]" not in result
+
+    def test_search_files_no_match(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["write_file"](name="a.md", content="hello world")
+        result = handlers["search_files"](query="nonexistent")
+        assert "no matches" in result
+
+    def test_search_files_empty_query(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        result = handlers["search_files"](query="")
+        assert result.startswith("error:")
+
+    def test_overwrite_does_not_hit_count_limit(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["write_file"](name="a.md", content="one")
+        # Overwriting the same file should always succeed regardless
+        # of the file-count cap.
+        result = handlers["write_file"](name="a.md", content="two")
+        assert "wrote a.md" in result
+        assert handlers["read_file"](name="a.md") == "two"
 
 
 class TestCircuitBreaker:
