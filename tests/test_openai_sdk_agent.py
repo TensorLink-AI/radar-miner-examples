@@ -339,20 +339,15 @@ class TestToolSchema:
     def test_required_tools_present(self):
         from agents.openai_sdk.tools import TOOLS
         names = {t["function"]["name"] for t in TOOLS}
+        # Full parity with the autonomous agent's tool surface.
         assert {
             "analyze_task", "validate_code", "estimate_flops",
             "list_frontier", "get_frontier_member", "submit",
+            "search_papers", "query_db", "estimate_layer_flops",
+            "sketch_architecture", "trace_architecture",
+            "check_output_shape", "read_scratchpad", "write_scratchpad",
+            "time_remaining",
         } == names
-
-    def test_no_unwanted_tools_in_v1(self):
-        """v1 is intentionally minimal — these were excluded by spec."""
-        from agents.openai_sdk.tools import TOOLS
-        names = {t["function"]["name"] for t in TOOLS}
-        for excluded in (
-            "read_scratchpad", "save_scratchpad",
-            "search_papers", "query_db",
-        ):
-            assert excluded not in names
 
     def test_submit_requires_code_name_motivation(self):
         from agents.openai_sdk.tools import TOOLS
@@ -473,7 +468,7 @@ class TestDesignArchitecture:
 
         ch = _make_challenge(with_flops=False)
         ch["agent_seconds"] = 60
-        result = agent.design_architecture(ch, _gated_client=None)
+        result = agent.design_architecture(ch, gated_client=None)
         assert result["code"] == VALID_CODE
         assert result["name"] == "instant"
 
@@ -490,7 +485,7 @@ class TestDesignArchitecture:
 
         ch = _make_challenge()
         ch["agent_seconds"] = 60
-        result = agent.design_architecture(ch, _gated_client=None)
+        result = agent.design_architecture(ch, gated_client=None)
         assert "fallback" in result["name"]
         assert "build_model" in result["code"]
         assert "build_optimizer" in result["code"]
@@ -505,7 +500,7 @@ class TestDesignArchitecture:
 
         ch = _make_challenge()
         ch["agent_seconds"] = 60
-        result = agent.design_architecture(ch, _gated_client=None)
+        result = agent.design_architecture(ch, gated_client=None)
         # Fallback path → bucket-tagged template name
         assert "fallback" in result["name"]
         assert result["code"] != ""
@@ -526,7 +521,7 @@ class TestDesignArchitecture:
         ch = _make_challenge()
         ch["agent_seconds"] = 60
         # No llm_url key in challenge
-        result = agent.design_architecture(ch, _gated_client=None)
+        result = agent.design_architecture(ch, gated_client=None)
 
         assert "fallback" in result["name"]
         assert result["code"] != ""
@@ -554,7 +549,7 @@ class TestDesignArchitecture:
         ch = _make_challenge(with_flops=False)
         ch["agent_seconds"] = 60
         ch["llm_url"] = "http://from-challenge/llm"
-        result = agent.design_architecture(ch, _gated_client=None)
+        result = agent.design_architecture(ch, gated_client=None)
 
         assert result["name"] == "from-challenge"
         # OpenAI was built with the challenge-supplied URL.
