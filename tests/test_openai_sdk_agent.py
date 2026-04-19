@@ -569,6 +569,132 @@ class TestFileTools:
         assert handlers["read_file"](name="a.md") == "two"
 
 
+class TestScratchpadNotes:
+    """Covers the structured write_scratchpad / read_scratchpad contract.
+
+    ``write_scratchpad`` must route ``hypothesis`` / ``dead_end`` +
+    ``reason`` / ``observation`` into the matching notes section, still
+    honour the deprecated ``notes`` string for in-flight rounds, and
+    reject empty calls. ``read_scratchpad`` must render the structured
+    sections so the next round can see them.
+    """
+
+    def _handlers_with_state(self, state=None):
+        from agents.openai_sdk.tools import build_handlers
+        state = {} if state is None else state
+        handlers = build_handlers(_make_challenge(), state=state)
+        return handlers, state
+
+    def test_write_hypothesis_appends_to_section(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](hypothesis="try SSM backbone")
+        assert "hypothesis" in out
+        assert state["notes"]["open_hypotheses"] == ["try SSM backbone"]
+
+    def test_write_dead_end_with_reason_combines_them(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](
+            dead_end="plain MLP", reason="below FLOPs gate",
+        )
+        assert "dead_end" in out
+        entry = state["notes"]["dead_ends"][0]
+        assert "plain MLP" in entry
+        assert "below FLOPs gate" in entry
+
+    def test_write_dead_end_without_reason_still_stored(self):
+        handlers, state = self._handlers_with_state()
+        handlers["write_scratchpad"](dead_end="untried idea")
+        assert state["notes"]["dead_ends"] == ["untried idea"]
+
+    def test_write_observation_appends_to_section(self):
+        handlers, state = self._handlers_with_state()
+        handlers["write_scratchpad"](observation="output is (B, N, K)")
+        assert state["notes"]["task_observations"] == [
+            "output is (B, N, K)",
+        ]
+
+    def test_multiple_fields_in_one_call(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](
+            hypothesis="try attention",
+            dead_end="pure Linear", reason="underfits",
+            observation="input channels are fixed",
+        )
+        for tag in ("hypothesis", "dead_end", "observation"):
+            assert tag in out
+        assert state["notes"]["open_hypotheses"] == ["try attention"]
+        assert "underfits" in state["notes"]["dead_ends"][0]
+        assert state["notes"]["task_observations"] == [
+            "input channels are fixed",
+        ]
+
+    def test_deprecated_notes_field_still_accepted(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](notes="legacy free-form text")
+        assert "notes(deprecated)" in out or "deprecated" in out
+        assert state.get("agent_notes") == "legacy free-form text"
+
+    def test_empty_call_returns_error(self):
+        handlers, _ = self._handlers_with_state()
+        out = handlers["write_scratchpad"]()
+        assert out.startswith("error:")
+
+    def test_whitespace_only_values_return_error(self):
+        handlers, _ = self._handlers_with_state()
+        out = handlers["write_scratchpad"](
+            hypothesis="   ", dead_end="", observation="",
+        )
+        assert out.startswith("error:")
+
+    def test_cap_enforced_through_handler(self):
+        from core.history import NOTES_MAX_ENTRIES
+        handlers, state = self._handlers_with_state()
+        for i in range(NOTES_MAX_ENTRIES + 3):
+            handlers["write_scratchpad"](hypothesis=f"h{i}")
+        bucket = state["notes"]["open_hypotheses"]
+        assert len(bucket) == NOTES_MAX_ENTRIES
+        assert bucket[-1] == f"h{NOTES_MAX_ENTRIES + 2}"
+
+    def test_wrote_this_round_flag_set_after_success(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(), state={})
+        # state_holder is stashed on the submit wrapper
+        state_holder = handlers["submit"]._state_holder
+        assert state_holder["wrote_this_round"] is False
+        handlers["write_scratchpad"](observation="anything")
+        assert state_holder["wrote_this_round"] is True
+
+    def test_wrote_this_round_stays_false_on_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(), state={})
+        state_holder = handlers["submit"]._state_holder
+        handlers["write_scratchpad"]()  # empty — error path
+        assert state_holder["wrote_this_round"] is False
+
+    def test_read_scratchpad_empty_state(self):
+        handlers, _ = self._handlers_with_state()
+        out = handlers["read_scratchpad"]()
+        assert "first round" in out or "empty" in out
+
+    def test_read_scratchpad_renders_structured_notes(self):
+        handlers, _ = self._handlers_with_state()
+        handlers["write_scratchpad"](hypothesis="attn variant A")
+        handlers["write_scratchpad"](
+            dead_end="dense MLP", reason="overshoots FLOPs",
+        )
+        out = handlers["read_scratchpad"]()
+        assert "Open Hypotheses" in out
+        assert "attn variant A" in out
+        assert "Dead Ends" in out
+        assert "dense MLP" in out
+
+    def test_read_scratchpad_shows_legacy_notes_section(self):
+        handlers, _ = self._handlers_with_state()
+        handlers["write_scratchpad"](notes="legacy blob")
+        out = handlers["read_scratchpad"]()
+        assert "legacy blob" in out
+
+
 class TestCircuitBreaker:
     def test_trips_after_repeated_identical_errors(self):
         from agents.openai_sdk.tools import build_handlers

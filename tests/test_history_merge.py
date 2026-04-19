@@ -21,9 +21,13 @@ for _k in list(sys.modules.keys()):
         del sys.modules[_k]
 
 from core.history import (  # noqa: E402
+    NOTES_MAX_ENTRIES,
+    NOTES_SECTIONS,
     add_entry,
+    add_note,
     best_own_submission,
     format_history,
+    format_notes,
     merge_results_into_state,
 )
 
@@ -199,3 +203,117 @@ class TestBestOwnSubmission:
             {"name": "scored", "score": 0.42, "code_hash": 2},
         ]}
         assert best_own_submission(state)["name"] == "scored"
+
+
+class TestAddNote:
+    def test_sections_constant_matches_expectation(self):
+        # Locking in the three-section contract the prompt advertises.
+        assert set(NOTES_SECTIONS) == {
+            "open_hypotheses", "dead_ends", "task_observations",
+        }
+
+    def test_appends_to_hypothesis_section(self):
+        state: dict = {}
+        add_note(state, "open_hypotheses", "try depthwise-sep convs")
+        assert state["notes"]["open_hypotheses"] == [
+            "try depthwise-sep convs",
+        ]
+
+    def test_appends_to_dead_ends_section(self):
+        state: dict = {}
+        add_note(state, "dead_ends", "plain MLP — undersized")
+        assert state["notes"]["dead_ends"] == ["plain MLP — undersized"]
+
+    def test_appends_to_task_observations_section(self):
+        state: dict = {}
+        add_note(state, "task_observations", "output shape is (B, N, K)")
+        assert state["notes"]["task_observations"] == [
+            "output shape is (B, N, K)",
+        ]
+
+    def test_strips_whitespace(self):
+        state: dict = {}
+        add_note(state, "open_hypotheses", "  idea one  \n")
+        assert state["notes"]["open_hypotheses"] == ["idea one"]
+
+    def test_rejects_unknown_section(self):
+        import pytest
+        with pytest.raises(ValueError):
+            add_note({}, "bogus_section", "anything")
+
+    def test_empty_string_is_noop(self):
+        state: dict = {}
+        add_note(state, "open_hypotheses", "")
+        add_note(state, "open_hypotheses", "   ")
+        # add_note initialises the sections lazily; either empty dict or
+        # empty list is an acceptable "nothing was written" shape.
+        assert state.get("notes", {}).get("open_hypotheses", []) == []
+
+    def test_non_string_is_noop(self):
+        state: dict = {}
+        add_note(state, "open_hypotheses", None)  # type: ignore[arg-type]
+        add_note(state, "open_hypotheses", 42)    # type: ignore[arg-type]
+        assert state.get("notes", {}).get("open_hypotheses", []) == []
+
+    def test_cap_drops_oldest(self):
+        state: dict = {}
+        for i in range(NOTES_MAX_ENTRIES + 5):
+            add_note(state, "dead_ends", f"attempt_{i}")
+        bucket = state["notes"]["dead_ends"]
+        assert len(bucket) == NOTES_MAX_ENTRIES
+        # Oldest 5 got dropped; newest entry is attempt_{N+4}
+        assert bucket[0] == "attempt_5"
+        assert bucket[-1] == f"attempt_{NOTES_MAX_ENTRIES + 4}"
+
+    def test_cap_is_per_section(self):
+        state: dict = {}
+        for i in range(NOTES_MAX_ENTRIES):
+            add_note(state, "open_hypotheses", f"h{i}")
+        # Filling hypotheses to the cap must not evict anything from
+        # another section.
+        add_note(state, "dead_ends", "one dead end")
+        add_note(state, "task_observations", "one observation")
+        notes = state["notes"]
+        assert len(notes["open_hypotheses"]) == NOTES_MAX_ENTRIES
+        assert notes["dead_ends"] == ["one dead end"]
+        assert notes["task_observations"] == ["one observation"]
+
+
+class TestFormatNotes:
+    def test_empty_state_renders_empty_string(self):
+        assert format_notes({}) == ""
+        assert format_notes({"notes": {}}) == ""
+
+    def test_renders_all_three_sections(self):
+        state: dict = {}
+        add_note(state, "open_hypotheses", "hypothesis one")
+        add_note(state, "dead_ends", "dead end one")
+        add_note(state, "task_observations", "observation one")
+        out = format_notes(state)
+        assert "## Open Hypotheses" in out
+        assert "## Dead Ends" in out
+        assert "## Task Observations" in out
+        assert "- hypothesis one" in out
+        assert "- dead end one" in out
+        assert "- observation one" in out
+
+    def test_skips_empty_sections(self):
+        state: dict = {}
+        add_note(state, "dead_ends", "only this")
+        out = format_notes(state)
+        assert "## Dead Ends" in out
+        assert "Open Hypotheses" not in out
+        assert "Task Observations" not in out
+
+    def test_stable_section_ordering(self):
+        state: dict = {}
+        # Write in a different order than NOTES_SECTIONS to prove the
+        # render respects the canonical order, not insertion order.
+        add_note(state, "task_observations", "obs")
+        add_note(state, "open_hypotheses", "hyp")
+        add_note(state, "dead_ends", "dead")
+        out = format_notes(state)
+        hyp_idx = out.index("Open Hypotheses")
+        dead_idx = out.index("Dead Ends")
+        obs_idx = out.index("Task Observations")
+        assert hyp_idx < dead_idx < obs_idx

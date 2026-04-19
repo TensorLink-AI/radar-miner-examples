@@ -44,11 +44,17 @@ def build_system_prompt(challenge: dict, bucket: str | None = None) -> str:
         "iterate.\n"
         "  4. Call `submit` with the final code, a short name, and a "
         "motivation.\n\n"
-        "Persistent state: `read_scratchpad` / `write_scratchpad` hold a "
-        "single free-form notes string plus your submission history. For "
-        "structured notes (design.md, task-notes.md, etc.) use "
-        "`list_files`, `read_file`, and `write_file` — these persist "
-        "across rounds alongside the scratchpad."
+        "Persistent state: `read_scratchpad` returns your submission "
+        "history (now annotated with validator-reported scores when "
+        "available) and three structured note sections — "
+        "`open_hypotheses`, `dead_ends`, `task_observations`. Write to "
+        "those sections via `write_scratchpad` with ONE of: "
+        "`hypothesis`, `dead_end` + `reason`, or `observation`. Each "
+        "section is capped at 20 entries. You MUST write at least one "
+        "note before calling `submit` so future rounds learn from this "
+        "one. For longer structured notes (design.md, task-notes.md, "
+        "etc.) use `list_files`, `read_file`, and `write_file` — these "
+        "persist across rounds alongside the scratchpad."
     )
 
     parts.append(

@@ -30,7 +30,8 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    extract_flops_budget, format_history, get_history, load_state, save_state,
+    add_note, extract_flops_budget, format_history, format_notes,
+    get_history, load_state, save_state,
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
@@ -358,17 +359,50 @@ TOOLS: list[dict] = [
         "function": {
             "name": "write_scratchpad",
             "description": (
-                "Save notes to the persistent scratchpad for future "
-                "rounds. Use this to record what you learned, what "
-                "worked, and what to try next time."
+                "Record a structured note for future rounds. Pass ONE "
+                "of: `hypothesis` (something to test next), `dead_end` "
+                "+ `reason` (an approach that failed and why), or "
+                "`observation` (a task-agnostic fact learned). Each "
+                "section is capped at 20 entries (oldest is dropped). "
+                "You MUST write at least one note before calling "
+                "`submit`. The deprecated free-form `notes` field is "
+                "still accepted but prefer the structured fields."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "hypothesis": {
+                        "type": "string",
+                        "description": (
+                            "Appended to open_hypotheses. Example: "
+                            "'Try depthwise-sep convs for the same "
+                            "receptive field at lower FLOPs.'"
+                        ),
+                    },
+                    "dead_end": {
+                        "type": "string",
+                        "description": (
+                            "Short name of an approach that failed. "
+                            "Pair with `reason`."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the dead_end failed.",
+                    },
+                    "observation": {
+                        "type": "string",
+                        "description": (
+                            "A task-agnostic fact learned this round "
+                            "(e.g. 'output shape inferred as (B, N, K)'). "
+                            "Appended to task_observations."
+                        ),
+                    },
                     "notes": {
                         "type": "string",
                         "description": (
-                            "Free-form notes to save for future rounds."
+                            "(DEPRECATED) Free-form notes string. "
+                            "Prefer hypothesis / dead_end / observation."
                         ),
                     },
                 },
@@ -622,7 +656,13 @@ def build_handlers(
 
     if state is None:
         state = load_state(scratch_dir) if scratch_dir else {}
-    state_holder = {"state": state}
+    # ``wrote_this_round`` feeds the submit-time nag; ``submit_nag_count``
+    # makes the nag a one-shot so a determined LLM isn't blocked.
+    state_holder: dict = {
+        "state": state,
+        "wrote_this_round": False,
+        "submit_nag_count": 0,
+    }
 
     # Frontier fetched from the challenge dict only — the openai_sdk
     # agent has historically treated ``feasible_frontier`` as canonical
@@ -963,13 +1003,16 @@ def build_handlers(
     def _read_scratchpad(**_kwargs) -> str:
         state = state_holder["state"]
         history_entries = get_history(state)
-        notes = state.get("agent_notes", "")
+        legacy_notes = state.get("agent_notes", "")
         score_direction = (
             challenge.get("score_direction") or "minimize"
         )
         parts = []
-        if notes:
-            parts.append(f"## Saved Notes\n{notes}")
+        structured = format_notes(state)
+        if structured:
+            parts.append(structured)
+        if legacy_notes:
+            parts.append(f"## Free-form Notes (deprecated)\n{legacy_notes}")
         if history_entries:
             parts.append(
                 "## Submission History\n"
@@ -983,12 +1026,42 @@ def build_handlers(
             return "scratchpad is empty — this is your first round"
         return "\n\n".join(parts)
 
-    def _write_scratchpad(notes: str = "", **_kwargs) -> str:
+    def _write_scratchpad(hypothesis: str = "", dead_end: str = "",
+                          reason: str = "", observation: str = "",
+                          notes: str = "", **_kwargs) -> str:
         state = state_holder["state"]
-        if notes:
-            state["agent_notes"] = notes
+        wrote: list[str] = []
+        if hypothesis and hypothesis.strip():
+            add_note(state, "open_hypotheses", hypothesis)
+            wrote.append("hypothesis")
+        if dead_end and dead_end.strip():
+            combined = (
+                f"{dead_end.strip()} — {reason.strip()}"
+                if reason and reason.strip()
+                else dead_end.strip()
+            )
+            add_note(state, "dead_ends", combined)
+            wrote.append("dead_end")
+        if observation and observation.strip():
+            add_note(state, "task_observations", observation)
+            wrote.append("observation")
+        if notes and notes.strip():
+            # Deprecated path — still honored so in-flight rounds don't
+            # crash. Stash alongside the structured notes and warn.
+            state["agent_notes"] = notes.strip()
+            wrote.append("notes(deprecated)")
+            _log(
+                "[tools] write_scratchpad(notes=...) is deprecated — use "
+                "hypothesis/dead_end/observation instead"
+            )
+        if not wrote:
+            return (
+                "error: nothing to write — pass at least one of "
+                "hypothesis, dead_end (+reason), observation, or notes"
+            )
         state_holder["state"] = state
-        return "scratchpad updated"
+        state_holder["wrote_this_round"] = True
+        return f"scratchpad updated ({', '.join(wrote)})"
 
     # ── Files (scratchpad directory) ─────────────────────────────
 

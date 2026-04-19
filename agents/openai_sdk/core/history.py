@@ -204,6 +204,55 @@ def add_entry(state: dict, *, name: str, code: str, motivation: str,
     return state
 
 
+NOTES_MAX_ENTRIES = 20
+NOTES_SECTIONS = ("open_hypotheses", "dead_ends", "task_observations")
+
+
+def _notes(state: dict) -> dict:
+    """Return the ``notes`` sub-dict, creating it (and sections) on demand."""
+    notes = state.setdefault("notes", {})
+    for section in NOTES_SECTIONS:
+        notes.setdefault(section, [])
+    return notes
+
+
+def add_note(state: dict, section: str, entry: str) -> dict:
+    """Append ``entry`` to ``state['notes'][section]``, capping at
+    ``NOTES_MAX_ENTRIES`` by dropping the oldest.
+    """
+    if section not in NOTES_SECTIONS:
+        raise ValueError(
+            f"unknown notes section {section!r}; "
+            f"expected one of {NOTES_SECTIONS}"
+        )
+    if not isinstance(entry, str) or not entry.strip():
+        return state
+    notes = _notes(state)
+    bucket = notes[section]
+    bucket.append(entry.strip())
+    if len(bucket) > NOTES_MAX_ENTRIES:
+        del bucket[: len(bucket) - NOTES_MAX_ENTRIES]
+    return state
+
+
+def format_notes(state: dict) -> str:
+    """Render the three notes sections as a plain-text summary."""
+    notes = state.get("notes") or {}
+    titles = {
+        "open_hypotheses": "Open Hypotheses",
+        "dead_ends": "Dead Ends",
+        "task_observations": "Task Observations",
+    }
+    parts: list[str] = []
+    for section in NOTES_SECTIONS:
+        items = notes.get(section) or []
+        if not items:
+            continue
+        rendered = "\n".join(f"- {item}" for item in items)
+        parts.append(f"## {titles[section]}\n{rendered}")
+    return "\n\n".join(parts)
+
+
 def load_state(scratch_dir: str) -> dict:
     """Load state dict from scratch_dir/state.json."""
     path = os.path.join(scratch_dir, "state.json")
