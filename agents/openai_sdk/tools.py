@@ -1359,6 +1359,22 @@ def build_handlers(
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
                 **_kwargs) -> str:
+        # One-shot nag: if the LLM hasn't written any scratchpad note
+        # this round, ask once before we ship. On the second submit we
+        # accept even without a note — a determined LLM isn't blocked,
+        # we just won't have fresh notes for the next round.
+        if (not state_holder.get("wrote_this_round")
+                and state_holder.get("submit_nag_count", 0) == 0):
+            state_holder["submit_nag_count"] = 1
+            return (
+                "error: please write at least one note via "
+                "`write_scratchpad` before submitting — pass one of "
+                "`hypothesis`, `dead_end` + `reason`, or "
+                "`observation`. Future rounds need your observations "
+                "from this one. This is a one-time reminder; if you "
+                "call `submit` again without writing, the submission "
+                "will go through."
+            )
         raise SubmitSignal(code=code, name=name, motivation=motivation)
 
     def _time_remaining(**_kwargs) -> str:

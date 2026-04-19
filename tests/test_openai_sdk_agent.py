@@ -437,9 +437,11 @@ class TestToolHandlers:
         data = json.loads(result)
         assert data["code"] == "x=1"
 
-    def test_submit_raises_signal(self):
+    def test_submit_raises_signal_after_scratchpad_write(self):
+        """Happy path — note is written, submit raises SubmitSignal."""
         from agents.openai_sdk.tools import SubmitSignal, build_handlers
         handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="tried variant A")
         with pytest.raises(SubmitSignal) as excinfo:
             handlers["submit"](
                 code=VALID_CODE, name="m", motivation="testing",
@@ -787,6 +789,64 @@ class TestScratchpadNotes:
         handlers["write_scratchpad"](notes="legacy blob")
         out = handlers["read_scratchpad"]()
         assert "legacy blob" in out
+
+
+class TestSubmitNag:
+    """Step 6: mandatory write_scratchpad before submit, enforced as a
+    one-shot polite nag. First submit without a note returns an error
+    string; second submit proceeds even without a note."""
+
+    def test_first_submit_without_note_returns_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["submit"](
+            code=VALID_CODE, name="m", motivation="testing",
+        )
+        assert result.startswith("error:")
+        assert "write_scratchpad" in result
+
+    def test_second_submit_accepts_even_without_note(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        # First call: nag (returns error string).
+        handlers["submit"](
+            code=VALID_CODE, name="m", motivation="nag cycle",
+        )
+        # Second call: should raise SubmitSignal even though no note
+        # was written — determined LLMs aren't blocked.
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="after nag",
+            )
+
+    def test_submit_after_write_skips_nag(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="try idea X")
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="with note",
+            )
+
+    def test_submit_after_deprecated_notes_write_also_skips_nag(self):
+        """The deprecated `notes=...` path still flips wrote_this_round
+        so in-flight rounds don't get stuck."""
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](notes="legacy text")
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="legacy",
+            )
+
+    def test_submit_nag_count_bumped_once(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        state_holder = handlers["submit"]._state_holder
+        handlers["submit"](
+            code=VALID_CODE, name="m", motivation="first",
+        )
+        assert state_holder["submit_nag_count"] == 1
 
 
 class TestCallCounts:
