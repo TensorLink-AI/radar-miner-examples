@@ -54,17 +54,127 @@ def get_bucket_history(state: dict, bucket: str) -> list[dict]:
     return [e for e in get_history(state) if e.get("bucket") == bucket]
 
 
-def format_history(entries: list[dict], max_entries: int = 10) -> str:
-    """Format history entries for inclusion in prompts."""
+def format_history(entries: list[dict], max_entries: int = 10,
+                   score_direction: str = "minimize") -> str:
+    """Format history entries for inclusion in prompts.
+
+    Scored entries come first (best per ``score_direction``), unscored
+    entries follow (newest first), marked ``(pending)``. Output is capped
+    at ``max_entries`` lines.
+    """
     if not entries:
         return "No previous submissions."
+
+    def _has_score(e: dict) -> bool:
+        return isinstance(e.get("score"), (int, float))
+
+    scored = [e for e in entries if _has_score(e)]
+    pending = [e for e in entries if not _has_score(e)]
+    reverse = score_direction == "maximize"
+    scored.sort(key=lambda e: e["score"], reverse=reverse)
+    pending.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+    ordered = scored + pending
+
     lines: list[str] = []
-    for e in entries[-max_entries:]:
+    for e in ordered[:max_entries]:
+        bits = [
+            f"bucket={e.get('bucket', '?')}",
+            f"strategy={e.get('strategy', '?')}",
+        ]
+        if _has_score(e):
+            score_bit = f"score={e['score']:.4g}"
+            rank = e.get("rank")
+            total = e.get("rank_total")
+            if isinstance(rank, int):
+                score_bit += (
+                    f", rank={rank}/{total}" if isinstance(total, int)
+                    else f", rank={rank}"
+                )
+            bits.append(score_bit)
+            err = e.get("error")
+            if err:
+                bits.append(f"error={str(err)[:40]!r}")
+        else:
+            bits.append("(pending)")
         lines.append(
-            f"- {e.get('name', '?')} (bucket={e.get('bucket', '?')}, "
-            f"strategy={e.get('strategy', '?')}): {e.get('motivation', '')}"
+            f"- {e.get('name', '?')} ({', '.join(bits)}): "
+            f"{e.get('motivation', '')}"
         )
     return "\n".join(lines)
+
+
+def merge_results_into_state(state: dict,
+                             previous_results: list[dict] | None) -> dict:
+    """Merge validator-supplied round results onto matching history entries.
+
+    Expected shape (harness-provided, optional)::
+
+        challenge["previous_results"] = [
+            {"round_id": str, "code_hash": int, "score": float | None,
+             "rank": int | None, "error": str | None},
+            ...
+        ]
+
+    Join key is ``code_hash``. Any entries in ``state["history"]`` whose
+    ``code_hash`` matches get ``score``, ``rank``, ``rank_total``,
+    ``error``, and ``scored_round_id`` written onto them. Duplicate
+    hashes all receive the update. Unknown hashes are ignored. Returns
+    the mutated state for chaining.
+    """
+    if not previous_results:
+        return state
+    history = state.setdefault("history", [])
+    index: dict = {}
+    for entry in history:
+        h = entry.get("code_hash")
+        if h is not None:
+            index.setdefault(h, []).append(entry)
+    for r in previous_results:
+        if not isinstance(r, dict):
+            continue
+        h = r.get("code_hash")
+        if h is None:
+            continue
+        targets = index.get(h) or []
+        if not targets:
+            continue
+        for entry in targets:
+            score = r.get("score")
+            if isinstance(score, (int, float)):
+                entry["score"] = float(score)
+            rank = r.get("rank")
+            if isinstance(rank, int):
+                entry["rank"] = rank
+            total = r.get("rank_total")
+            if isinstance(total, int):
+                entry["rank_total"] = total
+            err = r.get("error")
+            if err:
+                entry["error"] = str(err)
+            rid = r.get("round_id")
+            if rid is not None:
+                entry["scored_round_id"] = rid
+    return state
+
+
+def best_own_submission(state: dict,
+                        score_direction: str = "minimize") -> dict | None:
+    """Return the best-scored history entry, or ``None`` if none are scored.
+
+    ``score_direction`` is ``"minimize"`` (lower is better) or ``"maximize"``.
+    Ties break by most-recent timestamp.
+    """
+    scored = [
+        e for e in state.get("history", [])
+        if isinstance(e.get("score"), (int, float))
+    ]
+    if not scored:
+        return None
+    if score_direction == "maximize":
+        scored.sort(key=lambda e: (-e["score"], -e.get("timestamp", 0)))
+    else:
+        scored.sort(key=lambda e: (e["score"], -e.get("timestamp", 0)))
+    return scored[0]
 
 
 def add_entry(state: dict, *, name: str, code: str, motivation: str,
@@ -92,6 +202,55 @@ def add_entry(state: dict, *, name: str, code: str, motivation: str,
         state["history"] = state["history"][-50:]
 
     return state
+
+
+NOTES_MAX_ENTRIES = 20
+NOTES_SECTIONS = ("open_hypotheses", "dead_ends", "task_observations")
+
+
+def _notes(state: dict) -> dict:
+    """Return the ``notes`` sub-dict, creating it (and sections) on demand."""
+    notes = state.setdefault("notes", {})
+    for section in NOTES_SECTIONS:
+        notes.setdefault(section, [])
+    return notes
+
+
+def add_note(state: dict, section: str, entry: str) -> dict:
+    """Append ``entry`` to ``state['notes'][section]``, capping at
+    ``NOTES_MAX_ENTRIES`` by dropping the oldest.
+    """
+    if section not in NOTES_SECTIONS:
+        raise ValueError(
+            f"unknown notes section {section!r}; "
+            f"expected one of {NOTES_SECTIONS}"
+        )
+    if not isinstance(entry, str) or not entry.strip():
+        return state
+    notes = _notes(state)
+    bucket = notes[section]
+    bucket.append(entry.strip())
+    if len(bucket) > NOTES_MAX_ENTRIES:
+        del bucket[: len(bucket) - NOTES_MAX_ENTRIES]
+    return state
+
+
+def format_notes(state: dict) -> str:
+    """Render the three notes sections as a plain-text summary."""
+    notes = state.get("notes") or {}
+    titles = {
+        "open_hypotheses": "Open Hypotheses",
+        "dead_ends": "Dead Ends",
+        "task_observations": "Task Observations",
+    }
+    parts: list[str] = []
+    for section in NOTES_SECTIONS:
+        items = notes.get(section) or []
+        if not items:
+            continue
+        rendered = "\n".join(f"- {item}" for item in items)
+        parts.append(f"## {titles[section]}\n{rendered}")
+    return "\n\n".join(parts)
 
 
 def load_state(scratch_dir: str) -> dict:

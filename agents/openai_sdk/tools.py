@@ -30,10 +30,12 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    extract_flops_budget, format_history, get_history, load_state, save_state,
+    add_note, extract_flops_budget, format_history, format_notes,
+    get_history, load_state, save_state,
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
+from core.sizing import MAX_PROBES, sweep_sizes
 from core.trace import format_trace, trace_architecture
 from core.validation import validate_code
 
@@ -257,6 +259,58 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "size_to_flops",
+            "description": (
+                "Sweep a scalar size knob to land on a target FLOPs "
+                "count. Provide code containing a `{{SIZE}}` "
+                "placeholder (any integer knob — hidden_dim, num_layers, "
+                "channels, etc.) and the range to search. Runs up to "
+                f"{MAX_PROBES} measurements using geometric-probe-then-"
+                "refine and returns the MEASURED (size, flops) pair "
+                "closest to the target. Use this BEFORE calling "
+                "validate_code — it saves FLOPs-bound iterations."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code_template": {
+                        "type": "string",
+                        "description": (
+                            "Python source containing `build_model` "
+                            "with a `{{SIZE}}` placeholder. The "
+                            "placeholder is substituted with each "
+                            "probe's integer. Example: "
+                            "`hidden = {{SIZE}}` inside build_model."
+                        ),
+                    },
+                    "size_min": {
+                        "type": "integer",
+                        "description": (
+                            "Smallest size to probe (must be > 0)."
+                        ),
+                    },
+                    "size_max": {
+                        "type": "integer",
+                        "description": (
+                            "Largest size to probe (must be >= size_min)."
+                        ),
+                    },
+                    "target_flops": {
+                        "type": "integer",
+                        "description": (
+                            "Target FLOPs count. Defaults to 60% of the "
+                            "challenge's max_flops_equivalent when 0 or "
+                            "omitted."
+                        ),
+                    },
+                },
+                "required": ["code_template", "size_min", "size_max"],
+            },
+        },
+    },
     # ── Validation ───────────────────────────────────────────────
     {
         "type": "function",
@@ -358,17 +412,50 @@ TOOLS: list[dict] = [
         "function": {
             "name": "write_scratchpad",
             "description": (
-                "Save notes to the persistent scratchpad for future "
-                "rounds. Use this to record what you learned, what "
-                "worked, and what to try next time."
+                "Record a structured note for future rounds. Pass ONE "
+                "of: `hypothesis` (something to test next), `dead_end` "
+                "+ `reason` (an approach that failed and why), or "
+                "`observation` (a task-agnostic fact learned). Each "
+                "section is capped at 20 entries (oldest is dropped). "
+                "You MUST write at least one note before calling "
+                "`submit`. The deprecated free-form `notes` field is "
+                "still accepted but prefer the structured fields."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "hypothesis": {
+                        "type": "string",
+                        "description": (
+                            "Appended to open_hypotheses. Example: "
+                            "'Try depthwise-sep convs for the same "
+                            "receptive field at lower FLOPs.'"
+                        ),
+                    },
+                    "dead_end": {
+                        "type": "string",
+                        "description": (
+                            "Short name of an approach that failed. "
+                            "Pair with `reason`."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why the dead_end failed.",
+                    },
+                    "observation": {
+                        "type": "string",
+                        "description": (
+                            "A task-agnostic fact learned this round "
+                            "(e.g. 'output shape inferred as (B, N, K)'). "
+                            "Appended to task_observations."
+                        ),
+                    },
                     "notes": {
                         "type": "string",
                         "description": (
-                            "Free-form notes to save for future rounds."
+                            "(DEPRECATED) Free-form notes string. "
+                            "Prefer hypothesis / dead_end / observation."
                         ),
                     },
                 },
@@ -596,6 +683,7 @@ def build_handlers(
     client=None,
     scratch_dir: str | None = None,
     deadline: float | None = None,
+    state: dict | None = None,
 ) -> dict:
     """Build a ``{name: callable(**kwargs) -> str}`` mapping for the round.
 
@@ -603,7 +691,9 @@ def build_handlers(
     ``get_json``/``post_json``) used for paper search and DB queries.
     ``scratch_dir`` is a filesystem path where scratchpad state lives.
     ``deadline`` is the monotonic wall-clock the round must finish by;
-    ``time_remaining`` reports against it.
+    ``time_remaining`` reports against it. ``state``, when provided,
+    overrides the on-disk load — used by callers that need to merge
+    round-result feedback before the handlers see the state.
 
     Any of these may be ``None`` — the affected tools return an
     "unavailable" string instead of raising. Handlers are wrapped with
@@ -611,14 +701,24 @@ def build_handlers(
     same broken tool over and over.
     """
     breaker = _make_circuit_breaker()
+    # Per-round telemetry — every wrapped handler bumps this. The agent
+    # reads it at end-of-round to log a usage summary. Handlers see it
+    # via closure only; nothing inside a handler should mutate it.
+    _call_counts: dict[str, int] = {}
 
     db_url = (challenge.get("db_url") or "").rstrip("/")
     desearch_url = (challenge.get("desearch_url") or "").rstrip("/")
     flops_min, flops_max = extract_flops_budget(challenge)
     target_flops = int(flops_max * 0.6) if flops_max else 0
 
-    state_holder = {
-        "state": load_state(scratch_dir) if scratch_dir else {}
+    if state is None:
+        state = load_state(scratch_dir) if scratch_dir else {}
+    # ``wrote_this_round`` feeds the submit-time nag; ``submit_nag_count``
+    # makes the nag a one-shot so a determined LLM isn't blocked.
+    state_holder: dict = {
+        "state": state,
+        "wrote_this_round": False,
+        "submit_nag_count": 0,
     }
 
     # Frontier fetched from the challenge dict only — the openai_sdk
@@ -876,6 +976,94 @@ def build_handlers(
             return f"error: {err}"
         return f"estimated_flops: {flops:,}"
 
+    def _size_to_flops(code_template: str = "", size_min: int = 0,
+                       size_max: int = 0, target_flops: int = 0,
+                       **_kwargs) -> str:
+        if not code_template or not code_template.strip():
+            return "error: empty code_template"
+        if "{{SIZE}}" not in code_template:
+            return (
+                "error: code_template must contain a `{{SIZE}}` "
+                "placeholder (the integer knob to sweep)"
+            )
+        try:
+            size_min = int(size_min)
+            size_max = int(size_max)
+            target_flops = int(target_flops or 0)
+        except (TypeError, ValueError):
+            return "error: size_min/size_max/target_flops must be integers"
+        if size_min <= 0:
+            return f"error: size_min must be > 0 (got {size_min})"
+        if size_max < size_min:
+            return (
+                f"error: size_max ({size_max}) < size_min ({size_min})"
+            )
+        if target_flops <= 0:
+            target_flops = int(flops_max * 0.6) if flops_max else 0
+        if target_flops <= 0:
+            return (
+                "error: no target_flops supplied and the challenge has "
+                "no FLOPs budget to default from"
+            )
+
+        def _probe(size: int) -> int | None:
+            code = code_template.replace("{{SIZE}}", str(size))
+            flops, err = estimate_flops(code, challenge)
+            if err or flops is None:
+                return None
+            return int(flops)
+
+        result = sweep_sizes(
+            _probe, size_min, size_max, target_flops,
+        )
+        probes = result["probes"]
+        failures = result["failures"]
+        best = result["best"]
+        n_probes = result["n_probes"]
+
+        lines = [
+            f"target_flops: {target_flops:,}",
+            f"search_range: [{size_min:,}, {size_max:,}]",
+            f"probes: {n_probes} ({len(probes)} ok, {len(failures)} failed)",
+        ]
+        if best is None:
+            lines.append(
+                "best: NONE — every probe failed. Check that "
+                "code_template defines build_model and the SIZE knob is "
+                "wired to a real shape dimension."
+            )
+            if failures:
+                lines.append(
+                    f"failing sizes (sample): {failures[:5]}"
+                )
+        else:
+            size, flops = best
+            pct = 100.0 * flops / target_flops
+            lines.append(
+                f"best: size={size:,} flops={flops:,} "
+                f"({pct:.1f}% of target)"
+            )
+            if flops_min and flops_max:
+                gate_min = int(flops_min * 0.9)
+                gate_max = int(flops_max * 1.1)
+                if gate_min <= flops <= gate_max:
+                    lines.append(
+                        f"status: within hard gate "
+                        f"[{gate_min:,}, {gate_max:,}]"
+                    )
+                else:
+                    lines.append(
+                        f"status: OUTSIDE hard gate "
+                        f"[{gate_min:,}, {gate_max:,}] — widen the "
+                        "search range or change the knob"
+                    )
+            if len(probes) > 1:
+                sample = ", ".join(
+                    f"{s}:{f:,}" for s, f in probes[:6]
+                )
+                lines.append(f"probe_samples: {sample}")
+        return "\n".join(lines)
+
     def _list_frontier(**_kwargs) -> str:
         frontier = _frontier()
         if not frontier:
@@ -960,25 +1148,65 @@ def build_handlers(
     def _read_scratchpad(**_kwargs) -> str:
         state = state_holder["state"]
         history_entries = get_history(state)
-        notes = state.get("agent_notes", "")
+        legacy_notes = state.get("agent_notes", "")
+        score_direction = (
+            challenge.get("score_direction") or "minimize"
+        )
         parts = []
-        if notes:
-            parts.append(f"## Saved Notes\n{notes}")
+        structured = format_notes(state)
+        if structured:
+            parts.append(structured)
+        if legacy_notes:
+            parts.append(f"## Free-form Notes (deprecated)\n{legacy_notes}")
         if history_entries:
             parts.append(
                 "## Submission History\n"
-                + format_history(history_entries, max_entries=10)
+                + format_history(
+                    history_entries,
+                    max_entries=10,
+                    score_direction=score_direction,
+                )
             )
         if not parts:
             return "scratchpad is empty — this is your first round"
         return "\n\n".join(parts)
 
-    def _write_scratchpad(notes: str = "", **_kwargs) -> str:
+    def _write_scratchpad(hypothesis: str = "", dead_end: str = "",
+                          reason: str = "", observation: str = "",
+                          notes: str = "", **_kwargs) -> str:
         state = state_holder["state"]
-        if notes:
-            state["agent_notes"] = notes
+        wrote: list[str] = []
+        if hypothesis and hypothesis.strip():
+            add_note(state, "open_hypotheses", hypothesis)
+            wrote.append("hypothesis")
+        if dead_end and dead_end.strip():
+            combined = (
+                f"{dead_end.strip()} — {reason.strip()}"
+                if reason and reason.strip()
+                else dead_end.strip()
+            )
+            add_note(state, "dead_ends", combined)
+            wrote.append("dead_end")
+        if observation and observation.strip():
+            add_note(state, "task_observations", observation)
+            wrote.append("observation")
+        if notes and notes.strip():
+            # Deprecated path — still honored so in-flight rounds don't
+            # crash. Stash alongside the structured notes and warn.
+            state["agent_notes"] = notes.strip()
+            wrote.append("notes(deprecated)")
+            _log(
+                "[tools] write_scratchpad(notes=...) is deprecated — use "
+                "hypothesis/dead_end/observation instead"
+            )
+        if not wrote:
+            return (
+                "error: nothing to write — pass at least one of "
+                "hypothesis, dead_end (+reason), observation, or notes"
+            )
         state_holder["state"] = state
-        return "scratchpad updated"
+        state_holder["wrote_this_round"] = True
+        return f"scratchpad updated ({', '.join(wrote)})"
 
     # ── Files (scratchpad directory) ─────────────────────────────
 
@@ -1131,6 +1359,22 @@ def build_handlers(
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
                 **_kwargs) -> str:
+        # One-shot nag: if the LLM hasn't written any scratchpad note
+        # this round, ask once before we ship. On the second submit we
+        # accept even without a note — a determined LLM isn't blocked,
+        # we just won't have fresh notes for the next round.
+        if (not state_holder.get("wrote_this_round")
+                and state_holder.get("submit_nag_count", 0) == 0):
+            state_holder["submit_nag_count"] = 1
+            return (
+                "error: please write at least one note via "
+                "`write_scratchpad` before submitting — pass one of "
+                "`hypothesis`, `dead_end` + `reason`, or "
+                "`observation`. Future rounds need your observations "
+                "from this one. This is a one-time reminder; if you "
+                "call `submit` again without writing, the submission "
+                "will go through."
+            )
         raise SubmitSignal(code=code, name=name, motivation=motivation)
 
     def _time_remaining(**_kwargs) -> str:
@@ -1153,6 +1397,7 @@ def build_handlers(
         "estimate_layer_flops": _estimate_layer_flops,
         "sketch_architecture": _sketch_architecture,
         "estimate_flops": _estimate_flops,
+        "size_to_flops": _size_to_flops,
         "list_frontier": _list_frontier,
         "get_frontier_member": _get_frontier_member,
         "trace_architecture": _trace_architecture,
@@ -1170,6 +1415,7 @@ def build_handlers(
 
     def _wrap(name, fn):
         def wrapped(**kwargs):
+            _call_counts[name] = _call_counts.get(name, 0) + 1
             # SubmitSignal must propagate untouched — do not pass it
             # through the breaker.
             try:
@@ -1181,9 +1427,11 @@ def build_handlers(
             return breaker(name, str(result))
 
         # Expose state_holder on the submit handler so the agent can
-        # persist scratchpad notes after the loop.
+        # persist scratchpad notes after the loop. Expose the per-round
+        # counter the same way so the agent can log a usage summary.
         if name == "submit":
             wrapped._state_holder = state_holder  # type: ignore[attr-defined]
+            wrapped._call_counts = _call_counts   # type: ignore[attr-defined]
         return wrapped
 
     return {name: _wrap(name, fn) for name, fn in raw.items()}

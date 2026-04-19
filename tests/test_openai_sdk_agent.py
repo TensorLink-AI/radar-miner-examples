@@ -47,12 +47,35 @@ def _reset_llm_client_cache() -> None:
     llm_client._cached_config = None
 
 
+def _reset_core_resolution() -> None:
+    """Drop any cached ``core.*`` (and the openai_sdk submodules that
+    captured it) so the next ``from agents.openai_sdk import agent``
+    re-resolves ``from core import history`` against the openai_sdk
+    package — not whatever autonomous-core another test left behind in
+    ``sys.modules``. ``agents.openai_sdk.llm_client`` is preserved so
+    ``@pytest.fixture mock_openai``'s ``patch(...)`` target keeps its
+    identity across the fixture/test boundary.
+    """
+    for _k in list(sys.modules.keys()):
+        if _k == "core" or _k.startswith("core."):
+            del sys.modules[_k]
+        if _k == "tools" or _k.startswith("tools."):
+            del sys.modules[_k]
+        if _k in (
+            "agents.openai_sdk.agent",
+            "agents.openai_sdk.prompts",
+            "agents.openai_sdk.tools",
+        ):
+            del sys.modules[_k]
+
+
 # ── Fixtures ──────────────────────────────────────────────────────
 
 @pytest.fixture
 def mock_openai(monkeypatch):
     """Patch the ``OpenAI`` class inside ``llm_client`` and reset the
     singleton cache so each test gets a clean stub."""
+    _reset_core_resolution()
     _reset_llm_client_cache()
     monkeypatch.setenv("LLM_URL", "http://test/llm")
     monkeypatch.setenv("AGENT_TOKEN", "test-token")
@@ -343,6 +366,7 @@ class TestToolSchema:
         # the scratchpad-directory file tools.
         assert {
             "analyze_task", "validate_code", "estimate_flops",
+            "size_to_flops",
             "list_frontier", "get_frontier_member", "submit",
             "search_papers", "query_db", "estimate_layer_flops",
             "sketch_architecture", "trace_architecture",
@@ -413,9 +437,11 @@ class TestToolHandlers:
         data = json.loads(result)
         assert data["code"] == "x=1"
 
-    def test_submit_raises_signal(self):
+    def test_submit_raises_signal_after_scratchpad_write(self):
+        """Happy path — note is written, submit raises SubmitSignal."""
         from agents.openai_sdk.tools import SubmitSignal, build_handlers
         handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="tried variant A")
         with pytest.raises(SubmitSignal) as excinfo:
             handlers["submit"](
                 code=VALID_CODE, name="m", motivation="testing",
@@ -544,6 +570,311 @@ class TestFileTools:
         result = handlers["write_file"](name="a.md", content="two")
         assert "wrote a.md" in result
         assert handlers["read_file"](name="a.md") == "two"
+
+
+SIZED_CODE_TEMPLATE = '''\
+import torch
+import torch.nn as nn
+
+class M(nn.Module):
+    def __init__(self, context_len, prediction_len, num_variates, n_q, h):
+        super().__init__()
+        self.pred = prediction_len
+        self.nv = num_variates
+        self.nq = n_q
+        self.enc = nn.Linear(context_len, h)
+        self.dec = nn.Linear(h, prediction_len * n_q)
+    def forward(self, x):
+        b, L, V = x.shape
+        h = x.transpose(1, 2)
+        h = self.enc(h)
+        h = self.dec(h)
+        return h.view(b, V, self.pred, self.nq).permute(0, 2, 1, 3)
+
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return M(context_len, prediction_len, num_variates, len(quantiles), {{SIZE}})
+
+def build_optimizer(model):
+    return torch.optim.Adam(model.parameters(), lr=1e-3)
+'''
+
+
+class TestSizeToFlops:
+    def test_missing_placeholder_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="def build_model(**kw): pass",
+            size_min=1, size_max=100,
+        )
+        assert "SIZE" in result and "error" in result.lower()
+
+    def test_empty_template_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="", size_min=1, size_max=100,
+        )
+        assert result.startswith("error:")
+
+    def test_invalid_range_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="# {{SIZE}}", size_min=100, size_max=10,
+        )
+        assert "error" in result.lower()
+
+    def test_zero_size_min_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="# {{SIZE}}", size_min=0, size_max=100,
+        )
+        assert "error" in result.lower()
+
+    def test_no_target_and_no_budget_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        # Challenge without FLOPs budget and no target_flops passed
+        ch = _make_challenge(with_flops=False)
+        handlers = build_handlers(ch)
+        result = handlers["size_to_flops"](
+            code_template="# {{SIZE}}", size_min=1, size_max=100,
+        )
+        assert "error" in result.lower()
+        assert "target" in result.lower() or "budget" in result.lower()
+
+    def test_happy_path_finds_best(self):
+        """End-to-end: sweep a real linear build_model and find a size
+        whose FLOPs are near the target. Kept small (size range 8..64)
+        so it runs fast inside CI."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        # target_flops defaults to 60% of max (=1.2M). For the template
+        # above, tiny hidden sizes (8..64) give ~50K..400K FLOPs which
+        # is well below target — so "best" is the highest size probed.
+        result = handlers["size_to_flops"](
+            code_template=SIZED_CODE_TEMPLATE,
+            size_min=8, size_max=64,
+            target_flops=200_000,
+        )
+        assert "best:" in result
+        assert "size=" in result
+        assert "flops=" in result
+        # Should mention it did some probes
+        assert "probes:" in result
+
+
+class TestScratchpadNotes:
+    """Covers the structured write_scratchpad / read_scratchpad contract.
+
+    ``write_scratchpad`` must route ``hypothesis`` / ``dead_end`` +
+    ``reason`` / ``observation`` into the matching notes section, still
+    honour the deprecated ``notes`` string for in-flight rounds, and
+    reject empty calls. ``read_scratchpad`` must render the structured
+    sections so the next round can see them.
+    """
+
+    def _handlers_with_state(self, state=None):
+        from agents.openai_sdk.tools import build_handlers
+        state = {} if state is None else state
+        handlers = build_handlers(_make_challenge(), state=state)
+        return handlers, state
+
+    def test_write_hypothesis_appends_to_section(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](hypothesis="try SSM backbone")
+        assert "hypothesis" in out
+        assert state["notes"]["open_hypotheses"] == ["try SSM backbone"]
+
+    def test_write_dead_end_with_reason_combines_them(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](
+            dead_end="plain MLP", reason="below FLOPs gate",
+        )
+        assert "dead_end" in out
+        entry = state["notes"]["dead_ends"][0]
+        assert "plain MLP" in entry
+        assert "below FLOPs gate" in entry
+
+    def test_write_dead_end_without_reason_still_stored(self):
+        handlers, state = self._handlers_with_state()
+        handlers["write_scratchpad"](dead_end="untried idea")
+        assert state["notes"]["dead_ends"] == ["untried idea"]
+
+    def test_write_observation_appends_to_section(self):
+        handlers, state = self._handlers_with_state()
+        handlers["write_scratchpad"](observation="output is (B, N, K)")
+        assert state["notes"]["task_observations"] == [
+            "output is (B, N, K)",
+        ]
+
+    def test_multiple_fields_in_one_call(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](
+            hypothesis="try attention",
+            dead_end="pure Linear", reason="underfits",
+            observation="input channels are fixed",
+        )
+        for tag in ("hypothesis", "dead_end", "observation"):
+            assert tag in out
+        assert state["notes"]["open_hypotheses"] == ["try attention"]
+        assert "underfits" in state["notes"]["dead_ends"][0]
+        assert state["notes"]["task_observations"] == [
+            "input channels are fixed",
+        ]
+
+    def test_deprecated_notes_field_still_accepted(self):
+        handlers, state = self._handlers_with_state()
+        out = handlers["write_scratchpad"](notes="legacy free-form text")
+        assert "notes(deprecated)" in out or "deprecated" in out
+        assert state.get("agent_notes") == "legacy free-form text"
+
+    def test_empty_call_returns_error(self):
+        handlers, _ = self._handlers_with_state()
+        out = handlers["write_scratchpad"]()
+        assert out.startswith("error:")
+
+    def test_whitespace_only_values_return_error(self):
+        handlers, _ = self._handlers_with_state()
+        out = handlers["write_scratchpad"](
+            hypothesis="   ", dead_end="", observation="",
+        )
+        assert out.startswith("error:")
+
+    def test_cap_enforced_through_handler(self):
+        from core.history import NOTES_MAX_ENTRIES
+        handlers, state = self._handlers_with_state()
+        for i in range(NOTES_MAX_ENTRIES + 3):
+            handlers["write_scratchpad"](hypothesis=f"h{i}")
+        bucket = state["notes"]["open_hypotheses"]
+        assert len(bucket) == NOTES_MAX_ENTRIES
+        assert bucket[-1] == f"h{NOTES_MAX_ENTRIES + 2}"
+
+    def test_wrote_this_round_flag_set_after_success(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(), state={})
+        # state_holder is stashed on the submit wrapper
+        state_holder = handlers["submit"]._state_holder
+        assert state_holder["wrote_this_round"] is False
+        handlers["write_scratchpad"](observation="anything")
+        assert state_holder["wrote_this_round"] is True
+
+    def test_wrote_this_round_stays_false_on_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(), state={})
+        state_holder = handlers["submit"]._state_holder
+        handlers["write_scratchpad"]()  # empty — error path
+        assert state_holder["wrote_this_round"] is False
+
+    def test_read_scratchpad_empty_state(self):
+        handlers, _ = self._handlers_with_state()
+        out = handlers["read_scratchpad"]()
+        assert "first round" in out or "empty" in out
+
+    def test_read_scratchpad_renders_structured_notes(self):
+        handlers, _ = self._handlers_with_state()
+        handlers["write_scratchpad"](hypothesis="attn variant A")
+        handlers["write_scratchpad"](
+            dead_end="dense MLP", reason="overshoots FLOPs",
+        )
+        out = handlers["read_scratchpad"]()
+        assert "Open Hypotheses" in out
+        assert "attn variant A" in out
+        assert "Dead Ends" in out
+        assert "dense MLP" in out
+
+    def test_read_scratchpad_shows_legacy_notes_section(self):
+        handlers, _ = self._handlers_with_state()
+        handlers["write_scratchpad"](notes="legacy blob")
+        out = handlers["read_scratchpad"]()
+        assert "legacy blob" in out
+
+
+class TestSubmitNag:
+    """Step 6: mandatory write_scratchpad before submit, enforced as a
+    one-shot polite nag. First submit without a note returns an error
+    string; second submit proceeds even without a note."""
+
+    def test_first_submit_without_note_returns_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["submit"](
+            code=VALID_CODE, name="m", motivation="testing",
+        )
+        assert result.startswith("error:")
+        assert "write_scratchpad" in result
+
+    def test_second_submit_accepts_even_without_note(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        # First call: nag (returns error string).
+        handlers["submit"](
+            code=VALID_CODE, name="m", motivation="nag cycle",
+        )
+        # Second call: should raise SubmitSignal even though no note
+        # was written — determined LLMs aren't blocked.
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="after nag",
+            )
+
+    def test_submit_after_write_skips_nag(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="try idea X")
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="with note",
+            )
+
+    def test_submit_after_deprecated_notes_write_also_skips_nag(self):
+        """The deprecated `notes=...` path still flips wrote_this_round
+        so in-flight rounds don't get stuck."""
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](notes="legacy text")
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="legacy",
+            )
+
+    def test_submit_nag_count_bumped_once(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        state_holder = handlers["submit"]._state_holder
+        handlers["submit"](
+            code=VALID_CODE, name="m", motivation="first",
+        )
+        assert state_holder["submit_nag_count"] == 1
+
+
+class TestCallCounts:
+    """Per-round tool-usage telemetry is stashed on the submit
+    wrapper as ``_call_counts``. Each wrapped handler invocation bumps
+    its entry; the agent logs the summary at end-of-round."""
+
+    def test_counter_starts_empty(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        assert handlers["submit"]._call_counts == {}
+
+    def test_counter_bumps_on_each_call(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        counts = handlers["submit"]._call_counts
+        handlers["analyze_task"]()
+        handlers["analyze_task"]()
+        handlers["list_frontier"]()
+        assert counts == {"analyze_task": 2, "list_frontier": 1}
+
+    def test_counter_bumps_even_on_error_path(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        counts = handlers["submit"]._call_counts
+        handlers["get_frontier_member"](idx=99)   # error
+        handlers["get_frontier_member"](idx=99)   # error
+        assert counts["get_frontier_member"] == 2
 
 
 class TestCircuitBreaker:
