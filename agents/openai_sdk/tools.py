@@ -596,6 +596,7 @@ def build_handlers(
     client=None,
     scratch_dir: str | None = None,
     deadline: float | None = None,
+    state: dict | None = None,
 ) -> dict:
     """Build a ``{name: callable(**kwargs) -> str}`` mapping for the round.
 
@@ -603,7 +604,9 @@ def build_handlers(
     ``get_json``/``post_json``) used for paper search and DB queries.
     ``scratch_dir`` is a filesystem path where scratchpad state lives.
     ``deadline`` is the monotonic wall-clock the round must finish by;
-    ``time_remaining`` reports against it.
+    ``time_remaining`` reports against it. ``state``, when provided,
+    overrides the on-disk load — used by callers that need to merge
+    round-result feedback before the handlers see the state.
 
     Any of these may be ``None`` — the affected tools return an
     "unavailable" string instead of raising. Handlers are wrapped with
@@ -617,9 +620,9 @@ def build_handlers(
     flops_min, flops_max = extract_flops_budget(challenge)
     target_flops = int(flops_max * 0.6) if flops_max else 0
 
-    state_holder = {
-        "state": load_state(scratch_dir) if scratch_dir else {}
-    }
+    if state is None:
+        state = load_state(scratch_dir) if scratch_dir else {}
+    state_holder = {"state": state}
 
     # Frontier fetched from the challenge dict only — the openai_sdk
     # agent has historically treated ``feasible_frontier`` as canonical
@@ -961,13 +964,20 @@ def build_handlers(
         state = state_holder["state"]
         history_entries = get_history(state)
         notes = state.get("agent_notes", "")
+        score_direction = (
+            challenge.get("score_direction") or "minimize"
+        )
         parts = []
         if notes:
             parts.append(f"## Saved Notes\n{notes}")
         if history_entries:
             parts.append(
                 "## Submission History\n"
-                + format_history(history_entries, max_entries=10)
+                + format_history(
+                    history_entries,
+                    max_entries=10,
+                    score_direction=score_direction,
+                )
             )
         if not parts:
             return "scratchpad is empty — this is your first round"

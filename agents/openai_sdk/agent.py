@@ -342,11 +342,40 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     except Exception as exc:
         _log(f"[agent] scratchpad load failed: {exc}")
 
+    # Load state up front so ``previous_results`` (round-score feedback
+    # delivered by the harness on the next round) can be merged before
+    # prompts are built or handlers see history.
+    state = history.load_state(scratch_dir) if scratch_dir else {}
+    prev_results = challenge.get("previous_results") or []
+    score_direction = challenge.get("score_direction") or "minimize"
+    if prev_results:
+        history.merge_results_into_state(state, prev_results)
+    all_hist = history.get_history(state)
+    scored = [
+        e for e in all_hist if isinstance(e.get("score"), (int, float))
+    ]
+    pending = len(all_hist) - len(scored)
+    best = history.best_own_submission(state, score_direction)
+    if best is not None:
+        rank = best.get("rank", "?")
+        total = best.get("rank_total", "?")
+        _log(
+            f"[agent] score feedback: {len(prev_results)} prior merged, "
+            f"best own score={best['score']:.4g} (rank {rank}/{total}), "
+            f"{pending} pending"
+        )
+    else:
+        _log(
+            f"[agent] score feedback: {len(prev_results)} prior merged, "
+            f"no scored submissions yet, {pending} pending"
+        )
+
     handlers = build_handlers(
         challenge,
         client=gated_client,
         scratch_dir=scratch_dir,
         deadline=deadline,
+        state=state,
     )
     tools = build_tools(challenge)
     llm_url = challenge.get("llm_url", "") or ""

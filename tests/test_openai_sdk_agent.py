@@ -47,12 +47,35 @@ def _reset_llm_client_cache() -> None:
     llm_client._cached_config = None
 
 
+def _reset_core_resolution() -> None:
+    """Drop any cached ``core.*`` (and the openai_sdk submodules that
+    captured it) so the next ``from agents.openai_sdk import agent``
+    re-resolves ``from core import history`` against the openai_sdk
+    package — not whatever autonomous-core another test left behind in
+    ``sys.modules``. ``agents.openai_sdk.llm_client`` is preserved so
+    ``@pytest.fixture mock_openai``'s ``patch(...)`` target keeps its
+    identity across the fixture/test boundary.
+    """
+    for _k in list(sys.modules.keys()):
+        if _k == "core" or _k.startswith("core."):
+            del sys.modules[_k]
+        if _k == "tools" or _k.startswith("tools."):
+            del sys.modules[_k]
+        if _k in (
+            "agents.openai_sdk.agent",
+            "agents.openai_sdk.prompts",
+            "agents.openai_sdk.tools",
+        ):
+            del sys.modules[_k]
+
+
 # ── Fixtures ──────────────────────────────────────────────────────
 
 @pytest.fixture
 def mock_openai(monkeypatch):
     """Patch the ``OpenAI`` class inside ``llm_client`` and reset the
     singleton cache so each test gets a clean stub."""
+    _reset_core_resolution()
     _reset_llm_client_cache()
     monkeypatch.setenv("LLM_URL", "http://test/llm")
     monkeypatch.setenv("AGENT_TOKEN", "test-token")
