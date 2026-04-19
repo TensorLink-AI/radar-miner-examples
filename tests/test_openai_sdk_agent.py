@@ -366,6 +366,7 @@ class TestToolSchema:
         # the scratchpad-directory file tools.
         assert {
             "analyze_task", "validate_code", "estimate_flops",
+            "size_to_flops",
             "list_frontier", "get_frontier_member", "submit",
             "search_papers", "query_db", "estimate_layer_flops",
             "sketch_architecture", "trace_architecture",
@@ -567,6 +568,99 @@ class TestFileTools:
         result = handlers["write_file"](name="a.md", content="two")
         assert "wrote a.md" in result
         assert handlers["read_file"](name="a.md") == "two"
+
+
+SIZED_CODE_TEMPLATE = '''\
+import torch
+import torch.nn as nn
+
+class M(nn.Module):
+    def __init__(self, context_len, prediction_len, num_variates, n_q, h):
+        super().__init__()
+        self.pred = prediction_len
+        self.nv = num_variates
+        self.nq = n_q
+        self.enc = nn.Linear(context_len, h)
+        self.dec = nn.Linear(h, prediction_len * n_q)
+    def forward(self, x):
+        b, L, V = x.shape
+        h = x.transpose(1, 2)
+        h = self.enc(h)
+        h = self.dec(h)
+        return h.view(b, V, self.pred, self.nq).permute(0, 2, 1, 3)
+
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return M(context_len, prediction_len, num_variates, len(quantiles), {{SIZE}})
+
+def build_optimizer(model):
+    return torch.optim.Adam(model.parameters(), lr=1e-3)
+'''
+
+
+class TestSizeToFlops:
+    def test_missing_placeholder_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="def build_model(**kw): pass",
+            size_min=1, size_max=100,
+        )
+        assert "SIZE" in result and "error" in result.lower()
+
+    def test_empty_template_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="", size_min=1, size_max=100,
+        )
+        assert result.startswith("error:")
+
+    def test_invalid_range_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="# {{SIZE}}", size_min=100, size_max=10,
+        )
+        assert "error" in result.lower()
+
+    def test_zero_size_min_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["size_to_flops"](
+            code_template="# {{SIZE}}", size_min=0, size_max=100,
+        )
+        assert "error" in result.lower()
+
+    def test_no_target_and_no_budget_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        # Challenge without FLOPs budget and no target_flops passed
+        ch = _make_challenge(with_flops=False)
+        handlers = build_handlers(ch)
+        result = handlers["size_to_flops"](
+            code_template="# {{SIZE}}", size_min=1, size_max=100,
+        )
+        assert "error" in result.lower()
+        assert "target" in result.lower() or "budget" in result.lower()
+
+    def test_happy_path_finds_best(self):
+        """End-to-end: sweep a real linear build_model and find a size
+        whose FLOPs are near the target. Kept small (size range 8..64)
+        so it runs fast inside CI."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        # target_flops defaults to 60% of max (=1.2M). For the template
+        # above, tiny hidden sizes (8..64) give ~50K..400K FLOPs which
+        # is well below target — so "best" is the highest size probed.
+        result = handlers["size_to_flops"](
+            code_template=SIZED_CODE_TEMPLATE,
+            size_min=8, size_max=64,
+            target_flops=200_000,
+        )
+        assert "best:" in result
+        assert "size=" in result
+        assert "flops=" in result
+        # Should mention it did some probes
+        assert "probes:" in result
 
 
 class TestScratchpadNotes:

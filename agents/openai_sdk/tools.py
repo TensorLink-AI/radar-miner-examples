@@ -35,6 +35,7 @@ from core.history import (
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
+from core.sizing import MAX_PROBES, sweep_sizes
 from core.trace import format_trace, trace_architecture
 from core.validation import validate_code
 
@@ -255,6 +256,58 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": ["idx"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "size_to_flops",
+            "description": (
+                "Sweep a scalar size knob to land on a target FLOPs "
+                "count. Provide code containing a `{{SIZE}}` "
+                "placeholder (any integer knob — hidden_dim, num_layers, "
+                "channels, etc.) and the range to search. Runs up to "
+                f"{MAX_PROBES} measurements using geometric-probe-then-"
+                "refine and returns the MEASURED (size, flops) pair "
+                "closest to the target. Use this BEFORE calling "
+                "validate_code — it saves FLOPs-bound iterations."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code_template": {
+                        "type": "string",
+                        "description": (
+                            "Python source containing `build_model` "
+                            "with a `{{SIZE}}` placeholder. The "
+                            "placeholder is substituted with each "
+                            "probe's integer. Example: "
+                            "`hidden = {{SIZE}}` inside build_model."
+                        ),
+                    },
+                    "size_min": {
+                        "type": "integer",
+                        "description": (
+                            "Smallest size to probe (must be > 0)."
+                        ),
+                    },
+                    "size_max": {
+                        "type": "integer",
+                        "description": (
+                            "Largest size to probe (must be >= size_min)."
+                        ),
+                    },
+                    "target_flops": {
+                        "type": "integer",
+                        "description": (
+                            "Target FLOPs count. Defaults to 60% of the "
+                            "challenge's max_flops_equivalent when 0 or "
+                            "omitted."
+                        ),
+                    },
+                },
+                "required": ["code_template", "size_min", "size_max"],
             },
         },
     },
@@ -919,6 +972,94 @@ def build_handlers(
             return f"error: {err}"
         return f"estimated_flops: {flops:,}"
 
+    def _size_to_flops(code_template: str = "", size_min: int = 0,
+                       size_max: int = 0, target_flops: int = 0,
+                       **_kwargs) -> str:
+        if not code_template or not code_template.strip():
+            return "error: empty code_template"
+        if "{{SIZE}}" not in code_template:
+            return (
+                "error: code_template must contain a `{{SIZE}}` "
+                "placeholder (the integer knob to sweep)"
+            )
+        try:
+            size_min = int(size_min)
+            size_max = int(size_max)
+            target_flops = int(target_flops or 0)
+        except (TypeError, ValueError):
+            return "error: size_min/size_max/target_flops must be integers"
+        if size_min <= 0:
+            return f"error: size_min must be > 0 (got {size_min})"
+        if size_max < size_min:
+            return (
+                f"error: size_max ({size_max}) < size_min ({size_min})"
+            )
+        if target_flops <= 0:
+            target_flops = int(flops_max * 0.6) if flops_max else 0
+        if target_flops <= 0:
+            return (
+                "error: no target_flops supplied and the challenge has "
+                "no FLOPs budget to default from"
+            )
+
+        def _probe(size: int) -> int | None:
+            code = code_template.replace("{{SIZE}}", str(size))
+            flops, err = estimate_flops(code, challenge)
+            if err or flops is None:
+                return None
+            return int(flops)
+
+        result = sweep_sizes(
+            _probe, size_min, size_max, target_flops,
+        )
+        probes = result["probes"]
+        failures = result["failures"]
+        best = result["best"]
+        n_probes = result["n_probes"]
+
+        lines = [
+            f"target_flops: {target_flops:,}",
+            f"search_range: [{size_min:,}, {size_max:,}]",
+            f"probes: {n_probes} ({len(probes)} ok, {len(failures)} failed)",
+        ]
+        if best is None:
+            lines.append(
+                "best: NONE — every probe failed. Check that "
+                "code_template defines build_model and the SIZE knob is "
+                "wired to a real shape dimension."
+            )
+            if failures:
+                lines.append(
+                    f"failing sizes (sample): {failures[:5]}"
+                )
+        else:
+            size, flops = best
+            pct = 100.0 * flops / target_flops
+            lines.append(
+                f"best: size={size:,} flops={flops:,} "
+                f"({pct:.1f}% of target)"
+            )
+            if flops_min and flops_max:
+                gate_min = int(flops_min * 0.9)
+                gate_max = int(flops_max * 1.1)
+                if gate_min <= flops <= gate_max:
+                    lines.append(
+                        f"status: within hard gate "
+                        f"[{gate_min:,}, {gate_max:,}]"
+                    )
+                else:
+                    lines.append(
+                        f"status: OUTSIDE hard gate "
+                        f"[{gate_min:,}, {gate_max:,}] — widen the "
+                        "search range or change the knob"
+                    )
+            if len(probes) > 1:
+                sample = ", ".join(
+                    f"{s}:{f:,}" for s, f in probes[:6]
+                )
+                lines.append(f"probe_samples: {sample}")
+        return "\n".join(lines)
+
     def _list_frontier(**_kwargs) -> str:
         frontier = _frontier()
         if not frontier:
@@ -1236,6 +1377,7 @@ def build_handlers(
         "estimate_layer_flops": _estimate_layer_flops,
         "sketch_architecture": _sketch_architecture,
         "estimate_flops": _estimate_flops,
+        "size_to_flops": _size_to_flops,
         "list_frontier": _list_frontier,
         "get_frontier_member": _get_frontier_member,
         "trace_architecture": _trace_architecture,
