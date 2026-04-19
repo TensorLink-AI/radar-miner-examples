@@ -354,3 +354,170 @@ def estimate_flops(code: str, challenge: dict,
 
     del model
     return total_flops, ""
+
+
+# ── Trainability check ──────────────────────────────────────────
+#
+# Regression guard for failures like:
+#   "The size of tensor a (48) must match the size of tensor b (96) at
+#   non-singleton dimension 1"
+# which bit two miners in the large bucket — validate_code passed the
+# single batch=1 forward pass check but the model's forward pass
+# produced a dim-1 size that depended on batch_size (or the bug only
+# surfaced during the loss / backward pass, which no_grad skipped).
+#
+# Running forward+loss+backward at batch_size=2 with grads enabled
+# exposes those bugs at validate time instead of burning an hour of
+# training wall-clock before crashing.
+
+
+def check_trainable(code: str, challenge: dict,
+                    expected_shape: list[int] | None = None,
+                    batch_size: int = 2) -> tuple[bool, str]:
+    """Run one forward+MSE loss+backward pass to catch training-time errors.
+
+    Catches bugs that a single ``torch.no_grad()`` forward at batch=1 misses:
+      * output shapes that depend on batch size (e.g. ``x.view(1, ...)``
+        hardcoded instead of ``x.view(b, ...)``)
+      * broadcast mismatches between output and a target of the task-
+        declared shape (``mse_loss((B,48,V,Q), (B,96,V,Q))`` → the exact
+        "tensor a (48) vs tensor b (96)" error we are guarding against)
+      * backward-only failures (custom autograd ops, in-place mutations of
+        a view tensor, etc.)
+      * ``build_optimizer`` that rejects the model's parameter set
+
+    ``expected_shape`` (the non-batch dims from
+    ``infer_output_shape(...)``) is used to size the target tensor. Wildcard
+    dims (``-1``) are filled from the actual output shape so they never
+    trigger false positives.
+
+    Returns ``(ok, error_message)``; ``error_message`` is empty on success.
+    """
+    task = challenge.get("task", {}) or {}
+    tp = task.get("task_params", {}) or {}
+    constraints = task.get("constraints", []) or []
+
+    namespace: dict = {}
+    try:
+        exec(compile(code, "<generated>", "exec"), namespace)
+    except Exception as exc:
+        return False, f"Code execution failed: {exc}"
+
+    build_model_fn = namespace.get("build_model")
+    build_optimizer_fn = namespace.get("build_optimizer")
+    if not callable(build_model_fn):
+        return False, "build_model not found or not callable"
+    if not callable(build_optimizer_fn):
+        return False, "build_optimizer not found or not callable"
+
+    try:
+        model = build_model_fn(**tp)
+    except Exception as exc:
+        return False, f"build_model() raised: {exc}"
+    if not isinstance(model, nn.Module):
+        return False, "build_model() did not return an nn.Module"
+
+    try:
+        optimizer = build_optimizer_fn(model)
+    except Exception as exc:
+        del model
+        return False, f"build_optimizer() raised: {exc}"
+
+    # Build a batch_size>1 input to expose hardcoded batch-dim bugs.
+    input_shape, input_dtype = infer_input(tp, constraints)
+    shape = [batch_size] + list(input_shape[1:])
+    try:
+        if input_dtype == torch.long:
+            vocab = tp.get("vocab_size", tp.get("n_vocab", 1000))
+            dummy = torch.randint(0, int(vocab), shape)
+        else:
+            dummy = torch.randn(*shape)
+    except Exception as exc:
+        del model
+        return False, f"Failed to create dummy input at batch_size={batch_size}: {exc}"
+
+    try:
+        model.train()
+        out = model(dummy)
+    except Exception as exc:
+        del model
+        return False, (
+            f"Forward pass at batch_size={batch_size} raised: {exc}. "
+            "This is a training-time failure — the batch=1 FLOPs check "
+            "missed it. Check for hardcoded batch dimensions or shapes "
+            "that depend on the input batch size."
+        )
+
+    if not isinstance(out, torch.Tensor):
+        del model
+        return False, "Model forward() returned non-tensor output"
+
+    if out.shape[0] != batch_size:
+        err = (
+            f"Output batch dim {out.shape[0]} != input batch dim "
+            f"{batch_size}. The model collapses or reshapes the batch "
+            "dimension — it must preserve batch size."
+        )
+        del model
+        return False, err
+
+    # Build a target matching the task-declared shape so a shape mismatch
+    # surfaces as a loss broadcast error — the exact failure mode reported
+    # from training ("tensor a (48) vs tensor b (96) at dim 1"). Wildcards
+    # fall back to the actual output dim so unresolved dims don't create
+    # spurious failures.
+    if expected_shape is not None:
+        target_non_batch: list[int] = []
+        actual_non_batch = list(out.shape[1:])
+        if len(expected_shape) != len(actual_non_batch):
+            del model
+            return False, (
+                f"Output rank mismatch at batch_size={batch_size}: "
+                f"expected {len(expected_shape) + 1}D (batch + "
+                f"{expected_shape}), got {out.dim()}D {tuple(out.shape)}."
+            )
+        for expected_dim, actual_dim in zip(expected_shape, actual_non_batch):
+            target_non_batch.append(
+                expected_dim if expected_dim >= 0 else actual_dim,
+            )
+        target_shape = [batch_size] + target_non_batch
+    else:
+        target_shape = list(out.shape)
+
+    try:
+        target_dtype = out.dtype if out.is_floating_point() else torch.float32
+        target = torch.randn(*target_shape, dtype=target_dtype)
+    except Exception as exc:
+        del model
+        return False, f"Failed to create target tensor of shape {target_shape}: {exc}"
+
+    out_for_loss = out if out.is_floating_point() else out.float()
+    try:
+        loss = nn.functional.mse_loss(out_for_loss, target)
+    except RuntimeError as exc:
+        del model
+        return False, (
+            f"Loss computation failed at batch_size={batch_size}: {exc}. "
+            f"Model output shape {tuple(out.shape)} does not broadcast "
+            f"with the task-declared target shape {tuple(target_shape)}. "
+            "Make sure every output dim is derived from task_params."
+        )
+    except Exception as exc:
+        del model
+        return False, f"Loss computation failed: {exc}"
+
+    try:
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+    except Exception as exc:
+        del model
+        return False, (
+            f"Backward/optimizer step failed at batch_size={batch_size}: "
+            f"{exc}. This catches training-time failures the forward pass "
+            "alone would miss (autograd shape errors, in-place view "
+            "mutations, optimizer/param mismatches)."
+        )
+
+    del model
+    return True, ""

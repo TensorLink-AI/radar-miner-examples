@@ -7,7 +7,7 @@ when models land outside the budget.
 
 import ast
 
-from core.flops_estimator import estimate_flops, suggest_resize
+from core.flops_estimator import check_trainable, estimate_flops, suggest_resize
 from core.history import extract_flops_budget
 from core.output_shape import infer_output_shape, verify_output_shape
 
@@ -99,10 +99,9 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
         task_params = task.get("task_params", {}) or {}
         constraints = task.get("constraints", []) or []
         out_shape_sink: list = []
+        expected = infer_output_shape(task_params, constraints)
 
-        run_estimator = bool(flops_min or flops_max) or bool(
-            infer_output_shape(task_params, constraints)
-        )
+        run_estimator = bool(flops_min or flops_max) or bool(expected)
 
         if run_estimator:
             estimated, err = estimate_flops(code, challenge, out_shape_sink)
@@ -133,7 +132,6 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
             # build_model() returns a module whose forward() projects to the
             # wrong dim; it would train for an hour before crashing. Better
             # to reject at validate time.
-            expected = infer_output_shape(task_params, constraints)
             if expected is not None:
                 if not out_shape_sink:
                     # FLOPs path bailed out (hook-based / static-walk fallback,
@@ -153,5 +151,25 @@ def validate_code(code: str, challenge: dict | None = None) -> tuple[bool, list[
                     shape_err = verify_output_shape(out_shape_sink[0], expected)
                     if shape_err:
                         errors.append(shape_err)
+
+            # 10. Trainability check — the FLOPs path above runs a single
+            # ``torch.no_grad()`` forward at batch=1. Two miner rounds
+            # shipped models that passed that check but failed training
+            # with "tensor a (48) must match tensor b (96) at non-singleton
+            # dim 1" because the bug only surfaced at batch>1 or during
+            # the backward pass. Re-run with grads enabled, batch_size=2,
+            # and a target of the task-declared shape so mismatches blow
+            # up here instead of burning training wall-clock.
+            #
+            # Gated on ``run_estimator`` to match step 8/9 — the check
+            # needs a real task spec to be meaningful, and bare
+            # structural-only tests (no FLOPs budget, no constraints)
+            # shouldn't pay the cost of a forward+backward pass.
+            if not errors:
+                ok, train_err = check_trainable(
+                    code, challenge, expected_shape=expected,
+                )
+                if not ok:
+                    errors.append(train_err)
 
     return len(errors) == 0, errors

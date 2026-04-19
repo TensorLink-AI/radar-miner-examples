@@ -213,3 +213,120 @@ class TestValidateCodeShapeIntegration:
         if not ok:
             joined = "\n".join(errors)
             assert "FLOPs" in joined or "flops" in joined.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Regression guard: "tensor a (48) must match tensor b (96) at dim 1"
+#
+# Two miner rounds shipped models that passed the single-batch shape
+# check but crashed during training with a broadcast mismatch between
+# the model output and the task-declared target. This happened because
+# the bug was either batch-size-dependent or only surfaced during the
+# backward pass. The trainability check (forward+loss+backward at
+# batch_size=2) must catch these classes.
+# ══════════════════════════════════════════════════════════════════════
+
+# Model whose forward collapses prediction_len to half when batch_size>1.
+# At batch=1 the old validator saw (1, 96, 1, 3) — all good. At batch=2
+# the output is (2, 48, 1, 3) and mse_loss against the task's target
+# shape (2, 96, 1, 3) raises the exact 48-vs-96 error that failed in
+# production.
+_BATCH_DEP_HALFPRED_CODE = '''\
+import torch
+import torch.nn as nn
+
+class BatchDepHalfPred(nn.Module):
+    def __init__(self, context_len, prediction_len, num_variates, n_q):
+        super().__init__()
+        self.pred = prediction_len
+        self.nv = num_variates
+        self.nq = n_q
+        self.fc = nn.Linear(context_len, prediction_len * n_q)
+
+    def forward(self, x):
+        b, L, V = x.shape
+        h = self.fc(x.transpose(1, 2))  # (b, V, pred*nq)
+        if b > 1:
+            # Bug: at training batch sizes the model silently halves the
+            # prediction horizon — the classic failure mode.
+            half = self.pred // 2
+            h = h[..., : half * self.nq]
+            return h.view(b, V, half, self.nq).permute(0, 2, 1, 3)
+        return h.view(b, V, self.pred, self.nq).permute(0, 2, 1, 3)
+
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return BatchDepHalfPred(context_len, prediction_len, num_variates, len(quantiles))
+
+def build_optimizer(model):
+    return torch.optim.Adam(model.parameters(), lr=1e-3)
+'''
+
+
+# Model that hits a backward-only autograd failure. Forward pass and
+# mse_loss both succeed, but the detached output breaks the backward
+# graph — the kind of bug a no-grad forward would miss.
+_BACKWARD_FAILURE_CODE = '''\
+import torch
+import torch.nn as nn
+
+class BackwardBreaker(nn.Module):
+    def __init__(self, context_len, prediction_len, num_variates, n_q):
+        super().__init__()
+        self.pred = prediction_len
+        self.nv = num_variates
+        self.nq = n_q
+        self.fc = nn.Linear(context_len, prediction_len * n_q)
+
+    def forward(self, x):
+        b, L, V = x.shape
+        h = self.fc(x.transpose(1, 2))
+        h = h.view(b, V, self.pred, self.nq).permute(0, 2, 1, 3).contiguous()
+        return h.detach()
+
+def build_model(context_len, prediction_len, num_variates, quantiles):
+    return BackwardBreaker(context_len, prediction_len, num_variates, len(quantiles))
+
+def build_optimizer(model):
+    return torch.optim.Adam(model.parameters(), lr=1e-3)
+'''
+
+
+class TestTrainabilityCheckCatchesRuntimeFailures:
+    """The trainability check (step 10) re-runs the model with grads
+    enabled at batch_size=2 against a target of the task-declared shape.
+
+    These tests encode the failure modes from the production training
+    crashes — they must stay rejected so we never ship a model that
+    burns training wall-clock only to crash with the same error.
+    """
+
+    def test_48_vs_96_broadcast_is_caught(self):
+        ok, errors = validate_code(_BATCH_DEP_HALFPRED_CODE, _ts_challenge())
+        assert not ok, "The 48 vs 96 broadcast bug must not pass validation"
+        joined = "\n".join(errors).lower()
+        # The error surfaces either as the batch=2 forward-pass shape
+        # (48 vs 96) or the loss broadcast error — both are acceptable
+        # signals, both prevent submission.
+        assert (
+            "48" in joined
+            or "broadcast" in joined
+            or "training-time" in joined
+            or "loss computation failed" in joined
+            or "mismatch" in joined
+        ), f"Expected a training-time / shape-broadcast error, got: {errors}"
+
+    def test_backward_only_failure_is_caught(self):
+        ok, errors = validate_code(_BACKWARD_FAILURE_CODE, _ts_challenge())
+        # We only require rejection here — the exact backward error is
+        # torch-version-dependent. What matters is we reject pre-submit
+        # instead of letting training crash.
+        assert not ok, (
+            "Backward-only failures must be caught at validate time so "
+            "the agent can retry before shipping broken code"
+        )
+
+    def test_correct_model_still_passes_with_trainability_check(self):
+        # The stronger check must not produce false positives on models
+        # that are actually fine.
+        ok, errors = validate_code(_CORRECT_CODE, _ts_challenge())
+        assert ok, f"Correct model rejected by trainability check: {errors}"
