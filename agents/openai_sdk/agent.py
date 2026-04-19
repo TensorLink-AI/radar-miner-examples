@@ -501,6 +501,23 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     elapsed = time.monotonic() - t_start
     _log(f"[agent] phase=reserve elapsed={elapsed:.0f}s")
 
+    # Per-round tool-usage summary. Stashed on the submit wrapper so
+    # it's a stable single attach-point (alongside ``_state_holder``).
+    call_counts = getattr(
+        handlers.get("submit", None), "_call_counts", None,
+    )
+    if call_counts:
+        total = sum(call_counts.values())
+        summary = ", ".join(
+            f"{name}={count}"
+            for name, count in sorted(
+                call_counts.items(), key=lambda kv: (-kv[1], kv[0]),
+            )
+        )
+        _log(f"[agent] tool calls (total={total}): {summary}")
+    else:
+        _log("[agent] tool calls: none")
+
     if submit_sig is not None:
         return _package(
             submit_sig.code, submit_sig.name, submit_sig.motivation,

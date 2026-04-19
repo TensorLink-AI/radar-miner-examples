@@ -701,6 +701,10 @@ def build_handlers(
     same broken tool over and over.
     """
     breaker = _make_circuit_breaker()
+    # Per-round telemetry — every wrapped handler bumps this. The agent
+    # reads it at end-of-round to log a usage summary. Handlers see it
+    # via closure only; nothing inside a handler should mutate it.
+    _call_counts: dict[str, int] = {}
 
     db_url = (challenge.get("db_url") or "").rstrip("/")
     desearch_url = (challenge.get("desearch_url") or "").rstrip("/")
@@ -1395,6 +1399,7 @@ def build_handlers(
 
     def _wrap(name, fn):
         def wrapped(**kwargs):
+            _call_counts[name] = _call_counts.get(name, 0) + 1
             # SubmitSignal must propagate untouched — do not pass it
             # through the breaker.
             try:
@@ -1406,9 +1411,11 @@ def build_handlers(
             return breaker(name, str(result))
 
         # Expose state_holder on the submit handler so the agent can
-        # persist scratchpad notes after the loop.
+        # persist scratchpad notes after the loop. Expose the per-round
+        # counter the same way so the agent can log a usage summary.
         if name == "submit":
             wrapped._state_holder = state_holder  # type: ignore[attr-defined]
+            wrapped._call_counts = _call_counts   # type: ignore[attr-defined]
         return wrapped
 
     return {name: _wrap(name, fn) for name, fn in raw.items()}

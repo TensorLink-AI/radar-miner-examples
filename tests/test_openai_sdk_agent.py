@@ -789,6 +789,34 @@ class TestScratchpadNotes:
         assert "legacy blob" in out
 
 
+class TestCallCounts:
+    """Per-round tool-usage telemetry is stashed on the submit
+    wrapper as ``_call_counts``. Each wrapped handler invocation bumps
+    its entry; the agent logs the summary at end-of-round."""
+
+    def test_counter_starts_empty(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        assert handlers["submit"]._call_counts == {}
+
+    def test_counter_bumps_on_each_call(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        counts = handlers["submit"]._call_counts
+        handlers["analyze_task"]()
+        handlers["analyze_task"]()
+        handlers["list_frontier"]()
+        assert counts == {"analyze_task": 2, "list_frontier": 1}
+
+    def test_counter_bumps_even_on_error_path(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        counts = handlers["submit"]._call_counts
+        handlers["get_frontier_member"](idx=99)   # error
+        handlers["get_frontier_member"](idx=99)   # error
+        assert counts["get_frontier_member"] == 2
+
+
 class TestCircuitBreaker:
     def test_trips_after_repeated_identical_errors(self):
         from agents.openai_sdk.tools import build_handlers
