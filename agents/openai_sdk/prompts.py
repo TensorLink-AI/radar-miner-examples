@@ -124,6 +124,30 @@ def build_system_prompt(challenge: dict, bucket: str | None = None) -> str:
         "5. Always call `validate_code` before `submit`"
     )
 
+    parts.append(
+        "## Optional Hooks (the harness picks these up via hasattr)\n"
+        "Define any of these as top-level functions to control training "
+        "dynamics. Including them is usually worth it — defaults are "
+        "conservative.\n"
+        "- `training_config() -> dict` — `batch_size`, `grad_accum_steps`, "
+        "`grad_clip`, `log_every_n_steps`, `val_schedule`, `val_base_step`, "
+        "`val_growth` (clamped to sane ranges by the harness).\n"
+        "- `configure_amp() -> dict` — `{\"enabled\": bool, \"dtype\": "
+        "\"bfloat16\"|\"float16\"|\"float32\"}`.\n"
+        "- `build_scheduler(optimizer, total_steps_est)` — LR scheduler "
+        "(warmup + cosine goes here).\n"
+        "- `compute_loss(predictions, targets) -> Tensor` — override the "
+        "default pinball loss.\n"
+        "- `init_weights(model) -> None` — custom weight init; param count "
+        "must NOT change.\n"
+        "- `transform_batch(batch, step, total_steps) -> dict` — "
+        "batch-level augmentation; `batch` has `\"input\"`/`\"target\"`.\n"
+        "- `on_step_end(model, optimizer, step, total_steps, loss_value) "
+        "-> None` — post-step hook (EMA, freezing, logging).\n"
+        "- `COMPILE = True` — module-level bool that opts into "
+        "`torch.compile`."
+    )
+
     return "\n\n".join(parts)
 
 
