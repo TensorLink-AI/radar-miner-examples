@@ -91,14 +91,18 @@ TOOLS: list[dict] = [
         "function": {
             "name": "query_db",
             "description": (
-                "Query the experiment database. Known endpoints:\n"
-                "  GET  /experiments/recent?n=15\n"
-                "  GET  /experiments/failures?n=5\n"
-                "  GET  /provenance/component_stats\n"
-                "  GET  /provenance/dead_ends\n"
-                "  GET  /experiments/{id}\n"
-                "  POST /experiments/search\n"
-                "Other paths may also work — explore what's available."
+                "Query the experiment database. Available endpoints:\n"
+                "  GET  /frontier                     — feasible frontier for the current round\n"
+                "  GET  /experiments/recent?n=20      — recent experiments (default n=20)\n"
+                "  GET  /experiments/pareto           — Pareto-optimal experiments by task\n"
+                "  GET  /experiments/{index}          — single experiment by id\n"
+                "  GET  /experiments/stats            — DB statistics\n"
+                "  POST /experiments/search           — search experiments by query\n"
+                "  GET  /experiments/lineage/{index}  — experiment ancestry\n"
+                "  GET  /experiments/diff/{a}/{b}     — diff two experiments\n"
+                "These are independent views of the same data — pick whichever "
+                "fits what you're investigating. Other paths may also work; "
+                "feel free to explore."
             ),
             "parameters": {
                 "type": "object",
@@ -721,9 +725,6 @@ def build_handlers(
         "submit_nag_count": 0,
     }
 
-    # Frontier fetched from the challenge dict only — the openai_sdk
-    # agent has historically treated ``feasible_frontier`` as canonical
-    # and does not hit a /frontier endpoint.
     def _frontier() -> list:
         frontier = challenge.get("feasible_frontier") or []
         if not frontier:
