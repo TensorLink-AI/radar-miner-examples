@@ -27,7 +27,6 @@ import tempfile
 import time
 
 from core import history
-from core.fallback_templates import fallback_name_for, generate_fallback
 from core.history import extract_flops_budget, identify_bucket
 from core.validation import validate_code
 
@@ -40,22 +39,26 @@ from core.validation import validate_code
 # modes (harness adds it; ``__init__.py`` adds it in package mode).
 try:
     from .llm_client import chat, get_client
-    from .prompts import build_system_prompt, build_user_prompt
+    from .prompts import (
+        build_system_prompt, build_turn_header, build_user_prompt,
+    )
     from .tools import SubmitSignal, build_handlers, build_tools
 except ImportError:
     from llm_client import chat, get_client
-    from prompts import build_system_prompt, build_user_prompt
+    from prompts import (
+        build_system_prompt, build_turn_header, build_user_prompt,
+    )
     from tools import SubmitSignal, build_handlers, build_tools
 
 
 FALLBACK_RESERVE_SECONDS = 30
 RESEARCH_BUDGET_FRAC = 0.20
-RESEARCH_BUDGET_MAX = 120
+RESEARCH_BUDGET_MAX = 90
 RESEARCH_BUDGET_MIN = 60
 
 # Small per-phase tool-loop caps so the LLM doesn't sprawl.
-RESEARCH_MAX_ROUNDS = 4
-DESIGN_MAX_ROUNDS = 8
+RESEARCH_MAX_ROUNDS = 2
+DESIGN_MAX_ROUNDS = 6
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 
@@ -207,6 +210,22 @@ def _run_tool_loop(
             if failure is None:
                 failure = "deadline"
             break
+
+        # Per-turn time-aware status header. The directive escalates as
+        # the deadline approaches and changes wording when validated
+        # code is already on file — primary lever against the
+        # "analysis paralysis" failure mode.
+        has_validated = bool(getattr(
+            handlers.get("submit", None), "_has_validated", False,
+        ))
+        messages.append({
+            "role": "user",
+            "content": build_turn_header(
+                remaining_s=int(remaining),
+                phase=phase,
+                has_validated=has_validated,
+            ),
+        })
 
         try:
             resp = chat(
@@ -564,15 +583,33 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
                 f"{RESEARCH_MAX_ROUNDS + DESIGN_MAX_ROUNDS} rounds"
             )
 
-    _log(f"[agent] no LLM code produced — fallback: {fallback_motivation}")
-    try:
-        fb_code = generate_fallback(challenge)
-        fb_name = fallback_name_for(challenge)
-        return _package(fb_code, fb_name, fallback_motivation)
-    except Exception as exc:
-        _log(f"[agent] fallback generation failed: {exc}")
-        return _package(
-            "",
-            f"skipped_{bucket}",
-            f"{fallback_motivation}; fallback also failed: {exc}",
+    # Stage A: auto-submit recovery. If the LLM called validate_code
+    # successfully but never followed up with submit, ship that
+    # validated code instead of going home empty-handed.
+    auto_code = getattr(
+        handlers.get("submit", None), "_last_validated_code", "",
+    ) or ""
+    if auto_code:
+        _log(
+            f"[agent] auto-submit: LLM never called submit but validated "
+            f"code exists ({len(auto_code)} chars)"
         )
+        return _package(
+            auto_code,
+            f"auto_submit_{bucket}",
+            "Auto-submitted validated code — LLM did not call submit "
+            f"explicitly. Root cause: {fallback_motivation}",
+        )
+
+    # Stage B: honest failure. No template fallback — return empty code
+    # so the failure is visible in the round results instead of being
+    # masked by a near-zero MLP.
+    _log(
+        f"[agent] FAILED — no code produced. "
+        f"Root cause: {fallback_motivation}"
+    )
+    return _package(
+        "",
+        f"failed_{bucket}",
+        f"FAILURE: {fallback_motivation}",
+    )

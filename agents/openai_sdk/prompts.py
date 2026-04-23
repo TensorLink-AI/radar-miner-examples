@@ -161,6 +161,59 @@ def build_system_prompt(challenge: dict, bucket: str | None = None) -> str:
     return "\n\n".join(parts)
 
 
+def build_turn_header(
+    remaining_s: int, phase: str, has_validated: bool = False,
+) -> str:
+    """Per-turn directive injected at the top of every LLM turn.
+
+    The text changes based on remaining seconds and whether the agent
+    already has validated code stashed. This is the primary lever
+    against the "analysis paralysis" failure mode: as the deadline
+    approaches the message escalates from "normal pace" to an explicit
+    SUBMIT-NOW order so the LLM stops re-sketching and ships.
+    """
+    if has_validated:
+        if remaining_s < 100:
+            directive = (
+                "EMERGENCY: call write_scratchpad (one note) then submit "
+                "with the validated code RIGHT NOW."
+            )
+        elif remaining_s < 300:
+            directive = (
+                "You have validated code. Call write_scratchpad (one "
+                "note) then submit IMMEDIATELY. Do not sketch or "
+                "research again."
+            )
+        else:
+            directive = (
+                "You have validated code. Stop exploring. Next: "
+                "write_scratchpad + submit."
+            )
+    else:
+        if remaining_s < 100:
+            directive = (
+                "EMERGENCY: submit the best code you've produced this "
+                "round, even if unvalidated. Empty-handed = lost round."
+            )
+        elif remaining_s < 300:
+            directive = (
+                "SUBMIT MODE: if you have any candidate, go straight to "
+                "validate_code → submit. Skip further research and "
+                "re-sketching."
+            )
+        elif remaining_s < 600:
+            directive = (
+                "Time is short. If you haven't sketched, sketch NOW. "
+                "If you have, go straight to size_to_flops + validate_code."
+            )
+        else:
+            directive = (
+                "Normal pace. Sketch once, one research call, size, "
+                "validate, submit."
+            )
+    return f"[REMAINING: {remaining_s}s | PHASE: {phase}] {directive}"
+
+
 def build_user_prompt(challenge: dict, bucket: str | None = None) -> str:
     """Initial user message that starts the round."""
     task = challenge.get("task", {}) or {}

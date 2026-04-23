@@ -927,9 +927,11 @@ class TestDesignArchitecture:
         assert result["code"] == VALID_CODE
         assert result["name"] == "instant"
 
-    def test_falls_back_to_template_when_no_llm_code(self, mock_openai):
-        """When the LLM never produces code, the agent ships the
-        guaranteed-valid fallback template."""
+    def test_returns_empty_failure_when_no_llm_code(self, mock_openai):
+        """When the LLM never produces code AND there's no validated
+        code stashed, the agent returns an honest-failure package
+        (empty code, ``failed_<bucket>`` name) instead of masking the
+        problem with a near-zero MLP fallback."""
         from agents.openai_sdk import agent
 
         # Always return plain text — no tool calls, no code blocks
@@ -941,12 +943,13 @@ class TestDesignArchitecture:
         ch = _make_challenge()
         ch["agent_seconds"] = 60
         result = agent.design_architecture(ch, gated_client=None)
-        assert "fallback" in result["name"]
-        assert "build_model" in result["code"]
-        assert "build_optimizer" in result["code"]
+        assert result["name"].startswith("failed_")
+        assert result["code"] == ""
+        assert result["motivation"].startswith("FAILURE:")
 
-    def test_chat_failure_uses_fallback(self, mock_openai):
-        """If every LLM call raises, the agent still ships fallback code."""
+    def test_chat_failure_returns_empty_failure(self, mock_openai):
+        """If every LLM call raises and no validated code exists, the
+        agent returns the honest-failure package."""
         from openai import APIError
         from agents.openai_sdk import agent
         err = APIError("bad", request=MagicMock(), body=None)
@@ -956,19 +959,19 @@ class TestDesignArchitecture:
         ch = _make_challenge()
         ch["agent_seconds"] = 60
         result = agent.design_architecture(ch, gated_client=None)
-        # Fallback path → bucket-tagged template name
-        assert "fallback" in result["name"]
-        assert result["code"] != ""
-        # Honest failure motivation — not the generic template message.
+        assert result["name"].startswith("failed_")
+        assert result["code"] == ""
+        # Honest failure motivation surfaces the chat error.
+        assert result["motivation"].startswith("FAILURE:")
         assert "LLM chat failed" in result["motivation"]
 
     def test_missing_llm_url_shows_config_error_motivation(
         self, mock_openai, monkeypatch
     ):
         """With no challenge['llm_url'] and no LLM_URL env var, the
-        startup check should trip, skip both phases, and ship the
-        fallback with a config-error motivation (not the old generic
-        'could not produce code' message)."""
+        startup check should trip, skip both phases, and return an
+        honest-failure package whose motivation surfaces the config
+        error (not the old generic 'could not produce code' message)."""
         _reset_llm_client_cache()
         monkeypatch.delenv("LLM_URL", raising=False)
         from agents.openai_sdk import agent
@@ -978,8 +981,8 @@ class TestDesignArchitecture:
         # No llm_url key in challenge
         result = agent.design_architecture(ch, gated_client=None)
 
-        assert "fallback" in result["name"]
-        assert result["code"] != ""
+        assert result["name"].startswith("failed_")
+        assert result["code"] == ""
         assert "config error" in result["motivation"].lower()
         # The chat client should never have been built or called.
         assert not mock_openai.return_value.chat.completions.create.called

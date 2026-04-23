@@ -1141,6 +1141,9 @@ def build_handlers(
             return "errors: empty code"
         ok, errors = validate_code(code, challenge)
         if ok:
+            # Stash the most recent validated code so the agent can
+            # auto-submit it if the LLM never calls submit explicitly.
+            state_holder["last_validated_code"] = code
             return "ok"
         return "errors: " + "; ".join(errors)
 
@@ -1427,15 +1430,43 @@ def build_handlers(
                 result = f"error: {exc}"
             return breaker(name, str(result))
 
-        # Expose state_holder on the submit handler so the agent can
-        # persist scratchpad notes after the loop. Expose the per-round
-        # counter the same way so the agent can log a usage summary.
-        if name == "submit":
-            wrapped._state_holder = state_holder  # type: ignore[attr-defined]
-            wrapped._call_counts = _call_counts   # type: ignore[attr-defined]
         return wrapped
 
-    return {name: _wrap(name, fn) for name, fn in raw.items()}
+    class _SubmitWrapper:
+        """Callable wrapper around ``_submit`` that exposes per-round state.
+
+        The agent reads ``_state_holder`` / ``_call_counts`` after the
+        loop to persist scratchpad notes and log a tool-usage summary.
+        ``_has_validated`` / ``_last_validated_code`` let the agent
+        recover the most recent validated code if the LLM never calls
+        submit explicitly (the "analysis paralysis" failure mode).
+        """
+
+        def __init__(self):
+            self._state_holder = state_holder
+            self._call_counts = _call_counts
+
+        def __call__(self, **kwargs):
+            _call_counts["submit"] = _call_counts.get("submit", 0) + 1
+            try:
+                result = _submit(**kwargs)
+            except SubmitSignal:
+                raise
+            except Exception as exc:
+                result = f"error: {exc}"
+            return breaker("submit", str(result))
+
+        @property
+        def _has_validated(self) -> bool:
+            return bool(state_holder.get("last_validated_code"))
+
+        @property
+        def _last_validated_code(self) -> str:
+            return state_holder.get("last_validated_code") or ""
+
+    handlers = {name: _wrap(name, fn) for name, fn in raw.items()}
+    handlers["submit"] = _SubmitWrapper()
+    return handlers
 
 
 def build_tools(challenge: dict | None = None) -> list[dict]:
