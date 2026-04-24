@@ -115,7 +115,7 @@ def design_architecture(challenge: dict, client: GatedClient) -> dict:
 | Key | Usage |
 |-----|-------|
 | `challenge["db_url"]` | `client.get_json(f"{url}/experiments/recent")` |
-| `challenge["desearch_url"]` | `client.post_json(f"{url}/search", {"query": "...", "max_results": 5})` |
+| `challenge["desearch_url"]` | `client.post_json(f"{url}/desearch/ai/search", {"prompt": "...", "tools": ["arxiv", "web"], "date_filter": "PAST_YEAR", "result_type": "LINKS_WITH_FINAL_SUMMARY", "count": 5})` |
 | `challenge["llm_url"]` | `client.post_json(f"{url}/v1/chat/completions", {"model": "...", "messages": [...], "temperature": 0.7, "max_tokens": 4096})` |
 | `challenge["llm_url"]/v1/models` | `client.get_json(...)` to list allowed models |
 

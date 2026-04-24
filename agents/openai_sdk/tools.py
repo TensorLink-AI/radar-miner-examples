@@ -748,21 +748,48 @@ def build_handlers(
         try:
             resp = call_with_timeout(
                 client.post_json,
-                args=(f"{desearch_url}/search",
-                      {"query": query, "max_results": max_results}),
+                args=(f"{desearch_url}/desearch/ai/search",
+                      {
+                          "prompt": query,
+                          "tools": ["arxiv", "web"],
+                          "date_filter": "PAST_YEAR",
+                          "result_type": "LINKS_WITH_FINAL_SUMMARY",
+                          "count": max_results,
+                      }),
                 timeout=TOOL_HTTP_TIMEOUT,
             )
-            results = resp.get("results", []) if isinstance(resp, dict) else []
-            if not results:
+            if not isinstance(resp, dict):
                 return "no papers found"
             lines = []
-            for r in results[:max_results]:
-                lines.append(f"**{r.get('title', 'untitled')}**")
-                abstract = r.get("abstract", "")
-                if abstract:
-                    lines.append(abstract[:500])
+            summary = (resp.get("final_summary")
+                       or resp.get("summary")
+                       or resp.get("text"))
+            if summary:
+                lines.append(str(summary)[:2000])
                 lines.append("")
-            return "\n".join(lines)
+            links = (resp.get("links")
+                     or resp.get("completion_links")
+                     or resp.get("results")
+                     or [])
+            for r in links[:max_results]:
+                if isinstance(r, str):
+                    lines.append(r)
+                    continue
+                title = r.get("title") or r.get("url") or "untitled"
+                lines.append(f"**{title}**")
+                snippet = (r.get("snippet")
+                           or r.get("abstract")
+                           or r.get("description")
+                           or "")
+                if snippet:
+                    lines.append(snippet[:500])
+                url = r.get("url") or r.get("link")
+                if url and url != title:
+                    lines.append(url)
+                lines.append("")
+            if not lines:
+                return "no papers found"
+            return "\n".join(lines).rstrip()
         except TimeoutError:
             return f"paper search timed out after {TOOL_HTTP_TIMEOUT}s"
         except Exception as exc:
