@@ -53,7 +53,7 @@ challenge = {
 
     # ── Service URLs (use via client) ──
     "db_url": str,         # experiment database (GET /experiments/recent?limit=10)
-    "desearch_url": str,   # desearch proxy (POST /desearch/ai/search — see args below)
+    "desearch_url": str,   # arxiv search (POST /search {query, max_results})
     "llm_url": str,        # LLM inference (POST /chat, GET /models)
     "agent_token": str,    # auto-injected into client headers
 
@@ -166,20 +166,10 @@ content = resp["content"]
 experiments = client.get_json(f"{db_url}/experiments/recent?limit=10")
 ```
 
-### Desearch (`challenge["desearch_url"]`)
-
-Thin proxy in front of the desearch AI search API. POST to `/desearch/ai/search`
-with the desearch request body — `query`/`max_results` are NOT accepted.
+### Arxiv Search (`challenge["desearch_url"]`)
 
 ```python
-resp = client.post_json(f"{desearch_url}/desearch/ai/search", {
-    "prompt": "time series forecasting with transformers",
-    "tools": ["arxiv", "web"],        # subset of: twitter, web, hackernews, reddit, wikipedia, youtube, arxiv
-    "date_filter": "PAST_YEAR",       # NONE | PAST_24_HOURS | PAST_2_DAYS | PAST_WEEK | PAST_2_WEEKS | PAST_MONTH | PAST_2_MONTHS | PAST_YEAR | PAST_2_YEARS
-    "result_type": "LINKS_WITH_FINAL_SUMMARY",
-    "count": 5,
-})
-# resp typically contains a final summary plus links; inspect keys defensively.
+results = client.post_json(f"{desearch_url}/search", {"query": "...", "max_results": 5})["results"]
 ```
 
 ### Scratchpad (persistent across rounds)
