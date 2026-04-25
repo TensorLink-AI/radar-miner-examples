@@ -1144,7 +1144,13 @@ def build_handlers(
             # Stash the most recent validated code so the agent can
             # auto-submit it if the LLM never calls submit explicitly.
             state_holder["last_validated_code"] = code
-            return "ok"
+            return (
+                "ok — code passed all checks. THIS IS YOUR FINAL "
+                "ARTIFACT. Your next tool call MUST be `write_scratchpad` "
+                "followed by `submit` with this exact code. Do not call "
+                "sketch_architecture, size_to_flops, or validate_code "
+                "again unless you have a specific reason to revise."
+            )
         return "errors: " + "; ".join(errors)
 
     # ── State ────────────────────────────────────────────────────
