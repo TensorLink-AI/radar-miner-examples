@@ -399,7 +399,10 @@ class TestToolHandlers:
         ch = _make_challenge(with_flops=False)
         handlers = build_handlers(ch)
         result = handlers["validate_code"](code=VALID_CODE)
-        assert result == "ok"
+        # Success result starts with "ok" and includes a submit-now
+        # directive so the LLM doesn't go back to sketching.
+        assert result.startswith("ok")
+        assert "submit" in result.lower()
 
     def test_validate_code_errors(self):
         from agents.openai_sdk.tools import build_handlers

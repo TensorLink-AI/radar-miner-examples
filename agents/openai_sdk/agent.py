@@ -199,6 +199,7 @@ def _run_tool_loop(
     """
     submitted: str | None = None
     failure: str | None = None
+    rounds_since_validated = 0
 
     for round_num in range(max_rounds):
         remaining = deadline - time.monotonic()
@@ -218,6 +219,24 @@ def _run_tool_loop(
         has_validated = bool(getattr(
             handlers.get("submit", None), "_has_validated", False,
         ))
+
+        # Replace the previous turn-header instead of appending a stack
+        # of stale "[REMAINING:" status lines. Only safe when the
+        # immediate predecessor is itself a turn-header user message
+        # AND the message before it is not a tool message — the
+        # tool-call protocol requires tool messages to immediately
+        # follow the assistant's tool_calls, so we never pop a header
+        # that was inserted between assistant tool_calls and tool
+        # results.
+        if (
+            len(messages) >= 2
+            and messages[-1].get("role") == "user"
+            and isinstance(messages[-1].get("content"), str)
+            and messages[-1]["content"].startswith("[REMAINING:")
+            and messages[-2].get("role") != "tool"
+        ):
+            messages.pop()
+
         messages.append({
             "role": "user",
             "content": build_turn_header(
@@ -227,10 +246,22 @@ def _run_tool_loop(
             ),
         })
 
+        # Once code has been validated, narrow the tool surface to the
+        # ship path — submit + scratchpad. Removing the exploration
+        # tools is the structural fix for "keep sketching" loops: the
+        # LLM literally cannot pick a non-shipping tool when those
+        # tools aren't on the menu.
+        active_tools = tools
+        if has_validated and phase == "design":
+            keep = {"submit", "write_scratchpad", "read_scratchpad"}
+            active_tools = [
+                t for t in tools if t["function"]["name"] in keep
+            ]
+
         try:
             resp = chat(
                 messages=messages,
-                tools=tools,
+                tools=active_tools,
                 llm_url=llm_url,
                 agent_token=agent_token,
                 miner_uid=miner_uid,
@@ -316,6 +347,49 @@ def _run_tool_loop(
                 # Cap to avoid context blow-up from giant tool results.
                 "content": str(result)[:4000],
             })
+
+        # If validate_code just succeeded this round, hit the LLM with
+        # a dedicated user-role nudge right at the boundary — the turn
+        # header alone has not been enough to break the
+        # validate-then-keep-sketching loop. Only fire this when the
+        # validate call moved us from "no validated code" to "have
+        # validated code" so we don't spam every subsequent round.
+        validated_this_round = (
+            any(
+                getattr(getattr(tc, "function", None), "name", None)
+                == "validate_code"
+                for tc in tool_calls
+            )
+            and bool(getattr(
+                handlers.get("submit", None), "_has_validated", False,
+            ))
+        )
+        if validated_this_round and phase == "design":
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Validation passed. Submit now. Your next tool "
+                    "call must be `write_scratchpad` then `submit` "
+                    "with the validated code. Do not produce another "
+                    "candidate."
+                ),
+            })
+
+        # Validated-and-stalled early exit. After validation the model
+        # only needs one more turn to ship; if it burns two more
+        # rounds without submitting we bail and let the agent's
+        # auto-submit recovery path package the validated code.
+        has_validated_now = bool(getattr(
+            handlers.get("submit", None), "_has_validated", False,
+        ))
+        if has_validated_now:
+            rounds_since_validated += 1
+            if rounds_since_validated >= 2:
+                _log(
+                    f"[agent] {phase}: 2 rounds since validation, "
+                    "no submit — breaking to auto-submit"
+                )
+                break
 
     return messages, submitted, None, failure
 
