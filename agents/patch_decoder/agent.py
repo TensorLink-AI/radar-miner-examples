@@ -146,11 +146,20 @@ def _generate_code(cfg: dict, task_params: dict | None = None) -> str:
     ga = cfg["grad_accum"]
 
     param_str = ", ".join(task_params.keys()) if task_params else "**task_params"
+    # Bake the actual quantile levels into the generated code so compute_loss
+    # can apply per-quantile weighting without needing access to the challenge.
+    if task_params and "quantiles" in task_params:
+        quantiles_literal = repr(list(task_params["quantiles"]))
+    else:
+        quantiles_literal = "[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]"
 
     return textwrap.dedent(f"""\
         import torch
         import torch.nn as nn
         import math
+
+
+        QUANTILES = {quantiles_literal}
 
 
         class RevIN(nn.Module):
@@ -278,6 +287,30 @@ def _generate_code(cfg: dict, task_params: dict | None = None) -> str:
                     nn.init.xavier_uniform_(m.weight)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
+
+
+        def compute_loss(predictions, targets):
+            # Huberized (smooth) pinball loss. Standard pinball is piecewise
+            # linear with a kink at zero error, which produces noisy training
+            # curves on the dashboard. Replacing the L1 core with a Huber
+            # quadratic for |e| <= delta makes the loss C^1, smoothing
+            # gradients and the displayed loss while preserving the
+            # asymmetric quantile weighting.
+            quantiles = torch.tensor(
+                QUANTILES, device=predictions.device, dtype=predictions.dtype,
+            )
+            if targets.dim() == predictions.dim() - 1:
+                targets = targets.unsqueeze(-1)
+            error = targets - predictions
+            abs_e = error.abs()
+            delta = 0.01
+            huber = torch.where(
+                abs_e <= delta,
+                0.5 * error.pow(2) / delta,
+                abs_e - 0.5 * delta,
+            )
+            weight = torch.where(error >= 0, quantiles, 1.0 - quantiles)
+            return (weight * huber).mean()
     """)
 
 
