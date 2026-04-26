@@ -803,12 +803,11 @@ def build_handlers(
 
     if state is None:
         state = load_state(scratch_dir) if scratch_dir else {}
-    # ``wrote_this_round`` feeds the submit-time nag; ``submit_nag_count``
-    # makes the nag a one-shot so a determined LLM isn't blocked.
+    # ``wrote_this_round`` is informational only — read by ``_submit``
+    # to log a stderr warning when shipping without a fresh note.
     state_holder: dict = {
         "state": state,
         "wrote_this_round": False,
-        "submit_nag_count": 0,
     }
 
     def _frontier() -> list:
@@ -1492,21 +1491,15 @@ def build_handlers(
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
                 **_kwargs) -> str:
-        # One-shot nag: if the LLM hasn't written any scratchpad note
-        # this round, ask once before we ship. On the second submit we
-        # accept even without a note — a determined LLM isn't blocked,
-        # we just won't have fresh notes for the next round.
-        if (not state_holder.get("wrote_this_round")
-                and state_holder.get("submit_nag_count", 0) == 0):
-            state_holder["submit_nag_count"] = 1
-            return (
-                "error: please write at least one note via "
-                "`write_scratchpad` before submitting — pass one of "
-                "`hypothesis`, `dead_end` + `reason`, or "
-                "`observation`. Future rounds need your observations "
-                "from this one. This is a one-time reminder; if you "
-                "call `submit` again without writing, the submission "
-                "will go through."
+        # Soft incentive only: if the LLM hasn't written any scratchpad
+        # note this round, log a warning and let the submit go through.
+        # The harness no longer blocks shipping — notes-for-future-rounds
+        # is the LLM's responsibility, not ours.
+        if not state_holder.get("wrote_this_round"):
+            print(
+                "[agent] submit without scratchpad note this round",
+                file=sys.stderr,
+                flush=True,
             )
         raise SubmitSignal(code=code, name=name, motivation=motivation)
 
