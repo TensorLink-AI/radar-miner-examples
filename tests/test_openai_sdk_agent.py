@@ -333,7 +333,7 @@ def build_optimizer(model):
 '''
 
 
-def _make_challenge(frontier=None, with_flops=True):
+def _make_challenge(frontier=None, with_flops=True, cognition_wiki_url=""):
     ch = {
         "feasible_frontier": frontier or [],
         "task": {
@@ -351,11 +351,29 @@ def _make_challenge(frontier=None, with_flops=True):
             ],
             "objectives": [{"name": "crps", "primary": True}],
         },
+        "cognition_wiki_url": cognition_wiki_url,
     }
     if with_flops:
         ch["min_flops_equivalent"] = 500_000
         ch["max_flops_equivalent"] = 2_000_000
     return ch
+
+
+class _MockClient:
+    """Minimal GatedClient stub for wiki fetch tests.
+
+    Records call counts and returns a canned ``get`` response. Other
+    methods raise so tests don't accidentally rely on them.
+    """
+
+    def __init__(self, get_response: bytes = b""):
+        self._get_response = get_response
+        self.get_call_count = 0
+
+    def get(self, url, **_kwargs):
+        # ``call_with_timeout`` forwards a ``timeout=`` kwarg — accept it.
+        self.get_call_count += 1
+        return self._get_response
 
 
 class TestToolSchema:
@@ -373,6 +391,7 @@ class TestToolSchema:
             "check_output_shape", "read_scratchpad", "write_scratchpad",
             "list_files", "read_file", "write_file", "search_files",
             "time_remaining",
+            "cognition_wiki_index", "cognition_wiki_read",
         } == names
 
     def test_submit_requires_code_name_motivation(self):
@@ -666,6 +685,143 @@ class TestSizeToFlops:
         assert "flops=" in result
         # Should mention it did some probes
         assert "probes:" in result
+
+
+def _build_wiki_tarball(entries: dict[str, str]) -> bytes:
+    """Pack ``{name: content}`` into a gzipped tarball, return the bytes."""
+    import io as _io
+    import tarfile as _tarfile
+    buf = _io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, content in entries.items():
+            data = content.encode()
+            info = _tarfile.TarInfo(name=name)
+            info.size = len(data)
+            tar.addfile(info, _io.BytesIO(data))
+    return buf.getvalue()
+
+
+class TestCognitionWiki:
+    """Wiki tools sit next to search_papers/query_db. When
+    ``cognition_wiki_url`` is empty, both tools fail soft. When a
+    tarball is published, the index is fetched once per round and
+    cached in scratch_dir."""
+
+    def test_index_when_url_empty_returns_not_published(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        client = _MockClient()
+        handlers = build_handlers(
+            _make_challenge(cognition_wiki_url=""),
+            client=client,
+            scratch_dir=str(tmp_path),
+        )
+        out = handlers["cognition_wiki_index"]()
+        assert "not published" in out.lower()
+        assert client.get_call_count == 0
+
+    def test_read_when_url_empty_returns_not_published(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        client = _MockClient()
+        handlers = build_handlers(
+            _make_challenge(cognition_wiki_url=""),
+            client=client,
+            scratch_dir=str(tmp_path),
+        )
+        out = handlers["cognition_wiki_read"](slug="patchtst")
+        assert "not published" in out.lower()
+        assert client.get_call_count == 0
+
+    def test_index_extracts_and_caches_tarball(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        tar_bytes = _build_wiki_tarball({
+            "_index.md": "# Test Wiki\n\n- foo: a foo entry\n",
+            "foo.md": "# foo\n\nFull content of foo entry.\n",
+        })
+        client = _MockClient(get_response=tar_bytes)
+        handlers = build_handlers(
+            _make_challenge(
+                cognition_wiki_url="https://r2.example/wiki.tar.gz",
+            ),
+            client=client,
+            scratch_dir=str(tmp_path),
+        )
+
+        out = handlers["cognition_wiki_index"]()
+        assert "Test Wiki" in out
+        assert "foo" in out
+
+        # Second call hits the on-disk cache, doesn't re-fetch.
+        out2 = handlers["cognition_wiki_index"]()
+        assert out2 == out
+        assert client.get_call_count == 1
+
+    def test_read_returns_entry_content(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        tar_bytes = _build_wiki_tarball({
+            "_index.md": "# index\n",
+            "patchtst.md": "# patchtst\n\nClaim: patches help.\n",
+        })
+        handlers = build_handlers(
+            _make_challenge(
+                cognition_wiki_url="https://r2.example/wiki.tar.gz",
+            ),
+            client=_MockClient(get_response=tar_bytes),
+            scratch_dir=str(tmp_path),
+        )
+        out = handlers["cognition_wiki_read"](slug="patchtst")
+        assert "Claim: patches help." in out
+
+    def test_read_unknown_slug_returns_not_found(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        tar_bytes = _build_wiki_tarball({
+            "_index.md": "# index\n",
+            "foo.md": "# foo\n",
+        })
+        handlers = build_handlers(
+            _make_challenge(
+                cognition_wiki_url="https://r2.example/wiki.tar.gz",
+            ),
+            client=_MockClient(get_response=tar_bytes),
+            scratch_dir=str(tmp_path),
+        )
+        out = handlers["cognition_wiki_read"](slug="missing")
+        assert "not found" in out.lower()
+
+    def test_read_rejects_path_traversal_and_bad_slugs(self, tmp_path):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(
+                cognition_wiki_url="https://r2.example/wiki.tar.gz",
+            ),
+            client=_MockClient(),
+            scratch_dir=str(tmp_path),
+        )
+        # Each bad slug must be rejected before any disk read. We accept
+        # the circuit-breaker message too — it only fires on identical
+        # error strings, which means the rejection is consistent.
+        for bad in ("../etc/passwd", "foo/bar", "foo bar", "foo.md", ""):
+            out = handlers["cognition_wiki_read"](slug=bad)
+            low = out.lower()
+            assert (
+                out.startswith("error:")
+                or "not found" in low
+                or "unavailable" in low
+                or "circuit open" in low
+            ), f"expected reject for {bad!r}, got {out!r}"
+
+    def test_index_handles_missing_index_file(self, tmp_path):
+        """Tarball without _index.md → 'unavailable' string, no crash."""
+        from agents.openai_sdk.tools import build_handlers
+        tar_bytes = _build_wiki_tarball({"foo.md": "# foo\n"})
+        handlers = build_handlers(
+            _make_challenge(
+                cognition_wiki_url="https://r2.example/wiki.tar.gz",
+            ),
+            client=_MockClient(get_response=tar_bytes),
+            scratch_dir=str(tmp_path),
+        )
+        out = handlers["cognition_wiki_index"]()
+        assert "unavailable" in out.lower()
 
 
 class TestScratchpadNotes:

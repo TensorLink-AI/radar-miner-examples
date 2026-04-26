@@ -18,10 +18,13 @@ tool with the same failing args over and over.
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import sys
+import tarfile
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -53,6 +56,46 @@ FILE_SEARCH_MAX_TOTAL_MATCHES = 30    # global cap across all files
 # notes file is owned by write_scratchpad — don't let the LLM clobber
 # either from the generic file tools.
 RESERVED_FILE_NAMES = frozenset({"state.json"})
+
+# Cognition wiki tarball is fetched once per round and cached in scratch.
+COGNITION_WIKI_CACHE_DIR = "_cognition_wiki"  # subdir of scratch_dir
+COGNITION_WIKI_FETCH_TIMEOUT = 20  # seconds
+COGNITION_WIKI_MAX_BYTES = 5 * 1024 * 1024  # 5 MB sanity cap
+
+
+def _ensure_wiki_extracted(client, url: str, scratch_dir: str | None) -> Path | None:
+    """Fetch the wiki tarball once per round, extract it, return the dir.
+
+    Cached across calls in the same round via scratch_dir. Returns None
+    if any step fails — caller must handle gracefully.
+    """
+    if not url or client is None or scratch_dir is None:
+        return None
+    cache_dir = Path(scratch_dir) / COGNITION_WIKI_CACHE_DIR
+    if cache_dir.exists() and (cache_dir / "_index.md").is_file():
+        return cache_dir
+    try:
+        data = call_with_timeout(
+            client.get, args=(url,), timeout=COGNITION_WIKI_FETCH_TIMEOUT,
+        )
+        if not isinstance(data, (bytes, bytearray)):
+            return None
+        if len(data) > COGNITION_WIKI_MAX_BYTES:
+            return None
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                target = (cache_dir / member.name).resolve()
+                if (cache_dir.resolve() not in target.parents
+                        and target != cache_dir.resolve()):
+                    return None
+            tar.extractall(cache_dir)
+        if not (cache_dir / "_index.md").is_file():
+            return None
+        return cache_dir
+    except (TimeoutError, tarfile.TarError, OSError, Exception):
+        return None
+
 
 # ── Schema (OpenAI function-calling format) ───────────────────────────
 
@@ -124,6 +167,49 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cognition_wiki_index",
+            "description": (
+                "Fetch the cognition wiki's table of contents — a curated, "
+                "task-specific corpus of architecture-design and training "
+                "insights maintained by the subnet operator. Returns "
+                "_index.md (claim-first summaries grouped by category) so "
+                "you can decide which entries to read in full. Cheaper and "
+                "more reliable than search_papers for known design "
+                "questions. Returns 'not published' when no wiki exists "
+                "for this task."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cognition_wiki_read",
+            "description": (
+                "Read one full entry from the cognition wiki by slug. Use "
+                "after cognition_wiki_index so you know which slug to "
+                "request. Each entry is 200-400 words: claim, mechanism, "
+                "concrete hyperparameters, FLOPs guidance, applicability."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": (
+                            "Entry slug from cognition_wiki_index "
+                            "(e.g. 'patchtst', 'revin', "
+                            "'medium-model-recipe')"
+                        ),
+                    },
+                },
+                "required": ["slug"],
             },
         },
     },
@@ -802,6 +888,43 @@ def build_handlers(
         except Exception as exc:
             return f"DB query failed: {exc}"
 
+    wiki_url = (challenge.get("cognition_wiki_url") or "").strip()
+
+    def _cognition_wiki_index(**_kwargs) -> str:
+        if not wiki_url:
+            return "cognition wiki not published for this task"
+        wiki_dir = _ensure_wiki_extracted(client, wiki_url, scratch_dir)
+        if wiki_dir is None:
+            return "cognition wiki unavailable (fetch or extract failed)"
+        try:
+            return (wiki_dir / "_index.md").read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"cognition wiki index read failed: {exc}"
+
+    def _cognition_wiki_read(slug: str = "", **_kwargs) -> str:
+        if not slug:
+            return "error: empty slug"
+        safe = "".join(c for c in slug if c.isalnum() or c in "-_")
+        if not safe or safe != slug:
+            return (
+                "error: slug must be alphanumeric, hyphen, or underscore only"
+            )
+        if not wiki_url:
+            return "cognition wiki not published for this task"
+        wiki_dir = _ensure_wiki_extracted(client, wiki_url, scratch_dir)
+        if wiki_dir is None:
+            return "cognition wiki unavailable (fetch or extract failed)"
+        entry = wiki_dir / f"{safe}.md"
+        if not entry.is_file():
+            return (
+                f"slug '{safe}' not found in wiki — call "
+                "cognition_wiki_index for the list"
+            )
+        try:
+            return entry.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"cognition wiki read failed: {exc}"
+
     # ── Analysis ─────────────────────────────────────────────────
 
     def _analyze_task(**_kwargs) -> str:
@@ -1403,6 +1526,8 @@ def build_handlers(
     raw = {
         "search_papers": _search_papers,
         "query_db": _query_db,
+        "cognition_wiki_index": _cognition_wiki_index,
+        "cognition_wiki_read": _cognition_wiki_read,
         "analyze_task": _analyze_task,
         "estimate_layer_flops": _estimate_layer_flops,
         "sketch_architecture": _sketch_architecture,
