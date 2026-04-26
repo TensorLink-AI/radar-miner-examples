@@ -201,14 +201,13 @@ def build_system_prompt(challenge: dict, bucket: str | None = None) -> str:
     return "\n\n".join(parts)
 
 
-def build_turn_header(elapsed_s: int, has_validated: bool = False) -> str:
+def build_turn_header(elapsed_s: int, has_validated: bool) -> str:
     """Per-turn informational header.
 
     Minimal — no directives, no escalation. The LLM can call
     `time_remaining` if it cares about the clock.
     """
-    elapsed_min = max(0, elapsed_s) // 60
-    return f"[elapsed: {elapsed_min}m | validated: {has_validated}]"
+    return f"[elapsed: {max(0, elapsed_s) // 60}m | validated: {has_validated}]"
 
 
 def build_user_prompt(challenge: dict, bucket: str | None = None) -> str:

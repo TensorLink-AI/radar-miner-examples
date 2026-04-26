@@ -183,6 +183,7 @@ def _run_tool_loop(
     deadline: float,
     max_rounds: int,
     phase: str,
+    t_start: float,
     llm_url: str = "",
     agent_token: str = "",
     miner_uid: str = "",
@@ -212,27 +213,26 @@ def _run_tool_loop(
                 failure = "deadline"
             break
 
-        # Per-turn time-aware status header. The directive escalates as
-        # the deadline approaches and changes wording when validated
-        # code is already on file — primary lever against the
-        # "analysis paralysis" failure mode.
+        # Per-turn informational header — elapsed minutes + whether the
+        # model has validated code on file. No directives; the LLM owns
+        # its own pacing.
         has_validated = bool(getattr(
             handlers.get("submit", None), "_has_validated", False,
         ))
+        elapsed_s = int(time.monotonic() - t_start)
 
         # Replace the previous turn-header instead of appending a stack
-        # of stale "[REMAINING:" status lines. Only safe when the
-        # immediate predecessor is itself a turn-header user message
-        # AND the message before it is not a tool message — the
-        # tool-call protocol requires tool messages to immediately
-        # follow the assistant's tool_calls, so we never pop a header
-        # that was inserted between assistant tool_calls and tool
-        # results.
+        # of stale status lines. Only safe when the immediate
+        # predecessor is itself a turn-header user message AND the
+        # message before it is not a tool message — the tool-call
+        # protocol requires tool messages to immediately follow the
+        # assistant's tool_calls, so we never pop a header that was
+        # inserted between assistant tool_calls and tool results.
         if (
             len(messages) >= 2
             and messages[-1].get("role") == "user"
             and isinstance(messages[-1].get("content"), str)
-            and messages[-1]["content"].startswith("[REMAINING:")
+            and messages[-1]["content"].startswith("[elapsed:")
             and messages[-2].get("role") != "tool"
         ):
             messages.pop()
@@ -240,8 +240,7 @@ def _run_tool_loop(
         messages.append({
             "role": "user",
             "content": build_turn_header(
-                remaining_s=int(remaining),
-                phase=phase,
+                elapsed_s=elapsed_s,
                 has_validated=has_validated,
             ),
         })
@@ -516,6 +515,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             deadline=research_deadline,
             max_rounds=RESEARCH_MAX_ROUNDS,
             phase="research",
+            t_start=t_start,
             llm_url=llm_url,
             agent_token=agent_token,
             miner_uid=miner_uid,
@@ -547,6 +547,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
                     deadline=deadline,
                     max_rounds=DESIGN_MAX_ROUNDS,
                     phase="design",
+                    t_start=t_start,
                     llm_url=llm_url,
                     agent_token=agent_token,
                     miner_uid=miner_uid,
