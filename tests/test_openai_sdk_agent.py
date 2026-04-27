@@ -390,6 +390,7 @@ class TestToolSchema:
             "sketch_architecture", "trace_architecture",
             "check_output_shape", "read_scratchpad", "write_scratchpad",
             "list_files", "read_file", "write_file", "search_files",
+            "list_candidates", "get_candidate",
             "time_remaining",
             "cognition_wiki_index", "cognition_wiki_read",
         } == names

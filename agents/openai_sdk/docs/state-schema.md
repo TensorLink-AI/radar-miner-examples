@@ -401,57 +401,55 @@ counters apply transparently. Failure of any step aborts the macro
 
 ---
 
-## 5. Open questions
+## 5. Resolved decisions and open questions
 
-1. **Code storage in candidates.** Storing full code per candidate × 50
-   candidates × ~5 KB each = ~250 KB scratchpad usage just for
-   candidates. The scratchpad upload is capped by
-   `challenge["scratchpad_max_mb"]` — typically 5 MB — so this is fine
-   in absolute terms but it dominates the budget. Options:
-   1. Store code inline in the candidate (simplest).
-   2. Store code in a separate top-level `code_store: dict[code_hash,
-      str]` and reference by hash from candidates and history. Dedups
-      multiple candidates with the same code, useful when
-      validate-after-sketch is the same code.
-   3. Store code only for `status in {"validated", "submitted"}` and
-      drop it for sketched-but-discarded candidates.
-   **My recommendation:** option (3). Sketched-only code is rarely
-   useful to look back at; validated/submitted code is.
+### 5.0 Resolved (locked in for feature 1)
 
-2. **Cap-when-referenced.** When dropping the oldest candidate, do we
-   skip past candidates referenced by a `history` entry's
-   `candidate_id` or by a `hypotheses[*].candidate_id`? I'd say yes,
-   otherwise resolved hypotheses lose their evidence link. But this
-   complicates the cap logic. Easier alternative: just bump the cap to
-   100 and accept some bloat.
+1. **Code storage in candidates.** Store code only for `status in
+   {"validated", "submitted"}`. Sketched-only candidates carry
+   `code = None`. Keeps scratchpad lean while preserving the records
+   that are actually worth re-reading.
 
-3. **Candidate ID format.** `cand_0042` (monotonic, with seq counter)
-   vs `cand_<8-char-hash>` (random, no counter needed). Monotonic is
-   easier to read in logs and the LLM can reason about ordering. I'm
-   leaning monotonic — the `next_candidate_seq` counter is one extra
-   key.
+2. **Cap-when-referenced.** No reference-aware logic. Cap at
+   `MAX_CANDIDATES = 100` and drop oldest first. Simpler; the larger
+   cap absorbs the loss.
 
-4. **Cross-round candidate visibility.** Should `list_candidates`
-   default to "this round only" or "all-time"? I'd default to all-time
-   with a `recent_only=True` flag, since the lineage tree's value is
-   long-term.
+3. **Candidate ID format.** Monotonic `cand_0042` via
+   `next_candidate_seq`. Easier to reason about in logs and prompts
+   than random hashes.
 
-5. **Implicit candidate creation in `validate_code`.** If the LLM calls
-   `validate_code(code)` without a `candidate_id`, do we auto-create a
-   candidate? Pros: simple, no LLM contract change for callers that
-   ignore the new field. Cons: every dud validate spawns a candidate
-   record. Mitigation: only create a candidate on `ok`; on errors, just
-   return. **My recommendation:** auto-create only on success.
+4. **Implicit candidate creation in `validate_code`.** Auto-create a
+   candidate ONLY when validation passes. Failed validates do not
+   create a record. Sketched candidates passed in via `candidate_id`
+   are updated in place and gain `status="validated"` plus the code
+   payload.
 
-6. **Macro failure semantics.** Step fails → abort vs continue?
+5. **Submission also writes a history entry.** Today the openai_sdk
+   agent never calls `history.add_entry`, so `state["history"]` is
+   permanently empty and `merge_results_into_state` has nothing to
+   join against. Feature 1 fixes this by having `_submit` add a
+   history entry (with `candidate_id`) before raising `SubmitSignal`.
+   This is in scope because it's where the `candidate_id` ↔ history
+   join lives. Auto-submit recovery (when the LLM never explicitly
+   calls submit) does NOT add a history entry — keeping that gap
+   matches today's behaviour and avoids creeping scope.
+
+### 5.1 Still open (don't block feature 1)
+
+1. **Cross-round candidate visibility.** Should `list_candidates`
+   default to "this round only" or "all-time"? Leaning all-time with a
+   `recent_only=True` flag, since the lineage tree's value is
+   long-term. Decide before the tool ships in feature 1's PR.
+
+2. **Macro failure semantics.** Step fails → abort vs continue?
    Default abort, but expose `continue_on_error: bool = False` per
    step? I'd start with always-abort to keep the spec small.
 
-7. **Macro nesting.** Can a macro call `run_macro`? Risk: infinite
+3. **Macro nesting.** Can a macro call `run_macro`? Risk: infinite
    recursion. Easy fix: forbid `run_macro` and `define_macro` from
    appearing inside a macro `sequence` (validate at define time).
 
-8. **`previous_results` → hypothesis outcome auto-link.** This needs
+4. **`previous_results` → hypothesis outcome auto-link.** This needs
    the join key. We have `history.candidate_id` and
    `hypothesis.candidate_id`, so the join is
    `hypothesis.candidate_id == history.candidate_id`, then read the
@@ -461,13 +459,13 @@ counters apply transparently. Failure of any step aborts the macro
    judges manually? **My recommendation:** auto-fill score/rank only;
    leave verdict to the LLM via `link_hypothesis`.
 
-9. **Notes vs hypotheses double-write.** During the migration window,
+5. **Notes vs hypotheses double-write.** During the migration window,
    `write_scratchpad(hypothesis=...)` writes both to
    `notes.open_hypotheses` (list[str]) and `hypotheses` (structured).
    When do we stop the double-write? Probably after one round of
    in-the-wild verification.
 
-10. **Token budget impact on `read_scratchpad`.** Adding the
+6. **Token budget impact on `read_scratchpad`.** Adding the
     `Hypotheses` and `Candidates` sections inflates the read result.
     `read_scratchpad` already returns up to ~10 history entries; we
     should probably cap each new section at 10 visible items too, with

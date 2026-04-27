@@ -33,8 +33,10 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    add_note, extract_flops_budget, format_history, format_notes,
-    get_history, load_state, save_state,
+    add_candidate, add_entry, add_note, extract_flops_budget,
+    find_candidate, format_history, format_notes, get_candidates,
+    get_history, identify_bucket, load_state, save_state,
+    update_candidate,
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
@@ -295,7 +297,10 @@ TOOLS: list[dict] = [
                 "traces per-layer shapes, and checks output shape against "
                 "the task constraint. build_optimizer is auto-added if "
                 "missing. Use this to validate a design before writing "
-                "full production code."
+                "full production code. Each call records a candidate "
+                "(``cand_NNNN``) in the lineage tree; pass the parent's "
+                "id via ``parent_candidate_id`` when this sketch is a "
+                "fork of a prior one."
             ),
             "parameters": {
                 "type": "object",
@@ -306,6 +311,14 @@ TOOLS: list[dict] = [
                             "Python code containing a `def build_model(...)` "
                             "that returns an nn.Module. No need to include "
                             "build_optimizer — one is added automatically."
+                        ),
+                    },
+                    "parent_candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. ID of a prior candidate this sketch "
+                            "forks from (e.g. 'cand_0042'). Use "
+                            "list_candidates to see what's available."
                         ),
                     },
                 },
@@ -488,7 +501,12 @@ TOOLS: list[dict] = [
                 "Validate a candidate model. Returns 'ok' or 'errors: ...' "
                 "covering syntax, missing build_model/build_optimizer, "
                 "forbidden imports, FLOPs out of bucket, and output-shape "
-                "mismatches. Always call this before `submit`."
+                "mismatches. Always call this before `submit`. On 'ok' "
+                "the validated candidate id is reported on the last line "
+                "(e.g. 'candidate_id: cand_0042'); pass that id to "
+                "``submit`` so the lineage tree is preserved. If you "
+                "already have a sketched candidate, pass its id via "
+                "``candidate_id`` to update it in place."
             ),
             "parameters": {
                 "type": "object",
@@ -497,12 +515,70 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "description": "Full Python source to validate.",
                     },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. ID of a sketched candidate to "
+                            "promote to validated status (e.g. "
+                            "'cand_0042'). Omit to create a fresh "
+                            "candidate when validation passes."
+                        ),
+                    },
                 },
                 "required": ["code"],
             },
         },
     },
     # ── State ────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "list_candidates",
+            "description": (
+                "List the recent candidate records (architectures the "
+                "agent has sketched, validated, or submitted, across "
+                "rounds). Each entry shows id, status, parent_id, "
+                "flops_estimated, and name — use ``get_candidate`` to "
+                "fetch the full record including code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 20,
+                        "description": (
+                            "Most-recent N candidates (default 20)."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_candidate",
+            "description": (
+                "Return one candidate record as JSON. Includes the full "
+                "code for validated and submitted candidates; sketched "
+                "candidates carry no code."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {
+                        "type": "string",
+                        "description": "Candidate id, e.g. 'cand_0042'.",
+                    },
+                },
+                "required": ["candidate_id"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -676,7 +752,10 @@ TOOLS: list[dict] = [
             "name": "submit",
             "description": (
                 "Terminal tool — submit the validated model code, ending "
-                "the loop. Code MUST have passed `validate_code` first."
+                "the loop. Code MUST have passed `validate_code` first. "
+                "Pass ``candidate_id`` (returned by validate_code) so "
+                "this submission stays linked to its lineage and shows "
+                "up correctly in read_my_submissions / read_scratchpad."
             ),
             "parameters": {
                 "type": "object",
@@ -695,6 +774,15 @@ TOOLS: list[dict] = [
                         "type": "string",
                         "description": (
                             "Why this design — what it improves."
+                        ),
+                    },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. ID of the candidate this code "
+                            "came from (e.g. 'cand_0042'). When "
+                            "provided, the candidate is marked submitted "
+                            "and the history entry is linked to it."
                         ),
                     },
                 },
@@ -823,6 +911,16 @@ def build_handlers(
     desearch_url = (challenge.get("desearch_url") or "").rstrip("/")
     flops_min, flops_max = extract_flops_budget(challenge)
     target_flops = int(flops_max * 0.6) if flops_max else 0
+    bucket_name = identify_bucket(flops_min, flops_max) if flops_max else ""
+    round_id = str(
+        challenge.get("round_id")
+        or challenge.get("challenge_id")
+        or ""
+    )
+
+    # Cap on the sketch_summary text we stash in candidate records to
+    # keep state.json from ballooning when the LLM sketches a lot.
+    SKETCH_SUMMARY_MAX = 1024
 
     if state is None:
         state = load_state(scratch_dir) if scratch_dir else {}
@@ -1037,9 +1135,20 @@ def build_handlers(
             )
         return "\n".join(lines)
 
-    def _sketch_architecture(code: str = "", **_kwargs) -> str:
+    def _sketch_architecture(code: str = "",
+                             parent_candidate_id: str = "",
+                             **_kwargs) -> str:
         if not code or not code.strip():
             return "error: empty code"
+
+        parent_id: str | None = None
+        if parent_candidate_id:
+            if find_candidate(state_holder["state"], parent_candidate_id) is None:
+                return (
+                    f"error: parent_candidate_id {parent_candidate_id!r} "
+                    "not found — call list_candidates to see available ids"
+                )
+            parent_id = parent_candidate_id
 
         if "def build_optimizer" not in code:
             code = code.rstrip() + (
@@ -1125,6 +1234,18 @@ def build_handlers(
             "\nNote: sketch_architecture does NOT reject on FLOPs bounds. "
             "Use validate_code for the final pre-submission check."
         )
+
+        sketch_summary = "\n".join(lines)[-SKETCH_SUMMARY_MAX:]
+        record = add_candidate(
+            state_holder["state"],
+            status="sketched",
+            parent_id=parent_id,
+            bucket=bucket_name,
+            flops_estimated=int(estimated) if estimated is not None else None,
+            round_id=round_id,
+            sketch_summary=sketch_summary,
+        )
+        lines.append(f"\ncandidate_id: {record['id']}")
         return "\n".join(lines)
 
     def _estimate_flops(code: str = "", **_kwargs) -> str:
@@ -1294,24 +1415,97 @@ def build_handlers(
             f"(B, {expected_pretty})."
         )
 
-    def _validate_code(code: str = "", **_kwargs) -> str:
+    def _validate_code(code: str = "", candidate_id: str = "",
+                       **_kwargs) -> str:
         if not code:
             return "errors: empty code"
+        if candidate_id and find_candidate(
+            state_holder["state"], candidate_id,
+        ) is None:
+            return (
+                f"errors: candidate_id {candidate_id!r} not found — call "
+                "list_candidates to see available ids"
+            )
         ok, errors = validate_code(code, challenge)
         if ok:
             # Stash the most recent validated code so the agent can
             # auto-submit it if the LLM never calls submit explicitly.
             state_holder["last_validated_code"] = code
+            state_holder["last_validated_candidate_id"] = ""
+            if candidate_id:
+                update_candidate(
+                    state_holder["state"], candidate_id,
+                    status="validated",
+                    code=code,
+                    validate_result="ok",
+                )
+                cid = candidate_id
+            else:
+                rec = add_candidate(
+                    state_holder["state"],
+                    status="validated",
+                    code=code,
+                    bucket=bucket_name,
+                    round_id=round_id,
+                    validate_result="ok",
+                )
+                cid = rec["id"]
+            state_holder["last_validated_candidate_id"] = cid
             return (
                 "ok — code passed all checks. THIS IS YOUR FINAL "
                 "ARTIFACT. Your next tool call MUST be `write_scratchpad` "
-                "followed by `submit` with this exact code. Do not call "
+                "followed by `submit` with this exact code (and "
+                f"candidate_id={cid}). Do not call "
                 "sketch_architecture, size_to_flops, or validate_code "
-                "again unless you have a specific reason to revise."
+                "again unless you have a specific reason to revise.\n"
+                f"candidate_id: {cid}"
             )
-        return "errors: " + "; ".join(errors)
+        # Failed validation: don't create a candidate (keeps the lineage
+        # tree from filling up with noise). If the caller passed an
+        # existing candidate_id we DO record the failed validate_result
+        # on it so the LLM can see what went wrong later.
+        joined = "; ".join(errors)
+        if candidate_id:
+            update_candidate(
+                state_holder["state"], candidate_id,
+                validate_result="errors: " + joined,
+            )
+        return "errors: " + joined
 
     # ── State ────────────────────────────────────────────────────
+
+    def _list_candidates(limit: int = 20, **_kwargs) -> str:
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit = 20
+        cands = get_candidates(state_holder["state"])
+        if not cands:
+            return "no candidates yet"
+        recent = cands[-limit:]
+        items = [
+            {
+                "id": c.get("id"),
+                "status": c.get("status"),
+                "parent_id": c.get("parent_id"),
+                "flops_estimated": c.get("flops_estimated"),
+                "name": c.get("name") or "",
+                "round_id": c.get("round_id") or "",
+            }
+            for c in recent
+        ]
+        return json.dumps(items, indent=2, default=str)
+
+    def _get_candidate(candidate_id: str = "", **_kwargs) -> str:
+        if not candidate_id:
+            return "error: candidate_id is required"
+        record = find_candidate(state_holder["state"], candidate_id)
+        if record is None:
+            return (
+                f"error: candidate_id {candidate_id!r} not found — call "
+                "list_candidates to see available ids"
+            )
+        return json.dumps(record, indent=2, default=str)
 
     def _read_scratchpad(**_kwargs) -> str:
         state = state_holder["state"]
@@ -1526,7 +1720,7 @@ def build_handlers(
     # ── Control ──────────────────────────────────────────────────
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
-                **_kwargs) -> str:
+                candidate_id: str = "", **_kwargs) -> str:
         # Soft incentive only: if the LLM hasn't written any scratchpad
         # note this round, log a warning and let the submit go through.
         # The harness no longer blocks shipping — notes-for-future-rounds
@@ -1537,6 +1731,37 @@ def build_handlers(
                 file=sys.stderr,
                 flush=True,
             )
+        # Resolve candidate linkage. Prefer the explicit kwarg; fall
+        # back to the last validated candidate (set by _validate_code)
+        # so the LLM doesn't have to re-thread the id manually.
+        cid = candidate_id or state_holder.get(
+            "last_validated_candidate_id", "",
+        )
+        record = (
+            find_candidate(state_holder["state"], cid) if cid else None
+        )
+        if record is not None:
+            update_candidate(
+                state_holder["state"], cid,
+                status="submitted",
+                name=name,
+                motivation=motivation,
+                code=code,
+                submitted_round_id=round_id,
+            )
+        # Add a history entry so previous_results from the next round
+        # has something to merge against. Without this, state["history"]
+        # stays permanently empty in the openai_sdk agent.
+        add_entry(
+            state_holder["state"],
+            name=name,
+            code=code,
+            motivation=motivation,
+            bucket=bucket_name,
+            flops=target_flops,
+            strategy="openai_sdk",
+            candidate_id=cid or None,
+        )
         raise SubmitSignal(code=code, name=name, motivation=motivation)
 
     def _time_remaining(**_kwargs) -> str:
@@ -1567,6 +1792,8 @@ def build_handlers(
         "trace_architecture": _trace_architecture,
         "check_output_shape": _check_output_shape,
         "validate_code": _validate_code,
+        "list_candidates": _list_candidates,
+        "get_candidate": _get_candidate,
         "read_scratchpad": _read_scratchpad,
         "write_scratchpad": _write_scratchpad,
         "list_files": _list_files,
