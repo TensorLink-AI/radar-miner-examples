@@ -1,5 +1,6 @@
 """Persistent experiment history across rounds — stored in scratchpad state."""
 
+import hashlib
 import json
 import os
 import time
@@ -179,8 +180,7 @@ def best_own_submission(state: dict,
 
 def add_entry(state: dict, *, name: str, code: str, motivation: str,
               bucket: str = "", flops: int = 0,
-              strategy: str = "", metadata: dict | None = None,
-              candidate_id: str | None = None) -> dict:
+              strategy: str = "", metadata: dict | None = None) -> dict:
     """Add a history entry to the scratchpad state. Returns updated state."""
     if "history" not in state:
         state["history"] = []
@@ -196,8 +196,6 @@ def add_entry(state: dict, *, name: str, code: str, motivation: str,
     }
     if metadata:
         entry["metadata"] = metadata
-    if candidate_id:
-        entry["candidate_id"] = candidate_id
     state["history"].append(entry)
 
     # Keep last 50 entries to avoid scratchpad bloat
@@ -209,101 +207,87 @@ def add_entry(state: dict, *, name: str, code: str, motivation: str,
 
 # ── Candidate lineage ────────────────────────────────────────────────
 #
-# A candidate is a piece of code the agent has worked on. Sketched
-# candidates carry no code (status="sketched"); validated and submitted
-# candidates do (status="validated" / "submitted"). Lineage is the
-# parent_id pointer.
+# A candidate is a piece of code the agent has worked on. The
+# ``candidates`` state key is a dict keyed by a stable ``cand_<8 hex>``
+# id derived from the code itself, so identical code always yields the
+# same id (natural deduplication across sketch/validate/submit).
 #
-# IDs are monotonic ``cand_NNNN`` strings via ``next_candidate_seq``.
+# Each record holds: code, flops, trace (optional), validated (bool),
+# submitted (bool), created_at.
 
-MAX_CANDIDATES = 100
-CANDIDATE_STATUSES = ("sketched", "validated", "submitted", "rejected")
-
-
-def get_candidates(state: dict) -> list[dict]:
-    """Return the candidate list (read-only view; defaults to empty)."""
-    return state.get("candidates", [])
+CANDIDATE_ID_PREFIX = "cand_"
+CANDIDATE_ID_HEX_LEN = 8
 
 
-def _candidates(state: dict) -> list[dict]:
-    """Return the mutable candidate list, creating it on demand."""
-    return state.setdefault("candidates", [])
+def make_candidate_id(code: str) -> str:
+    """Stable id for a chunk of code: ``cand_`` + first 8 sha1 hex chars."""
+    digest = hashlib.sha1(code.encode("utf-8")).hexdigest()
+    return CANDIDATE_ID_PREFIX + digest[:CANDIDATE_ID_HEX_LEN]
 
 
-def next_candidate_id(state: dict) -> str:
-    """Allocate the next monotonic candidate id (``cand_0001``, ...)."""
-    seq = int(state.get("next_candidate_seq", 1))
-    state["next_candidate_seq"] = seq + 1
-    return f"cand_{seq:04d}"
+def get_candidates(state: dict) -> dict:
+    """Return the candidate dict (read-only view; defaults to empty)."""
+    return state.get("candidates", {})
+
+
+def _candidates(state: dict) -> dict:
+    """Return the mutable candidate dict, creating it on demand."""
+    return state.setdefault("candidates", {})
 
 
 def find_candidate(state: dict, candidate_id: str) -> dict | None:
     """Look up a candidate by id. Returns None if not found."""
-    for c in get_candidates(state):
-        if c.get("id") == candidate_id:
-            return c
-    return None
+    return get_candidates(state).get(candidate_id)
 
 
-def add_candidate(state: dict, *, status: str,
-                  parent_id: str | None = None,
-                  name: str = "",
-                  motivation: str = "",
-                  code: str | None = None,
-                  bucket: str = "",
-                  flops_estimated: int | None = None,
-                  round_id: str = "",
-                  sketch_summary: str | None = None,
-                  validate_result: str | None = None) -> dict:
-    """Append a new candidate record and return it. Caps at
-    ``MAX_CANDIDATES`` by dropping the oldest.
+def upsert_candidate(state: dict, *, code: str,
+                     flops: int | None = None,
+                     trace: str | list | None = None) -> str:
+    """Insert (or update) a candidate keyed by ``make_candidate_id(code)``.
+
+    Returns the candidate id. If a record already exists, ``flops`` and
+    ``trace`` are filled in only when newly available — the existing
+    ``validated``/``submitted`` flags and ``created_at`` are preserved.
     """
-    if status not in CANDIDATE_STATUSES:
-        raise ValueError(
-            f"unknown candidate status {status!r}; "
-            f"expected one of {CANDIDATE_STATUSES}"
-        )
-    cid = next_candidate_id(state)
-    record = {
-        "id": cid,
-        "round_id": round_id,
-        "created_at": time.time(),
-        "parent_id": parent_id,
-        "name": name,
-        "motivation": motivation,
-        "status": status,
-        "bucket": bucket,
-        "flops_estimated": flops_estimated,
-        "sketch_summary": sketch_summary,
-        "validate_result": validate_result,
-        "submitted_round_id": None,
-    }
-    if code is not None:
-        record["code"] = code
-        record["code_hash"] = hash(code) & 0xFFFFFFFF
+    cid = make_candidate_id(code)
     cands = _candidates(state)
-    cands.append(record)
-    if len(cands) > MAX_CANDIDATES:
-        del cands[: len(cands) - MAX_CANDIDATES]
-    return record
+    record = cands.get(cid)
+    if record is None:
+        cands[cid] = {
+            "code": code,
+            "flops": flops,
+            "trace": trace,
+            "validated": False,
+            "submitted": False,
+            "created_at": time.time(),
+        }
+    else:
+        if flops is not None and record.get("flops") is None:
+            record["flops"] = flops
+        if trace is not None and record.get("trace") is None:
+            record["trace"] = trace
+    return cid
 
 
-def update_candidate(state: dict, candidate_id: str, **fields) -> dict | None:
-    """Patch ``fields`` onto an existing candidate. Returns the record or
-    None if no candidate matches. Recomputes ``code_hash`` when ``code``
-    is supplied. Validates ``status`` if present.
+def mark_candidate_validated(state: dict, candidate_id: str) -> dict | None:
+    """Set ``validated=True`` on an existing candidate. Returns the record
+    or None if not found.
     """
     record = find_candidate(state, candidate_id)
     if record is None:
         return None
-    if "status" in fields and fields["status"] not in CANDIDATE_STATUSES:
-        raise ValueError(
-            f"unknown candidate status {fields['status']!r}; "
-            f"expected one of {CANDIDATE_STATUSES}"
-        )
-    if "code" in fields and fields["code"] is not None:
-        fields["code_hash"] = hash(fields["code"]) & 0xFFFFFFFF
-    record.update(fields)
+    record["validated"] = True
+    return record
+
+
+def mark_candidate_submitted(state: dict, candidate_id: str) -> dict | None:
+    """Set ``submitted=True`` on an existing candidate. Returns the record
+    or None if not found.
+    """
+    record = find_candidate(state, candidate_id)
+    if record is None:
+        return None
+    record["submitted"] = True
     return record
 
 

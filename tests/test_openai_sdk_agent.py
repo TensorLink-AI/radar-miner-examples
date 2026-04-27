@@ -390,18 +390,21 @@ class TestToolSchema:
             "sketch_architecture", "trace_architecture",
             "check_output_shape", "read_scratchpad", "write_scratchpad",
             "list_files", "read_file", "write_file", "search_files",
-            "list_candidates", "get_candidate",
             "time_remaining",
             "cognition_wiki_index", "cognition_wiki_read",
         } == names
 
-    def test_submit_requires_code_name_motivation(self):
+    def test_submit_requires_name_motivation(self):
         from agents.openai_sdk.tools import TOOLS
         submit = next(
             t for t in TOOLS if t["function"]["name"] == "submit"
         )
         required = submit["function"]["parameters"]["required"]
-        assert {"code", "name", "motivation"} <= set(required)
+        # ``code`` is conditionally required (only when no
+        # ``candidate_id`` is supplied), so it's not in the JSON-schema
+        # required list — the handler enforces "one of code/candidate_id"
+        # at runtime.
+        assert {"name", "motivation"} <= set(required)
 
 
 class TestToolHandlers:
@@ -484,6 +487,201 @@ class TestToolHandlers:
         assert excinfo.value.code == VALID_CODE
         captured = capsys.readouterr()
         assert "submit without scratchpad note this round" in captured.err
+
+
+class TestCandidateLineage:
+    """Feature 1: code lineage / candidate IDs.
+
+    A candidate is keyed by ``cand_<8 hex>``, derived from a sha1 of the
+    code, so identical code re-yields the same id (natural dedup). Each
+    record holds code, flops, trace, validated, submitted, created_at.
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def test_sketch_returns_candidate_id_and_stores_record(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        sketch_code = (
+            "import torch.nn as nn\n"
+            "def build_model(context_len, prediction_len, "
+            "num_variates, quantiles):\n"
+            "    return nn.Linear(context_len, prediction_len)\n"
+        )
+        result = handlers["sketch_architecture"](code=sketch_code)
+        # Output ends with a candidate_id line in cand_<hex> form.
+        last = [l for l in result.splitlines() if l.strip()][-1]
+        assert last.startswith("candidate_id: cand_")
+        cid = last.split(": ", 1)[1]
+        assert len(cid) == len("cand_") + 8
+        # Record is stored with the code, validated/submitted False.
+        cands = self._state(handlers)["candidates"]
+        assert cid in cands
+        record = cands[cid]
+        assert "def build_model" in record["code"]
+        assert record["validated"] is False
+        assert record["submitted"] is False
+        assert "created_at" in record
+
+    def test_sketch_dedupes_identical_code(self):
+        """Same code → same id; the dict still has one entry."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        code = (
+            "import torch.nn as nn\n"
+            "def build_model(context_len, prediction_len, "
+            "num_variates, quantiles):\n"
+            "    return nn.Linear(context_len, prediction_len)\n"
+        )
+        r1 = handlers["sketch_architecture"](code=code)
+        r2 = handlers["sketch_architecture"](code=code)
+        cid1 = r1.splitlines()[-1].split(": ", 1)[1]
+        cid2 = r2.splitlines()[-1].split(": ", 1)[1]
+        assert cid1 == cid2
+        assert len(self._state(handlers)["candidates"]) == 1
+
+    def test_validate_with_candidate_id_pulls_from_state(self):
+        """validate_code with candidate_id ignores the code arg and
+        loads the source from state."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        # Stash VALID_CODE under a known id by sketching it first.
+        sketch_result = handlers["sketch_architecture"](code=VALID_CODE)
+        cid = sketch_result.splitlines()[-1].split(": ", 1)[1]
+        # Pass NO code, only the id — the handler must look up the
+        # source from state.
+        result = handlers["validate_code"](candidate_id=cid)
+        assert result.startswith("ok")
+        record = self._state(handlers)["candidates"][cid]
+        assert record["validated"] is True
+
+    def test_validate_with_unknown_candidate_id_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        result = handlers["validate_code"](candidate_id="cand_deadbeef")
+        assert result.startswith("errors:")
+        assert "cand_deadbeef" in result
+        assert "not found" in result
+
+    def test_validate_without_candidate_id_autogenerates_on_success(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        result = handlers["validate_code"](code=VALID_CODE)
+        assert result.startswith("ok")
+        last = [l for l in result.splitlines() if l.strip()][-1]
+        assert last.startswith("candidate_id: cand_")
+        cid = last.split(": ", 1)[1]
+        cands = self._state(handlers)["candidates"]
+        assert cid in cands
+        assert cands[cid]["validated"] is True
+
+    def test_validate_failure_does_not_create_candidate(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["validate_code"](code="x = 1")
+        assert result.startswith("errors:")
+        assert self._state(handlers).get("candidates", {}) == {}
+
+    def test_submit_with_candidate_id_ships_from_state(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        handlers["validate_code"](code=VALID_CODE)
+        # The validate_code success line carries the id; pull it out.
+        # (Equivalent to the LLM reading the tool result.)
+        cands = self._state(handlers)["candidates"]
+        cid = next(iter(cands))
+        handlers["write_scratchpad"](observation="ok")
+        with pytest.raises(SubmitSignal) as excinfo:
+            handlers["submit"](
+                candidate_id=cid, name="m", motivation="from id",
+            )
+        # The shipped code came from state, not from a code= arg.
+        assert excinfo.value.code == cands[cid]["code"]
+        assert cands[cid]["submitted"] is True
+
+    def test_submit_with_unknown_candidate_id_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="ok")
+        result = handlers["submit"](
+            candidate_id="cand_deadbeef", name="m", motivation="x",
+        )
+        assert "not found" in result
+
+    def test_submit_without_candidate_id_behaves_as_before(self):
+        """Backwards-compat: submit(code=..., name=..., motivation=...)
+        still works and raises SubmitSignal with the supplied code."""
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="ok")
+        with pytest.raises(SubmitSignal) as excinfo:
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="legacy",
+            )
+        assert excinfo.value.code == VALID_CODE
+
+    def test_submit_with_neither_code_nor_id_returns_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="ok")
+        result = handlers["submit"](name="m", motivation="empty")
+        assert result.startswith("error:")
+        assert "candidate_id" in result or "code" in result
+
+    def test_candidates_survive_save_load_roundtrip(self, tmp_path):
+        """A candidate written via the handler persists through
+        history.save_state/load_state without losing fields."""
+        import sys
+        sys.path.insert(0, "agents/openai_sdk")
+        for k in list(sys.modules):
+            if k == "core" or k.startswith("core."):
+                del sys.modules[k]
+        from core.history import (  # noqa: E402
+            load_state, save_state,
+        )
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(with_flops=False),
+            scratch_dir=str(tmp_path),
+        )
+        handlers["sketch_architecture"](code=VALID_CODE)
+        state = self._state(handlers)
+        save_state(str(tmp_path), state)
+        reloaded = load_state(str(tmp_path))
+        assert "candidates" in reloaded
+        assert reloaded["candidates"] == state["candidates"]
+        # Spot-check the record shape survived JSON round-trip.
+        record = next(iter(reloaded["candidates"].values()))
+        for key in ("code", "flops", "trace", "validated",
+                    "submitted", "created_at"):
+            assert key in record
+
+    def test_legacy_state_without_candidates_loads_cleanly(self, tmp_path):
+        """An old-schema state.json (no candidates key) must load and
+        the handlers must treat the candidate dict as empty."""
+        import json
+        legacy = {
+            "history": [{"name": "old", "code_hash": 123}],
+            "notes": {"open_hypotheses": ["try X"]},
+        }
+        (tmp_path / "state.json").write_text(json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(with_flops=False),
+            scratch_dir=str(tmp_path),
+        )
+        state = self._state(handlers)
+        # Legacy keys preserved.
+        assert state["history"][0]["name"] == "old"
+        # candidates absent on disk → handler-side accessors see {}.
+        # (The dict is created lazily on first write.)
+        assert state.get("candidates", {}) == {}
+        # First sketch creates the dict without crashing on the absent
+        # key.
+        result = handlers["sketch_architecture"](code=VALID_CODE)
+        assert "candidate_id: cand_" in result
+        assert len(state["candidates"]) == 1
 
 
 class TestFileTools:

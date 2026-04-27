@@ -131,7 +131,15 @@ def build_system_prompt(challenge: dict, bucket: str | None = None) -> str:
         "Each section caps at 20 entries. Write at least one note per "
         "round so the next round learns from this one.\n"
         "- `time_remaining` — check the clock when it matters\n"
-        "- `submit` — ship validated code with a name and motivation"
+        "- `submit` — ship validated code with a name and motivation\n\n"
+        "**Candidate ids.** `sketch_architecture` returns a stable id "
+        "(e.g. `cand_a3f24c1d`) that points to the stored code, FLOPs, "
+        "and trace. `validate_code` and `submit` both accept that id "
+        "in place of the `code` argument — when present, they pull the "
+        "code from state and mark the candidate validated/submitted. "
+        "Identical code always hashes to the same id, so a sketch you "
+        "later validate doesn't create a duplicate. Use the id to "
+        "avoid re-pasting source between calls."
     )
 
     parts.append(

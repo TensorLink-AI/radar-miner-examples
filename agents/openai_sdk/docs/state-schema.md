@@ -78,50 +78,50 @@ LLM is steered toward the structured `hypotheses` list instead.
 
 | Key            | Type                       | Used by features |
 |----------------|----------------------------|------------------|
-| `candidates`   | `list[CandidateRecord]`    | 1, 3 (link target) |
+| `candidates`   | `dict[str, CandidateRecord]` (keyed by `cand_<8 hex>`) | 1, 3 (link target) |
 | `hypotheses`   | `list[HypothesisRecord]`   | 3 |
 | `macros`       | `dict[str, MacroRecord]`   | 4 |
-| `next_candidate_seq` | `int`                | 1 (monotonic ID counter) |
 
-### 2.2 `CandidateRecord` — feature 1
+### 2.2 `CandidateRecord` — feature 1 (as shipped)
 
-A candidate is a piece of code the agent has worked on this round
-(sketched, validated, or submitted). Lineage is the parent pointer.
+A candidate is a piece of code the agent has worked on. The
+``candidates`` state key is a **dict keyed by id**, where the id is a
+stable hash of the code itself (``cand_<8 hex>``). Identical code
+yields the same id, so re-sketching or re-validating the same source
+naturally deduplicates instead of producing parallel records.
 
 ```python
-{
-    "id": str,                       # "cand_0042" — monotonic via next_candidate_seq
-    "round_id": str,                 # challenge["challenge_id"] / round_id at creation
-    "created_at": float,             # time.time()
-    "parent_id": str | None,         # prior candidate this was forked from
-    "name": str,                     # short label (matches submission name when submitted)
-    "motivation": str,               # short rationale
-    "code_hash": int,                # join key with history entries
-    "code": str,                     # full code (see open question §5.1 on storage)
-    "bucket": str,
-    "flops_estimated": int | None,   # from sketch_architecture or estimate_flops
-    "status": str,                   # "sketched" | "validated" | "submitted" | "rejected"
-    "sketch_summary": str | None,    # truncated _sketch_architecture output (e.g. last 1KB)
-    "validate_result": str | None,   # "ok" or "errors: ..." from _validate_code
-    "submitted_round_id": str | None,  # set when status flips to submitted
+state["candidates"] = {
+    "cand_a3f24c1d": {
+        "code": str,                # the full source
+        "flops": int | None,        # measured by sketch_architecture
+        "trace": str | None,        # rendered per-layer trace, or None
+        "validated": bool,          # set True by validate_code on success
+        "submitted": bool,          # set True by submit when this id ships
+        "created_at": float,        # time.time() at first insert
+    },
+    ...
 }
 ```
 
 **Writes:**
-- `_sketch_architecture` creates a candidate with `status="sketched"`.
-- `_validate_code` either creates a fresh candidate or updates an
-  existing one (`candidate_id` kwarg) — sets `validate_result` and flips
-  status to `"validated"` on ok.
-- `_submit` flips the candidate's status to `"submitted"` and writes
-  `submitted_round_id`.
+- `_sketch_architecture` calls `upsert_candidate` with the code, FLOPs,
+  and trace. Returns the id and surfaces it as the last line of the
+  tool output (`candidate_id: cand_a3f24c1d`).
+- `_validate_code` either looks up an existing candidate by id (and
+  ignores any `code` arg) or, if no id was passed and validation
+  passes, calls `upsert_candidate` to create one. On success it sets
+  `validated=True`.
+- `_submit` looks up the candidate by id and ships its stored code,
+  setting `submitted=True`. Without an id, submit behaves as it did
+  before this feature (uses the `code` arg, no state mutation).
 
-**Reads:**
-- New tools `list_candidates`, `get_candidate`.
-- `read_scratchpad` summarizes recent candidates and their lineage tree.
+**Reads:** the LLM carries ids forward through tool-result text. Lineage
+read tools (`list_candidates`, `get_candidate`) are deferred — the
+in-conversation id is enough for feature 1's needs.
 
-**Cap:** keep last 50 candidates (mirrors `history`'s cap) — drop the
-oldest first, but never drop a candidate that's referenced by a
-hypothesis or by a `history` entry's `candidate_id`. (Open question §5.2.)
+**Cap:** none for now. Hash-keyed dedup keeps growth proportional to
+unique designs, not call count.
 
 ### 2.3 Submission records — feature 2
 
