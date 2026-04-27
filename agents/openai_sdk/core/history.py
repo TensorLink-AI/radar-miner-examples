@@ -106,7 +106,7 @@ def format_history(entries: list[dict], max_entries: int = 10,
 
 def merge_results_into_state(state: dict,
                              previous_results: list[dict] | None) -> dict:
-    """Merge validator-supplied round results onto matching history entries.
+    """Merge validator-supplied round results onto matching entries.
 
     Expected shape (harness-provided, optional)::
 
@@ -116,17 +116,22 @@ def merge_results_into_state(state: dict,
             ...
         ]
 
-    Join key is ``code_hash``. Any entries in ``state["history"]`` whose
-    ``code_hash`` matches get ``score``, ``rank``, ``rank_total``,
-    ``error``, and ``scored_round_id`` written onto them. Duplicate
-    hashes all receive the update. Unknown hashes are ignored. Returns
-    the mutated state for chaining.
+    Join key is ``code_hash``. Any entries in ``state["history"]`` AND
+    ``state["submissions"]`` whose ``code_hash`` matches get ``score``,
+    ``rank``, ``rank_total``, ``error``, and ``scored_round_id`` written
+    onto them. Duplicate hashes all receive the update. Unknown hashes
+    are ignored. Returns the mutated state for chaining.
     """
     if not previous_results:
         return state
     history = state.setdefault("history", [])
+    submissions = state.setdefault("submissions", [])
     index: dict = {}
     for entry in history:
+        h = entry.get("code_hash")
+        if h is not None:
+            index.setdefault(h, []).append(entry)
+    for entry in submissions:
         h = entry.get("code_hash")
         if h is not None:
             index.setdefault(h, []).append(entry)
@@ -288,6 +293,60 @@ def mark_candidate_submitted(state: dict, candidate_id: str) -> dict | None:
     if record is None:
         return None
     record["submitted"] = True
+    return record
+
+
+# ── Submissions ──────────────────────────────────────────────────────
+#
+# A list, not a dict — chronological order is the dominant access
+# pattern (read_my_submissions wants the most recent N), the cap-and-
+# drop-oldest semantics work naturally on a list, and we don't need
+# O(1) lookups by id (the join key with previous_results is
+# ``code_hash`` and that's a small linear scan in practice).
+#
+# Each entry retains the full ``code`` blob so the agent can re-read
+# what it actually shipped in a later round; today's history-only
+# storage drops the source after submit and only the hash survives.
+
+MAX_SUBMISSIONS = 50
+
+
+def get_submissions(state: dict) -> list[dict]:
+    """Return the submissions list (read-only view; defaults to empty)."""
+    return state.get("submissions", [])
+
+
+def _submissions(state: dict) -> list[dict]:
+    """Return the mutable submissions list, creating it on demand."""
+    return state.setdefault("submissions", [])
+
+
+def add_submission(state: dict, *, code: str, name: str, motivation: str,
+                   candidate_id: str | None = None,
+                   round_id: str = "") -> dict:
+    """Append a submission record to ``state['submissions']`` and return
+    it. Caps at ``MAX_SUBMISSIONS`` by dropping the oldest entry.
+
+    The ``code_hash`` field is computed on insert so
+    ``merge_results_into_state`` can later attach score/rank from the
+    validator's ``previous_results`` payload.
+    """
+    record = {
+        "code": code,
+        "code_hash": hash(code) & 0xFFFFFFFF,
+        "name": name,
+        "motivation": motivation,
+        "candidate_id": candidate_id,
+        "round_id": round_id,
+        "score": None,
+        "rank": None,
+        "rank_total": None,
+        "submitted_at": time.time(),
+    }
+    subs = _submissions(state)
+    subs.append(record)
+    if len(subs) > MAX_SUBMISSIONS:
+        del subs[: len(subs) - MAX_SUBMISSIONS]
     return record
 
 

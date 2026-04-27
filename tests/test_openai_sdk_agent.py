@@ -388,7 +388,8 @@ class TestToolSchema:
             "list_frontier", "get_frontier_member", "submit",
             "search_papers", "query_db", "estimate_layer_flops",
             "sketch_architecture", "trace_architecture",
-            "check_output_shape", "read_scratchpad", "write_scratchpad",
+            "check_output_shape", "read_scratchpad",
+            "read_my_submissions", "write_scratchpad",
             "list_files", "read_file", "write_file", "search_files",
             "time_remaining",
             "cognition_wiki_index", "cognition_wiki_read",
@@ -682,6 +683,207 @@ class TestCandidateLineage:
         result = handlers["sketch_architecture"](code=VALID_CODE)
         assert "candidate_id: cand_" in result
         assert len(state["candidates"]) == 1
+
+
+class TestReadMySubmissions:
+    """Feature 2: read_my_submissions tool.
+
+    submit appends a record to ``state["submissions"]`` with the full
+    code blob; read_my_submissions surfaces the n most recent (newest
+    first) and merge_results_into_state attaches score/rank when the
+    next round's previous_results arrive.
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def _ship(self, handlers, code, name, motivation, candidate_id=""):
+        from agents.openai_sdk.tools import SubmitSignal
+        handlers["write_scratchpad"](observation="ok")
+        kwargs = {"code": code, "name": name, "motivation": motivation}
+        if candidate_id:
+            kwargs["candidate_id"] = candidate_id
+        try:
+            handlers["submit"](**kwargs)
+        except SubmitSignal:
+            pass
+
+    def test_submit_records_into_state_submissions(self):
+        from agents.openai_sdk.tools import build_handlers
+        ch = _make_challenge()
+        ch["round_id"] = 7
+        handlers = build_handlers(ch)
+        self._ship(handlers, VALID_CODE, "m", "first try")
+        subs = self._state(handlers)["submissions"]
+        assert len(subs) == 1
+        rec = subs[0]
+        assert rec["code"] == VALID_CODE
+        assert rec["name"] == "m"
+        assert rec["motivation"] == "first try"
+        assert rec["round_id"] == "7"
+        assert rec["score"] is None
+        assert rec["rank"] is None
+        assert rec["candidate_id"] is None
+        assert "submitted_at" in rec
+        assert "code_hash" in rec
+
+    def test_submit_records_candidate_id_when_passed(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        validate_result = handlers["validate_code"](code=VALID_CODE)
+        cid = [
+            l for l in validate_result.splitlines()
+            if l.startswith("candidate_id: ")
+        ][-1].split(": ", 1)[1]
+        self._ship(handlers, "", "m", "from id", candidate_id=cid)
+        subs = self._state(handlers)["submissions"]
+        assert subs[-1]["candidate_id"] == cid
+        assert subs[-1]["code"] == VALID_CODE
+
+    def test_read_returns_pending_when_no_score_yet(self):
+        from agents.openai_sdk.tools import build_handlers
+        ch = _make_challenge()
+        ch["round_id"] = 12
+        handlers = build_handlers(ch)
+        self._ship(handlers, VALID_CODE, "wide_mlp", "wider hidden")
+        out = handlers["read_my_submissions"](n=1)
+        assert "round 12" in out
+        assert "wide_mlp" in out
+        assert "score: pending" in out
+        assert "wider hidden" in out
+        # Full code is shown when n=1.
+        assert "import torch" in out
+        assert "build_model" in out
+
+    def test_read_truncates_when_n_gt_1(self):
+        """A long-code submission must be truncated when n>1."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        long_code = (
+            "import torch\n" + "\n".join(
+                f"x_{i} = {i}" for i in range(100)
+            ) + "\n"
+        )
+        self._ship(handlers, long_code, "a", "first")
+        self._ship(handlers, VALID_CODE, "b", "second")
+        out = handlers["read_my_submissions"](n=2)
+        assert "Submission 1 of 2" in out
+        assert "Submission 2 of 2" in out
+        # Newest is "b" — appears first in the rendered output.
+        assert out.index("name=b") < out.index("name=a")
+        # The long code (now in entry #2) must show the truncation
+        # marker; VALID_CODE in entry #1 is short and stays intact.
+        assert "more lines truncated" in out
+
+    def test_read_full_code_when_n_eq_1(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        long_code = (
+            "import torch\n" + "\n".join(
+                f"x_{i} = {i}" for i in range(100)
+            ) + "\n"
+        )
+        self._ship(handlers, long_code, "long", "filler")
+        out = handlers["read_my_submissions"](n=1)
+        # No truncation marker, every line present.
+        assert "more lines truncated" not in out
+        assert "x_99 = 99" in out
+
+    def test_read_empty_state(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        assert handlers["read_my_submissions"]() == "no submissions yet"
+
+    def test_read_default_n_is_3(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        for i in range(5):
+            self._ship(
+                handlers, VALID_CODE.replace("Adam", f"Adam  # {i}"),
+                f"v{i}", f"motivation {i}",
+            )
+        out = handlers["read_my_submissions"]()
+        # Default 3, newest first → v4, v3, v2 visible; v1, v0 not.
+        assert "name=v4" in out
+        assert "name=v3" in out
+        assert "name=v2" in out
+        assert "name=v1" not in out
+        assert "name=v0" not in out
+
+    def test_read_clamps_n_to_at_least_1(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        self._ship(handlers, VALID_CODE, "only", "only one")
+        out = handlers["read_my_submissions"](n=0)
+        assert "Submission 1 of 1" in out
+
+    def test_legacy_state_loads_with_empty_submissions(self, tmp_path):
+        """Old state.json without ``submissions`` key loads cleanly."""
+        import json
+        legacy = {
+            "history": [{"name": "old", "code_hash": 123}],
+            "notes": {"open_hypotheses": ["try X"]},
+        }
+        (tmp_path / "state.json").write_text(json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        assert handlers["read_my_submissions"]() == "no submissions yet"
+        # First submit lazily creates the list.
+        self._ship(handlers, VALID_CODE, "n", "m")
+        assert len(self._state(handlers)["submissions"]) == 1
+
+    def test_score_updated_when_previous_results_arrive(self):
+        """Round N submits; round N+1's previous_results carries the
+        score; merge_results_into_state must attach it to the
+        submissions entry by code_hash."""
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        ch = _make_challenge()
+        ch["round_id"] = 5
+        handlers = build_handlers(ch)
+        self._ship(handlers, VALID_CODE, "v1", "m1")
+        state = self._state(handlers)
+        ch_value = state["submissions"][0]["code_hash"]
+        merge_results_into_state(state, [{
+            "round_id": 5, "code_hash": ch_value,
+            "score": 0.123, "rank": 3, "rank_total": 12,
+        }])
+        # Score / rank propagated to the submission record.
+        rec = state["submissions"][0]
+        assert rec["score"] == 0.123
+        assert rec["rank"] == 3
+        assert rec["rank_total"] == 12
+        assert rec["scored_round_id"] == 5
+        # And read_my_submissions renders them.
+        out = handlers["read_my_submissions"](n=1)
+        assert "score: 0.123 (rank 3/12)" in out
+
+    def test_submissions_survive_save_load_roundtrip(self, tmp_path):
+        import sys
+        sys.path.insert(0, "agents/openai_sdk")
+        for k in list(sys.modules):
+            if k == "core" or k.startswith("core."):
+                del sys.modules[k]
+        from core.history import (  # noqa: E402
+            load_state, save_state,
+        )
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        self._ship(handlers, VALID_CODE, "n", "m")
+        save_state(str(tmp_path), self._state(handlers))
+        reloaded = load_state(str(tmp_path))
+        assert "submissions" in reloaded
+        assert reloaded["submissions"][0]["code"] == VALID_CODE
+        for key in ("code", "code_hash", "name", "motivation",
+                    "candidate_id", "round_id", "score", "rank",
+                    "rank_total", "submitted_at"):
+            assert key in reloaded["submissions"][0]
 
 
 class TestFileTools:

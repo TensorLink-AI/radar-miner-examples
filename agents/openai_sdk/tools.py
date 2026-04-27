@@ -33,10 +33,10 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    add_note, extract_flops_budget, find_candidate, format_history,
-    format_notes, get_history, load_state,
-    mark_candidate_submitted, mark_candidate_validated, save_state,
-    upsert_candidate,
+    add_note, add_submission, extract_flops_budget, find_candidate,
+    format_history, format_notes, get_history, get_submissions,
+    load_state, mark_candidate_submitted, mark_candidate_validated,
+    save_state, upsert_candidate,
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
@@ -528,6 +528,42 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "read_my_submissions",
+            "description": (
+                "Show the agent's own prior submissions (newest "
+                "first) with full code, scores, and ranks. Each entry "
+                "shows round_id, name, score (or 'pending' when the "
+                "validator hasn't returned a result yet), rank, "
+                "candidate_id, motivation, and code. When ``n`` > 1 "
+                "the code per entry is truncated to the first ~40 "
+                "lines; call with ``n=1`` to see full code of just "
+                "the latest submission. Useful when read_scratchpad's "
+                "summary isn't enough — e.g. you want to compare what "
+                "you actually shipped against a new sketch."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 3,
+                        "description": (
+                            "Most-recent N submissions to show "
+                            "(default 3). ``n=1`` returns full code "
+                            "for the latest; larger values truncate "
+                            "per entry."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_scratchpad",
             "description": (
                 "Load persistent state from scratchpad. Contains history "
@@ -862,6 +898,11 @@ def build_handlers(
     desearch_url = (challenge.get("desearch_url") or "").rstrip("/")
     flops_min, flops_max = extract_flops_budget(challenge)
     target_flops = int(flops_max * 0.6) if flops_max else 0
+    round_id = str(
+        challenge.get("round_id")
+        or challenge.get("challenge_id")
+        or ""
+    )
 
     if state is None:
         state = load_state(scratch_dir) if scratch_dir else {}
@@ -1379,6 +1420,69 @@ def build_handlers(
 
     # ── State ────────────────────────────────────────────────────
 
+    READ_MY_SUBMISSIONS_TRUNC_LINES = 40
+
+    def _read_my_submissions(n: int = 3, **_kwargs) -> str:
+        try:
+            n = max(1, min(int(n), 20))
+        except (TypeError, ValueError):
+            n = 3
+        subs = get_submissions(state_holder["state"])
+        if not subs:
+            return "no submissions yet"
+        # Newest first.
+        recent = list(reversed(subs[-n:]))
+        parts: list[str] = []
+        for i, sub in enumerate(recent, 1):
+            score = sub.get("score")
+            if isinstance(score, (int, float)):
+                score_text = f"{score:.4g}"
+            else:
+                score_text = "pending"
+            rank = sub.get("rank")
+            rank_total = sub.get("rank_total")
+            if isinstance(rank, int):
+                rank_text = (
+                    f"{rank}/{rank_total}"
+                    if isinstance(rank_total, int) else str(rank)
+                )
+            else:
+                rank_text = "?"
+            cid = sub.get("candidate_id") or "—"
+            sub_round = sub.get("round_id") or "?"
+            sub_name = sub.get("name") or "?"
+            motivation = sub.get("motivation") or ""
+            code = sub.get("code") or ""
+            code_lines = code.splitlines()
+            # Full code only when n=1; otherwise truncate per entry.
+            if n > 1 and len(code_lines) > READ_MY_SUBMISSIONS_TRUNC_LINES:
+                shown = "\n".join(
+                    code_lines[:READ_MY_SUBMISSIONS_TRUNC_LINES]
+                )
+                more = len(code_lines) - READ_MY_SUBMISSIONS_TRUNC_LINES
+                code_block = (
+                    f"{shown}\n... ({more} more lines truncated; "
+                    "call read_my_submissions(n=1) for full code)"
+                )
+            else:
+                code_block = code
+            header = (
+                f"## Submission {i} of {len(recent)} "
+                f"(round {sub_round}, name={sub_name})"
+            )
+            meta_lines = [
+                f"score: {score_text} (rank {rank_text})",
+                f"candidate_id: {cid}",
+            ]
+            if motivation:
+                meta_lines.append(f"motivation: {motivation}")
+            parts.append(
+                f"{header}\n"
+                + "\n".join(meta_lines)
+                + f"\n```python\n{code_block}\n```"
+            )
+        return "\n\n".join(parts)
+
     def _read_scratchpad(**_kwargs) -> str:
         state = state_holder["state"]
         history_entries = get_history(state)
@@ -1614,6 +1718,17 @@ def build_handlers(
                 "error: nothing to submit — pass either ``code`` or a "
                 "stored ``candidate_id``"
             )
+        # Record the submission so read_my_submissions can show it back
+        # in a later round, and so merge_results_into_state has a
+        # code_hash target when the validator's previous_results arrive.
+        add_submission(
+            state_holder["state"],
+            code=code,
+            name=name,
+            motivation=motivation,
+            candidate_id=candidate_id or None,
+            round_id=round_id,
+        )
         raise SubmitSignal(code=code, name=name, motivation=motivation)
 
     def _time_remaining(**_kwargs) -> str:
@@ -1645,6 +1760,7 @@ def build_handlers(
         "check_output_shape": _check_output_shape,
         "validate_code": _validate_code,
         "read_scratchpad": _read_scratchpad,
+        "read_my_submissions": _read_my_submissions,
         "write_scratchpad": _write_scratchpad,
         "list_files": _list_files,
         "read_file": _read_file,
