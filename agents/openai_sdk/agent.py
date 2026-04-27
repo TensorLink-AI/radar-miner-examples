@@ -195,6 +195,7 @@ def _run_tool_loop(
     submitted: str | None = None
     failure: str | None = None
     rounds_since_validated = 0
+    submit_attempts = 0
 
     round_num = 0
     while True:
@@ -250,7 +251,7 @@ def _run_tool_loop(
                 miner_uid=miner_uid,
                 model=model,
                 temperature=temperature,
-                max_tokens=4096,
+                max_tokens=16384,
                 deadline=deadline,
             )
         except Exception as exc:
@@ -289,6 +290,7 @@ def _run_tool_loop(
                 submitted = code
             break
 
+        submit_error_this_round: str | None = None
         for tc in tool_calls:
             try:
                 name = tc.function.name
@@ -324,6 +326,13 @@ def _run_tool_loop(
                 except Exception as exc:
                     result = f"tool error: {exc}"
 
+            if name == "submit":
+                submit_attempts += 1
+                # ``submit`` returned a string instead of raising
+                # SubmitSignal — the call failed. Capture the message
+                # so we can re-prompt the LLM with corrective context.
+                submit_error_this_round = str(result)
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": call_id,
@@ -351,26 +360,67 @@ def _run_tool_loop(
             messages.append({
                 "role": "user",
                 "content": (
-                    "Validation passed. Submit now. Your next tool "
-                    "call must be `write_scratchpad` then `submit` "
-                    "with the validated code. Do not produce another "
-                    "candidate."
+                    "Validation passed. Submit now in a single call: "
+                    "`submit(candidate_id=..., name=..., "
+                    "motivation=..., note=...)`. Do not produce "
+                    "another candidate."
                 ),
             })
 
+        # Submit-error recovery. If submit returned an error string
+        # (didn't raise SubmitSignal), the LLM tried to ship but
+        # botched the call — reset the stall counter and inject a
+        # corrective user message naming the exact error, the stored
+        # candidate_id, and a literal example of the right call. This
+        # is distinct from "LLM is stalling and not calling submit at
+        # all" — that case keeps incrementing the counter.
+        state_holder = getattr(
+            handlers.get("submit", None), "_state_holder", None,
+        ) or {}
+        if submit_error_this_round and state_holder.get("last_validated_code"):
+            cid = state_holder.get("last_validated_candidate_id", "") or ""
+            example = (
+                f'submit(candidate_id="{cid}", name="...", '
+                f'motivation="...", note="...")'
+                if cid
+                else 'submit(code=..., name="...", motivation="...", note="...")'
+            )
+            cid_line = (
+                f"Validated candidate_id on file: {cid}\n"
+                if cid
+                else ""
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Your `submit` call failed with: "
+                    f"{submit_error_this_round}\n\n"
+                    f"{cid_line}"
+                    "Retry submit now. Example of the correct call:\n"
+                    f"    {example}"
+                ),
+            })
+            rounds_since_validated = 0
+            continue
+
         # Validated-and-stalled early exit. After validation the model
-        # only needs one more turn to ship; if it burns two more
-        # rounds without submitting we bail and let the agent's
-        # auto-submit recovery path package the validated code.
+        # has a clean turn (the round validation happened) plus a
+        # grace window of further rounds to ship. If it burns the
+        # whole window without submitting we bail and let the
+        # agent's auto-submit recovery path package the validated
+        # code. Don't count the validation round itself — start
+        # counting on the round AFTER, so the LLM has a fresh turn
+        # to call submit before the counter ticks.
         has_validated_now = bool(getattr(
             handlers.get("submit", None), "_has_validated", False,
         ))
-        if has_validated_now:
+        if has_validated_now and not validated_this_round:
             rounds_since_validated += 1
-            if rounds_since_validated >= 2:
+            if rounds_since_validated >= 4:
                 _log(
-                    f"[agent] {phase}: 2 rounds since validation, "
-                    "no submit — breaking to auto-submit"
+                    f"[agent] {phase}: 4 rounds since validation "
+                    f"(submit_attempts={submit_attempts}), "
+                    "no clean submit — breaking to auto-submit"
                 )
                 break
 

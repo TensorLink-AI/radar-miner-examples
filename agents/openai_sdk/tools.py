@@ -110,11 +110,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "search_papers",
-            "description": (
-                "Search arxiv for papers relevant to your architecture "
-                "design. Returns titles and abstracts. Use this to find "
-                "state-of-the-art techniques for the task."
-            ),
+            "description": "Arxiv search by query. Returns titles + abstracts.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -162,18 +158,10 @@ TOOLS: list[dict] = [
         "function": {
             "name": "query_db",
             "description": (
-                "Query the experiment database. Available endpoints:\n"
-                "  GET  /frontier                     — feasible frontier for the current round\n"
-                "  GET  /experiments/recent?n=20      — recent experiments (default n=20)\n"
-                "  GET  /experiments/pareto           — Pareto-optimal experiments by task\n"
-                "  GET  /experiments/{index}          — single experiment by id\n"
-                "  GET  /experiments/stats            — DB statistics\n"
-                "  POST /experiments/search           — search experiments by query\n"
-                "  GET  /experiments/lineage/{index}  — experiment ancestry\n"
-                "  GET  /experiments/diff/{a}/{b}     — diff two experiments\n"
-                "These are independent views of the same data — pick whichever "
-                "fits what you're investigating. Other paths may also work; "
-                "feel free to explore."
+                "Experiment DB. Paths: /frontier, /experiments/recent, "
+                "/experiments/pareto, /experiments/{id}, "
+                "/experiments/stats, POST /experiments/search, "
+                "/experiments/lineage/{id}, /experiments/diff/{a}/{b}."
             ),
             "parameters": {
                 "type": "object",
@@ -203,14 +191,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "cognition_wiki_index",
             "description": (
-                "Fetch the cognition wiki's table of contents — a curated, "
-                "task-specific corpus of architecture-design and training "
-                "insights maintained by the subnet operator. Returns "
-                "_index.md (claim-first summaries grouped by category) so "
-                "you can decide which entries to read in full. Cheaper and "
-                "more reliable than search_papers for known design "
-                "questions. Returns 'not published' when no wiki exists "
-                "for this task."
+                "Curated task-specific design-recipe wiki TOC. Try "
+                "before search_papers."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -219,12 +201,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "cognition_wiki_read",
-            "description": (
-                "Read one full entry from the cognition wiki by slug. Use "
-                "after cognition_wiki_index so you know which slug to "
-                "request. Each entry is 200-400 words: claim, mechanism, "
-                "concrete hyperparameters, FLOPs guidance, applicability."
-            ),
+            "description": "Read one wiki entry by slug from cognition_wiki_index.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -247,8 +224,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "analyze_task",
             "description": (
-                "Return the current challenge's task spec, parameters, "
-                "constraints, objectives, and FLOPs budget as JSON."
+                "Task spec, params, constraints, objectives, FLOPs "
+                "budget as JSON."
             ),
             "parameters": {
                 "type": "object",
@@ -262,10 +239,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "estimate_layer_flops",
             "description": (
-                "Instantiate a single layer / small module and measure its "
-                "forward-pass FLOPs with FlopCounterMode. Provide code that "
-                "assigns the module to a variable called `layer` and an "
-                "input shape. Works with ANY PyTorch module."
+                "Forward-pass FLOPs for one layer/module. Code must "
+                "assign to `layer`."
             ),
             "parameters": {
                 "type": "object",
@@ -295,16 +270,10 @@ TOOLS: list[dict] = [
         "function": {
             "name": "sketch_architecture",
             "description": (
-                "Test a complete architecture sketch by supplying only "
-                "build_model. The tool runs it, measures total FLOPs, "
-                "traces per-layer shapes, and checks output shape against "
-                "the task constraint. build_optimizer is auto-added if "
-                "missing. Use this to validate a design before writing "
-                "full production code. Each call stores the code as a "
-                "candidate keyed by a stable id (``cand_<8 hex>``) and "
-                "reports the id at the end of the output — pass that id "
-                "to ``validate_code`` and ``submit`` to avoid re-pasting "
-                "the source."
+                "Probe a build_model: FLOPs, per-layer trace, "
+                "output-shape check. Cheaper than validate_code. "
+                "Returns a candidate_id (cand_<hex>) accepted by "
+                "validate_code and submit in place of source."
             ),
             "parameters": {
                 "type": "object",
@@ -326,11 +295,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "estimate_flops",
-            "description": (
-                "Run build_model and measure forward-pass FLOPs with the "
-                "same FlopCounterMode the validator uses. Returns the "
-                "FLOPs count or an error string."
-            ),
+            "description": "Run build_model and measure forward-pass FLOPs.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -350,8 +315,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "list_frontier",
             "description": (
-                "List frontier members (just index + objectives). Use "
-                "`get_frontier_member` to fetch a specific member's code."
+                "List frontier members (index + objectives). Use "
+                "get_frontier_member for code."
             ),
             "parameters": {
                 "type": "object",
@@ -365,9 +330,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "get_frontier_member",
             "description": (
-                "Return a specific frontier member as JSON, including its "
-                "code and metrics. Call `list_frontier` first to see what "
-                "indices are available."
+                "One frontier member (code + metrics) by index from "
+                "list_frontier."
             ),
             "parameters": {
                 "type": "object",
@@ -386,14 +350,10 @@ TOOLS: list[dict] = [
         "function": {
             "name": "size_to_flops",
             "description": (
-                "Sweep a scalar size knob to land on a target FLOPs "
-                "count. Provide code containing a `{{SIZE}}` "
-                "placeholder (any integer knob — hidden_dim, num_layers, "
-                "channels, etc.) and the range to search. Runs up to "
-                f"{MAX_PROBES} measurements using geometric-probe-then-"
-                "refine and returns the MEASURED (size, flops) pair "
-                "closest to the target. Use this BEFORE calling "
-                "validate_code — it saves FLOPs-bound iterations."
+                "Sweep one scalar knob (use {{SIZE}} placeholder in "
+                "code) to land inside the FLOPs gate. Runs up to "
+                f"{MAX_PROBES} measurements; returns best (size, "
+                "flops) pair."
             ),
             "parameters": {
                 "type": "object",
@@ -439,10 +399,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "trace_architecture",
             "description": (
-                "Run a dummy forward pass through build_model and return "
-                "an op-by-op trace: each leaf module's name, class, input "
-                "shape, output shape, and parameter count. Memory-efficient "
-                "(only shape tuples and ints are captured)."
+                "Op-by-op trace of build_model: name, class, input "
+                "shape, output shape, param count."
             ),
             "parameters": {
                 "type": "object",
@@ -470,10 +428,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "check_output_shape",
             "description": (
-                "Run build_model and a dummy forward pass, then compare "
-                "the output tensor's shape against the expected shape "
-                "parsed from the task constraints. Catches tensor-size "
-                "mismatches before submission."
+                "Run build_model and compare output shape against the "
+                "task constraint."
             ),
             "parameters": {
                 "type": "object",
@@ -494,13 +450,9 @@ TOOLS: list[dict] = [
         "function": {
             "name": "validate_code",
             "description": (
-                "Validate a candidate model. Returns 'ok' or 'errors: ...' "
-                "covering syntax, missing build_model/build_optimizer, "
-                "forbidden imports, FLOPs out of bucket, and output-shape "
-                "mismatches. Always call this before `submit`. The "
-                "validated candidate id is reported on the last line "
-                "(e.g. 'candidate_id: cand_a3f24c1d') so you can pass "
-                "it to ``submit``."
+                "Final pre-submission check (syntax + build_model/"
+                "build_optimizer + FLOPs gate + output shape). "
+                "Required before submit. Accepts a candidate_id."
             ),
             "parameters": {
                 "type": "object",
@@ -533,20 +485,11 @@ TOOLS: list[dict] = [
         "function": {
             "name": "define_macro",
             "description": (
-                "Save a named sequence of tool calls so you can "
-                "replay it as one action. Each step is "
-                "``{tool: str, args: dict, output_to?: str}``. "
-                "Within ``args`` you can reference run-time "
-                "arguments via ``${args.foo}`` and prior step "
-                "outputs via ``${step_var}`` (the variable name set "
-                "by an earlier step's ``output_to``). When a string "
-                "value is exactly one substitution reference its "
-                "type is preserved; embedded refs stringify. "
-                "Restrictions: ``submit``, ``define_macro``, and "
-                "``run_macro`` cannot appear in a sequence — macros "
-                "cannot ship code or recurse into other macros. Up "
-                f"to {MAX_MACRO_STEPS} steps per macro, "
-                f"{MAX_MACROS} macros stored per miner."
+                "Save a named tool sequence for replay. Steps: "
+                "{tool, args, output_to?}; refer to args via "
+                "${args.X} and prior outputs via ${var}. submit, "
+                "define_macro, run_macro can't appear inside. Up to "
+                f"{MAX_MACRO_STEPS} steps, {MAX_MACROS} macros."
             ),
             "parameters": {
                 "type": "object",
@@ -592,15 +535,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "run_macro",
             "description": (
-                "Execute a previously defined macro. Substitutes "
-                "``${args.X}`` placeholders with the corresponding "
-                "value from ``args`` and ``${var}`` with the output "
-                "of a prior step labelled via ``output_to``. Returns "
-                "the concatenated outputs of every step, each "
-                "prefixed with ``[step N tool_name]``. Halts on the "
-                "first error (handler exception OR a result starting "
-                "with ``error:``/``errors:``) and returns the partial "
-                "output."
+                "Execute a saved macro by name. Halts on the first "
+                "error and returns the concatenated step outputs."
             ),
             "parameters": {
                 "type": "object",
@@ -626,11 +562,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_macros",
-            "description": (
-                "List the macros defined in this miner's state. "
-                "Each entry shows name, description, step count, "
-                "and the tool names invoked in the sequence."
-            ),
+            "description": "List saved macros (name, description, steps).",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -644,16 +576,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "read_my_submissions",
             "description": (
-                "Show the agent's own prior submissions (newest "
-                "first) with full code, scores, and ranks. Each entry "
-                "shows round_id, name, score (or 'pending' when the "
-                "validator hasn't returned a result yet), rank, "
-                "candidate_id, motivation, and code. When ``n`` > 1 "
-                "the code per entry is truncated to the first ~40 "
-                "lines; call with ``n=1`` to see full code of just "
-                "the latest submission. Useful when read_scratchpad's "
-                "summary isn't enough — e.g. you want to compare what "
-                "you actually shipped against a new sketch."
+                "Your prior submissions, newest first, with full "
+                "code (n=1) or truncated to ~40 lines (n>1)."
             ),
             "parameters": {
                 "type": "object",
@@ -680,10 +604,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "read_scratchpad",
             "description": (
-                "Load persistent state from scratchpad. Contains history "
-                "of your previous submissions across rounds — what you "
-                "tried, what worked, what didn't. Check this first each "
-                "round."
+                "Prior-round notes (hypotheses, dead_ends, "
+                "observations) + submission history."
             ),
             "parameters": {
                 "type": "object",
@@ -697,19 +619,9 @@ TOOLS: list[dict] = [
         "function": {
             "name": "write_scratchpad",
             "description": (
-                "Record a structured note for future rounds. Pass ONE "
-                "of: `hypothesis` (something to test next), `dead_end` "
-                "+ `reason` (an approach that failed and why), or "
-                "`observation` (a task-agnostic fact learned). Each "
-                "section is capped at 20 entries (oldest is dropped). "
-                "When the note is a `hypothesis` you can also pass "
-                "`candidate_id` to link it to a sketched/validated "
-                "candidate — read_scratchpad will then surface that "
-                "candidate's status and (eventually) score under the "
-                "hypothesis. You MUST write at least one note before "
-                "calling `submit`. The deprecated free-form `notes` "
-                "field is still accepted but prefer the structured "
-                "fields."
+                "Record one note: hypothesis (optional candidate_id "
+                "link), dead_end + reason, or observation. Or "
+                "attach inline via submit(note=...)."
             ),
             "parameters": {
                 "type": "object",
@@ -771,15 +683,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "link_hypothesis",
             "description": (
-                "Late-bind a candidate id and/or a verdict to an "
-                "existing hypothesis. Use when you realize mid-round "
-                "that a hypothesis from earlier matches the candidate "
-                "you just sketched, or when you want to mark the "
-                "hypothesis as supported/refuted before its score "
-                "lands. Looks up the hypothesis by its exact text — "
-                "pass the same string you used in "
-                "write_scratchpad(hypothesis=…). Returns an error "
-                "string when no hypothesis matches."
+                "Late-bind a candidate_id or verdict (supported/"
+                "refuted/inconclusive) to an existing hypothesis."
             ),
             "parameters": {
                 "type": "object",
@@ -819,12 +724,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": (
-                "List files you have written to the scratchpad directory "
-                "in previous rounds. Good for keeping structured markdown "
-                "notes (design.md, task-notes.md, etc.) alongside the "
-                "free-form scratchpad string."
-            ),
+            "description": "List files in the scratchpad directory.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -836,10 +736,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": (
-                "Read a file you previously wrote to the scratchpad "
-                "directory. Use `list_files` first to see what's there."
-            ),
+            "description": "Read a scratchpad file by basename.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -860,10 +757,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Write a text file to the scratchpad directory (persists "
-                "across rounds). Use for markdown notes, plans, or any "
-                "structured text you want to keep. Overwrites if the file "
-                "exists."
+                "Write a text file to the scratchpad directory "
+                "(persists across rounds; overwrites)."
             ),
             "parameters": {
                 "type": "object",
@@ -889,10 +784,8 @@ TOOLS: list[dict] = [
         "function": {
             "name": "search_files",
             "description": (
-                "Case-insensitive substring search across all scratchpad "
-                "files. Returns matching file names and the surrounding "
-                "lines with line numbers. Use to find notes on a topic "
-                "without rereading every file."
+                "Case-insensitive substring search across scratchpad "
+                "files."
             ),
             "parameters": {
                 "type": "object",
@@ -914,12 +807,10 @@ TOOLS: list[dict] = [
         "function": {
             "name": "submit",
             "description": (
-                "Terminal tool — submit the validated model code, ending "
-                "the loop. Code MUST have passed `validate_code` first. "
-                "Either pass ``code`` directly, or pass the "
-                "``candidate_id`` returned by ``validate_code`` to ship "
-                "the stored candidate (the candidate is then marked "
-                "submitted in state)."
+                "Ship validated code in one call. Pass code OR a "
+                "candidate_id from validate_code. Optional note "
+                "records a scratchpad entry inline (hypothesis if "
+                "candidate_id is set, else observation)."
             ),
             "parameters": {
                 "type": "object",
@@ -953,6 +844,19 @@ TOOLS: list[dict] = [
                             "ignored."
                         ),
                     },
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Scratchpad note recorded before "
+                            "shipping. When ``candidate_id`` is also "
+                            "supplied the note is stored as a "
+                            "hypothesis linked to that candidate so "
+                            "next round's read_scratchpad can resolve "
+                            "the outcome; otherwise it's stored as a "
+                            "task observation. Use this to skip a "
+                            "separate write_scratchpad call."
+                        ),
+                    },
                 },
                 "required": ["name", "motivation"],
             },
@@ -962,11 +866,7 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "time_remaining",
-            "description": (
-                "Check how many seconds remain in the time budget. If "
-                "time is low, submit what you have rather than starting "
-                "new research."
-            ),
+            "description": "Seconds left in this round.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -1590,12 +1490,12 @@ def build_handlers(
         state_holder["last_validated_candidate_id"] = cid
         return (
             "ok — code passed all checks. THIS IS YOUR FINAL "
-            "ARTIFACT. Your next tool call MUST be `write_scratchpad` "
-            "followed by `submit` with this exact code (you can "
-            f"pass candidate_id={cid} instead of re-pasting). Do not "
-            "call sketch_architecture, size_to_flops, or "
-            "validate_code again unless you have a specific reason "
-            "to revise.\n"
+            "ARTIFACT. Your next tool call should be "
+            f"`submit(candidate_id={cid!r}, name=..., motivation=..., "
+            "note=...)` — pass the scratchpad note inline so you only "
+            "need one call. Do not call sketch_architecture, "
+            "size_to_flops, or validate_code again unless you have a "
+            "specific reason to revise.\n"
             f"candidate_id: {cid}"
         )
 
@@ -2130,7 +2030,23 @@ def build_handlers(
     # ── Control ──────────────────────────────────────────────────
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
-                candidate_id: str = "", **_kwargs) -> str:
+                candidate_id: str = "", note: str = "",
+                **_kwargs) -> str:
+        # Inline scratchpad note. Recorded BEFORE raising SubmitSignal
+        # so the persisted state captures the note even though the
+        # submit terminates the loop. When the submission is tied to a
+        # candidate_id the note is filed as a hypothesis linked to the
+        # candidate (so next round's read_scratchpad shows what
+        # actually shipped). Otherwise it's a generic observation.
+        if note and isinstance(note, str) and note.strip():
+            text = note.strip()
+            state = state_holder["state"]
+            if candidate_id:
+                add_hypothesis(state, text=text, candidate_id=candidate_id)
+            else:
+                add_note(state, "task_observations", text)
+            state_holder["state"] = state
+            state_holder["wrote_this_round"] = True
         # Soft incentive only: if the LLM hasn't written any scratchpad
         # note this round, log a warning and let the submit go through.
         # The harness no longer blocks shipping — notes-for-future-rounds
