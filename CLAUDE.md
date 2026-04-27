@@ -53,7 +53,7 @@ challenge = {
 
     # ── Service URLs (use via client) ──
     "db_url": str,         # experiment database (GET /experiments/recent?limit=10)
-    "desearch_url": str,   # arxiv search (POST /search {query, max_results})
+    "desearch_url": str,   # arxiv search (POST /search {query, count, date_filter})
     "llm_url": str,        # LLM inference (POST /chat, GET /models)
     "agent_token": str,    # auto-injected into client headers
 
@@ -169,7 +169,7 @@ experiments = client.get_json(f"{db_url}/experiments/recent?limit=10")
 ### Arxiv Search (`challenge["desearch_url"]`)
 
 ```python
-results = client.post_json(f"{desearch_url}/search", {"query": "...", "max_results": 5})["results"]
+results = client.post_json(f"{desearch_url}/search", {"query": "...", "count": 10, "date_filter": "PAST_2_YEARS"})["results"]
 ```
 
 ### Scratchpad (persistent across rounds)

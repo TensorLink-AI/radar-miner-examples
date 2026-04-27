@@ -132,10 +132,10 @@ TOOLS: list[dict] = [
                     },
                     "max_results": {
                         "type": "integer",
-                        "minimum": 1,
+                        "minimum": 10,
                         "maximum": 20,
-                        "default": 5,
-                        "description": "Maximum results to return (1-20, default 5)",
+                        "default": 10,
+                        "description": "Maximum results to return (10-20, default 10)",
                     },
                     "tool": {
                         "type": "string",
@@ -598,23 +598,31 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
 
     # ── Research handlers ─────────────────────────────────────────
 
-    def search_papers(query: str, max_results: int = 5,
+    def search_papers(query: str, max_results: int = 10,
                       tool: str | None = None,
                       date_filter: str | None = None) -> str:
         if not desearch_url:
             return "Paper search unavailable (no desearch_url)."
         try:
-            max_results = max(1, min(int(max_results), 20))
+            max_results = max(10, min(int(max_results), 20))
         except (TypeError, ValueError):
-            max_results = 5
-        payload: dict = {"query": query, "max_results": max_results}
+            max_results = 10
+        # Upstream API renamed `max_results` → `count` (min 10) and
+        # rejects requests where `date_filter` is missing or "NONE",
+        # so always send a valid enum value.
+        payload: dict = {
+            "query": query,
+            "count": max_results,
+            "max_results": max_results,
+        }
         if tool in ("arxiv", "web"):
             payload["tool"] = tool
-        if date_filter in {
+        if date_filter not in {
             "PAST_24_HOURS", "PAST_2_DAYS", "PAST_WEEK", "PAST_2_WEEKS",
             "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
         }:
-            payload["date_filter"] = date_filter
+            date_filter = "PAST_2_YEARS"
+        payload["date_filter"] = date_filter
         try:
             resp = call_with_timeout(
                 client.post_json,
