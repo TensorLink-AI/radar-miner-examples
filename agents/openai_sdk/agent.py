@@ -52,13 +52,6 @@ except ImportError:
 
 
 FALLBACK_RESERVE_SECONDS = 30
-RESEARCH_BUDGET_FRAC = 0.20
-RESEARCH_BUDGET_MAX = 90
-RESEARCH_BUDGET_MIN = 60
-
-# Small per-phase tool-loop caps so the LLM doesn't sprawl.
-RESEARCH_MAX_ROUNDS = 2
-DESIGN_MAX_ROUNDS = 6
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 
@@ -181,58 +174,61 @@ def _run_tool_loop(
     tools: list[dict],
     handlers: dict,
     deadline: float,
-    max_rounds: int,
     phase: str,
+    t_start: float,
     llm_url: str = "",
     agent_token: str = "",
     miner_uid: str = "",
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
 ):
-    """Run tool-calling rounds until ``max_rounds``, deadline, or submit.
+    """Run tool-calling rounds until the deadline approaches or the
+    LLM submits.
 
-    Returns ``(updated_messages, submitted_code, submit_sig, failure)``.
-    ``failure`` is a short reason string when the loop couldn't produce
-    anything useful (``"config: ..."``, ``"chat: timeout"``, etc.), or
-    ``None`` on clean exit. The caller uses it to set an honest fallback
-    motivation and, for config errors, to skip later phases.
+    Returns ``(updated_messages, submitted_code, submit_sig, failure,
+    rounds_run)``. ``failure`` is a short reason string when the loop
+    couldn't produce anything useful (``"config: ..."``,
+    ``"chat: timeout"``, etc.), or ``None`` on clean exit.
+    ``rounds_run`` is the number of LLM turns the loop completed —
+    the caller uses it for diagnostic logs and fallback motivations.
     """
     submitted: str | None = None
     failure: str | None = None
     rounds_since_validated = 0
 
-    for round_num in range(max_rounds):
+    round_num = 0
+    while True:
+        round_num += 1
         remaining = deadline - time.monotonic()
-        if remaining < 15:
+        if remaining < 60:
             _log(
-                f"[agent] {phase} round {round_num + 1}: "
+                f"[agent] {phase} round {round_num}: "
                 f"only {remaining:.0f}s left, stopping"
             )
             if failure is None:
                 failure = "deadline"
             break
 
-        # Per-turn time-aware status header. The directive escalates as
-        # the deadline approaches and changes wording when validated
-        # code is already on file — primary lever against the
-        # "analysis paralysis" failure mode.
+        # Per-turn informational header — elapsed minutes + whether the
+        # model has validated code on file. No directives; the LLM owns
+        # its own pacing.
         has_validated = bool(getattr(
             handlers.get("submit", None), "_has_validated", False,
         ))
+        elapsed_s = int(time.monotonic() - t_start)
 
         # Replace the previous turn-header instead of appending a stack
-        # of stale "[REMAINING:" status lines. Only safe when the
-        # immediate predecessor is itself a turn-header user message
-        # AND the message before it is not a tool message — the
-        # tool-call protocol requires tool messages to immediately
-        # follow the assistant's tool_calls, so we never pop a header
-        # that was inserted between assistant tool_calls and tool
-        # results.
+        # of stale status lines. Only safe when the immediate
+        # predecessor is itself a turn-header user message AND the
+        # message before it is not a tool message — the tool-call
+        # protocol requires tool messages to immediately follow the
+        # assistant's tool_calls, so we never pop a header that was
+        # inserted between assistant tool_calls and tool results.
         if (
             len(messages) >= 2
             and messages[-1].get("role") == "user"
             and isinstance(messages[-1].get("content"), str)
-            and messages[-1]["content"].startswith("[REMAINING:")
+            and messages[-1]["content"].startswith("[elapsed:")
             and messages[-2].get("role") != "tool"
         ):
             messages.pop()
@@ -240,28 +236,15 @@ def _run_tool_loop(
         messages.append({
             "role": "user",
             "content": build_turn_header(
-                remaining_s=int(remaining),
-                phase=phase,
+                elapsed_s=elapsed_s,
                 has_validated=has_validated,
             ),
         })
 
-        # Once code has been validated, narrow the tool surface to the
-        # ship path — submit + scratchpad. Removing the exploration
-        # tools is the structural fix for "keep sketching" loops: the
-        # LLM literally cannot pick a non-shipping tool when those
-        # tools aren't on the menu.
-        active_tools = tools
-        if has_validated and phase == "design":
-            keep = {"submit", "write_scratchpad", "read_scratchpad"}
-            active_tools = [
-                t for t in tools if t["function"]["name"] in keep
-            ]
-
         try:
             resp = chat(
                 messages=messages,
-                tools=active_tools,
+                tools=tools,
                 llm_url=llm_url,
                 agent_token=agent_token,
                 miner_uid=miner_uid,
@@ -273,13 +256,13 @@ def _run_tool_loop(
         except Exception as exc:
             if _is_config_error(exc):
                 _log(
-                    f"[agent] {phase} round {round_num + 1} "
+                    f"[agent] {phase} round {round_num} "
                     f"CONFIG ERROR: {exc}"
                 )
                 failure = f"config: {exc}"
             else:
                 _log(
-                    f"[agent] {phase} round {round_num + 1} "
+                    f"[agent] {phase} round {round_num} "
                     f"chat failed: {exc}"
                 )
                 failure = f"chat: {type(exc).__name__}: {exc}"
@@ -337,7 +320,7 @@ def _run_tool_loop(
                         f"[agent] {phase}: model submitted "
                         f"({len(submitted)} chars, name={sig.name})"
                     )
-                    return messages, submitted, sig, None
+                    return messages, submitted, sig, None, round_num
                 except Exception as exc:
                     result = f"tool error: {exc}"
 
@@ -391,7 +374,7 @@ def _run_tool_loop(
                 )
                 break
 
-    return messages, submitted, None, failure
+    return messages, submitted, None, failure, round_num
 
 
 def design_architecture(challenge: dict, gated_client=None) -> dict:
@@ -407,16 +390,10 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     t_start = time.monotonic()
     budget = _agent_budget(challenge)
     deadline = t_start + budget - FALLBACK_RESERVE_SECONDS
-    research_window = max(
-        RESEARCH_BUDGET_MIN,
-        min(RESEARCH_BUDGET_MAX, int(budget * RESEARCH_BUDGET_FRAC)),
-    )
-    research_deadline = min(t_start + research_window, deadline)
 
     _log(
         f"[agent] start budget={budget}s "
-        f"deadline_in={budget - FALLBACK_RESERVE_SECONDS}s "
-        f"research_in={int(research_deadline - t_start)}s"
+        f"deadline_in={budget - FALLBACK_RESERVE_SECONDS}s"
     )
 
     flops_min, flops_max = extract_flops_budget(challenge)
@@ -500,74 +477,42 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     last_proposed_code: str | None = None
     last_validation_errors: list[str] = []
     submit_sig: SubmitSignal | None = None
-    research_failure: str | None = None
     design_failure: str | None = None
+    rounds_run = 0
 
     if config_broken:
-        # Skip both phases — nothing we can do without an LLM.
-        _log("[agent] config broken, skipping research+design phases")
+        # Nothing we can do without an LLM — skip straight to packaging.
+        _log("[agent] config broken, skipping main loop")
     else:
-        # ── Phase 1: research ────────────────────────────────────────
-        _log("[agent] phase=research")
-        messages, _candidate, submit_sig, research_failure = _run_tool_loop(
-            messages=messages,
-            tools=tools,
-            handlers=handlers,
-            deadline=research_deadline,
-            max_rounds=RESEARCH_MAX_ROUNDS,
-            phase="research",
-            llm_url=llm_url,
-            agent_token=agent_token,
-            miner_uid=miner_uid,
-        )
-        if research_failure and research_failure.startswith("config:"):
-            config_broken = True
-            config_error = research_failure.replace("config:", "config error:", 1)
-
-        # If the model already submitted in research (eager), accept it
-        # and skip straight to packaging. Otherwise run design unless
-        # config is broken.
-        if submit_sig is None and not config_broken:
-            # ── Phase 2: design ─────────────────────────────────────
-            _log("[agent] phase=design")
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Now propose a model. Call validate_code on your "
-                    "candidate; if it fails, iterate. When the code "
-                    "passes, call submit with the final code, a short "
-                    "name, and a motivation."
-                ),
-            })
-            messages, candidate_code, submit_sig, design_failure = (
-                _run_tool_loop(
-                    messages=messages,
-                    tools=tools,
-                    handlers=handlers,
-                    deadline=deadline,
-                    max_rounds=DESIGN_MAX_ROUNDS,
-                    phase="design",
-                    llm_url=llm_url,
-                    agent_token=agent_token,
-                    miner_uid=miner_uid,
-                )
+        messages, candidate_code, submit_sig, design_failure, rounds_run = (
+            _run_tool_loop(
+                messages=messages,
+                tools=tools,
+                handlers=handlers,
+                deadline=deadline,
+                phase="main",
+                t_start=t_start,
+                llm_url=llm_url,
+                agent_token=agent_token,
+                miner_uid=miner_uid,
             )
-            if design_failure and design_failure.startswith("config:"):
-                config_broken = True
-                config_error = design_failure.replace(
-                    "config:", "config error:", 1,
+        )
+        if design_failure and design_failure.startswith("config:"):
+            config_broken = True
+            config_error = design_failure.replace(
+                "config:", "config error:", 1,
+            )
+        if candidate_code:
+            ok, errors = validate_code(candidate_code, challenge)
+            if ok:
+                last_validated_code = candidate_code
+            else:
+                last_proposed_code = candidate_code
+                last_validation_errors = list(errors)
+                _log(
+                    f"[agent] candidate code didn't fully validate: "
+                    f"{errors}"
                 )
-            if candidate_code:
-                ok, errors = validate_code(candidate_code, challenge)
-                if ok:
-                    last_validated_code = candidate_code
-                else:
-                    last_proposed_code = candidate_code
-                    last_validation_errors = list(errors)
-                    _log(
-                        f"[agent] candidate code didn't fully validate: "
-                        f"{errors}"
-                    )
 
     # ── Scratchpad save ──────────────────────────────────────────────
     # Persist any notes the LLM stashed via ``write_scratchpad`` before
@@ -633,18 +578,11 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     if config_error:
         fallback_motivation = config_error
     else:
-        # Prefer the later phase's failure; research-only failure is
-        # reported when design never ran.
-        failure = design_failure or research_failure
+        failure = design_failure
         if failure and failure.startswith("chat:"):
             detail = failure.split(":", 1)[1].strip()
             if "timeout" in detail.lower() or "timed out" in detail.lower():
-                phase_name = (
-                    "design" if design_failure else "research"
-                )
-                fallback_motivation = (
-                    f"LLM timeout in {phase_name} phase"
-                )
+                fallback_motivation = "LLM timeout"
             else:
                 fallback_motivation = f"LLM chat failed: {detail}"
         elif failure == "deadline":
@@ -654,7 +592,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         else:
             fallback_motivation = (
                 f"LLM returned no parseable code after "
-                f"{RESEARCH_MAX_ROUNDS + DESIGN_MAX_ROUNDS} rounds"
+                f"{rounds_run} rounds"
             )
 
     # Stage A: auto-submit recovery. If the LLM called validate_code

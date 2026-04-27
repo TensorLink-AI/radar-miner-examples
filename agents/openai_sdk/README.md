@@ -26,15 +26,38 @@ Pick this agent as your starting point if you want:
 
 ## Architecture
 
-Three phases:
+Single tool-calling loop, one deadline. The LLM owns its time and
+decides when to ship.
 
-1. **Research** — first 20% of the budget (capped at 120s). The LLM
-   calls `analyze_task`, `list_frontier`, `get_frontier_member`.
-2. **Design** — middle 60% of the budget. The LLM iterates on
-   `validate_code` until something passes, then calls `submit`.
-3. **Reserve** — last 30s. Guaranteed window to wrap up; if nothing
-   submitted, ship a guaranteed-valid template via
-   `core.fallback_templates.generate_fallback`.
+`design_architecture` resolves a budget (`challenge["agent_seconds"]`,
+`AGENT_BUDGET_SECONDS`, or `task.time_budget`), reserves the last 30s
+for packaging, and hands the rest to `_run_tool_loop`. The loop runs
+until one of these fires:
+
+- **Submit** — the LLM calls the `submit` tool with validated code.
+  This is the happy path.
+- **Validated-and-stalled** — the LLM ran `validate_code` successfully
+  but burned two more rounds without calling `submit`. The harness
+  bails so its auto-submit recovery can ship the validated code.
+- **No tool calls** — the LLM responded with prose instead of a tool
+  call. If the prose contains a fenced code block it gets extracted as
+  a candidate; either way the loop ends.
+- **Deadline approaching** — fewer than 60s remain on the budget. The
+  loop hands control back to the packaging stage.
+- **Chat error** — the OpenAI SDK raises (timeout, 4xx, etc.). Config
+  errors short-circuit; transient errors are retried inside `chat()`.
+
+Once the loop exits, the agent saves the scratchpad, then picks the
+best return value it has — in order: explicit `submit`, validated
+candidate, partially-validated candidate, auto-submit of validated
+code stashed on the submit handler, and finally an honest
+empty-code failure package.
+
+There are no research/design phases, no per-phase round caps, no
+turn-header escalation, and no submit nag. The system prompt tells the
+LLM about the budget and the principles ("validation is the commitment
+point", "you can stop early"); the harness only intervenes when the
+LLM is genuinely stuck.
 
 ## File layout
 
@@ -61,7 +84,6 @@ agent is deployed.
 - `validation.validate_code` — AST + FLOPs + output-shape checks
 - `flops_estimator.estimate_flops` — FlopCounterMode wrapper
 - `history.extract_flops_budget`, `history.identify_bucket` — bucket math
-- `fallback_templates.generate_fallback` — guaranteed-valid model template
 - `prompt_builder._compute_sizing_guidance` — sizing prompt fragments
 
 ## Environment variables

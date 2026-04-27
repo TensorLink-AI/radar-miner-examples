@@ -471,6 +471,19 @@ class TestToolHandlers:
         assert excinfo.value.code == VALID_CODE
         assert excinfo.value.name == "m"
 
+    def test_submit_raises_signal_without_scratchpad_note(self, capsys):
+        """No-note path — submit no longer blocks. SubmitSignal still
+        fires, with one stderr warning line for diagnostics."""
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        with pytest.raises(SubmitSignal) as excinfo:
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="no note",
+            )
+        assert excinfo.value.code == VALID_CODE
+        captured = capsys.readouterr()
+        assert "submit without scratchpad note this round" in captured.err
+
 
 class TestFileTools:
     def test_write_then_read_roundtrip(self, tmp_path):
@@ -950,64 +963,6 @@ class TestScratchpadNotes:
         assert "legacy blob" in out
 
 
-class TestSubmitNag:
-    """Step 6: mandatory write_scratchpad before submit, enforced as a
-    one-shot polite nag. First submit without a note returns an error
-    string; second submit proceeds even without a note."""
-
-    def test_first_submit_without_note_returns_error(self):
-        from agents.openai_sdk.tools import build_handlers
-        handlers = build_handlers(_make_challenge())
-        result = handlers["submit"](
-            code=VALID_CODE, name="m", motivation="testing",
-        )
-        assert result.startswith("error:")
-        assert "write_scratchpad" in result
-
-    def test_second_submit_accepts_even_without_note(self):
-        from agents.openai_sdk.tools import SubmitSignal, build_handlers
-        handlers = build_handlers(_make_challenge())
-        # First call: nag (returns error string).
-        handlers["submit"](
-            code=VALID_CODE, name="m", motivation="nag cycle",
-        )
-        # Second call: should raise SubmitSignal even though no note
-        # was written — determined LLMs aren't blocked.
-        with pytest.raises(SubmitSignal):
-            handlers["submit"](
-                code=VALID_CODE, name="m", motivation="after nag",
-            )
-
-    def test_submit_after_write_skips_nag(self):
-        from agents.openai_sdk.tools import SubmitSignal, build_handlers
-        handlers = build_handlers(_make_challenge())
-        handlers["write_scratchpad"](hypothesis="try idea X")
-        with pytest.raises(SubmitSignal):
-            handlers["submit"](
-                code=VALID_CODE, name="m", motivation="with note",
-            )
-
-    def test_submit_after_deprecated_notes_write_also_skips_nag(self):
-        """The deprecated `notes=...` path still flips wrote_this_round
-        so in-flight rounds don't get stuck."""
-        from agents.openai_sdk.tools import SubmitSignal, build_handlers
-        handlers = build_handlers(_make_challenge())
-        handlers["write_scratchpad"](notes="legacy text")
-        with pytest.raises(SubmitSignal):
-            handlers["submit"](
-                code=VALID_CODE, name="m", motivation="legacy",
-            )
-
-    def test_submit_nag_count_bumped_once(self):
-        from agents.openai_sdk.tools import build_handlers
-        handlers = build_handlers(_make_challenge())
-        state_holder = handlers["submit"]._state_holder
-        handlers["submit"](
-            code=VALID_CODE, name="m", motivation="first",
-        )
-        assert state_holder["submit_nag_count"] == 1
-
-
 class TestCallCounts:
     """Per-round tool-usage telemetry is stashed on the submit
     wrapper as ``_call_counts``. Each wrapped handler invocation bumps
@@ -1081,7 +1036,7 @@ class TestDesignArchitecture:
         )
 
         ch = _make_challenge(with_flops=False)
-        ch["agent_seconds"] = 60
+        ch["agent_seconds"] = 180
         result = agent.design_architecture(ch, gated_client=None)
         assert result["code"] == VALID_CODE
         assert result["name"] == "instant"
@@ -1100,7 +1055,7 @@ class TestDesignArchitecture:
         )
 
         ch = _make_challenge()
-        ch["agent_seconds"] = 60
+        ch["agent_seconds"] = 180
         result = agent.design_architecture(ch, gated_client=None)
         assert result["name"].startswith("failed_")
         assert result["code"] == ""
@@ -1116,7 +1071,7 @@ class TestDesignArchitecture:
         mock_openai.return_value.chat.completions.create.side_effect = err
 
         ch = _make_challenge()
-        ch["agent_seconds"] = 60
+        ch["agent_seconds"] = 180
         result = agent.design_architecture(ch, gated_client=None)
         assert result["name"].startswith("failed_")
         assert result["code"] == ""
@@ -1128,7 +1083,7 @@ class TestDesignArchitecture:
         self, mock_openai, monkeypatch
     ):
         """With no challenge['llm_url'] and no LLM_URL env var, the
-        startup check should trip, skip both phases, and return an
+        startup check should trip, skip the main loop, and return an
         honest-failure package whose motivation surfaces the config
         error (not the old generic 'could not produce code' message)."""
         _reset_llm_client_cache()
@@ -1136,7 +1091,7 @@ class TestDesignArchitecture:
         from agents.openai_sdk import agent
 
         ch = _make_challenge()
-        ch["agent_seconds"] = 60
+        ch["agent_seconds"] = 180
         # No llm_url key in challenge
         result = agent.design_architecture(ch, gated_client=None)
 
@@ -1164,7 +1119,7 @@ class TestDesignArchitecture:
         )
 
         ch = _make_challenge(with_flops=False)
-        ch["agent_seconds"] = 60
+        ch["agent_seconds"] = 180
         ch["llm_url"] = "http://from-challenge/llm"
         result = agent.design_architecture(ch, gated_client=None)
 
