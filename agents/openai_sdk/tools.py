@@ -33,8 +33,9 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    add_note, add_submission, extract_flops_budget, find_candidate,
-    format_history, format_notes, get_history, get_submissions,
+    add_hypothesis, add_note, add_submission, extract_flops_budget,
+    find_candidate, format_history, format_notes,
+    format_scratchpad_summary, get_history, get_submissions,
     load_state, mark_candidate_submitted, mark_candidate_validated,
     save_state, upsert_candidate,
 )
@@ -588,9 +589,14 @@ TOOLS: list[dict] = [
                 "+ `reason` (an approach that failed and why), or "
                 "`observation` (a task-agnostic fact learned). Each "
                 "section is capped at 20 entries (oldest is dropped). "
-                "You MUST write at least one note before calling "
-                "`submit`. The deprecated free-form `notes` field is "
-                "still accepted but prefer the structured fields."
+                "When the note is a `hypothesis` you can also pass "
+                "`candidate_id` to link it to a sketched/validated "
+                "candidate — read_scratchpad will then surface that "
+                "candidate's status and (eventually) score under the "
+                "hypothesis. You MUST write at least one note before "
+                "calling `submit`. The deprecated free-form `notes` "
+                "field is still accepted but prefer the structured "
+                "fields."
             ),
             "parameters": {
                 "type": "object",
@@ -601,6 +607,19 @@ TOOLS: list[dict] = [
                             "Appended to open_hypotheses. Example: "
                             "'Try depthwise-sep convs for the same "
                             "receptive field at lower FLOPs.'"
+                        ),
+                    },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Only meaningful with "
+                            "`hypothesis`. Links the hypothesis to "
+                            "a candidate (e.g. 'cand_a3f24c1d') so "
+                            "the next round's read_scratchpad can "
+                            "show what the candidate's outcome was. "
+                            "If a hypothesis with the same text "
+                            "already exists, the id is appended to "
+                            "its candidate_ids list."
                         ),
                     },
                     "dead_end": {
@@ -1491,6 +1510,9 @@ def build_handlers(
             challenge.get("score_direction") or "minimize"
         )
         parts = []
+        # One-line situational summary at the top so the agent gets a
+        # quick read on what's been tried before scrolling the details.
+        parts.append(format_scratchpad_summary(state, score_direction))
         structured = format_notes(state)
         if structured:
             parts.append(structured)
@@ -1505,17 +1527,24 @@ def build_handlers(
                     score_direction=score_direction,
                 )
             )
-        if not parts:
+        # The summary line alone isn't enough to imply "scratchpad is
+        # populated" — if it's the only part we have, treat the round as
+        # the first one.
+        if len(parts) <= 1:
             return "scratchpad is empty — this is your first round"
         return "\n\n".join(parts)
 
     def _write_scratchpad(hypothesis: str = "", dead_end: str = "",
                           reason: str = "", observation: str = "",
-                          notes: str = "", **_kwargs) -> str:
+                          candidate_id: str = "", notes: str = "",
+                          **_kwargs) -> str:
         state = state_holder["state"]
         wrote: list[str] = []
         if hypothesis and hypothesis.strip():
-            add_note(state, "open_hypotheses", hypothesis)
+            add_hypothesis(
+                state, text=hypothesis,
+                candidate_id=candidate_id or None,
+            )
             wrote.append("hypothesis")
         if dead_end and dead_end.strip():
             combined = (

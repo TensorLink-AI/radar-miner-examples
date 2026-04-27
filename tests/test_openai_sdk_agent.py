@@ -886,6 +886,255 @@ class TestReadMySubmissions:
             assert key in reloaded["submissions"][0]
 
 
+class TestHypothesisLinkage:
+    """Feature 3: hypothesis → candidate_id → outcome linkage.
+
+    write_scratchpad(hypothesis=..., candidate_id=...) attaches the id
+    to the hypothesis record. read_scratchpad renders each link's
+    current candidate state (validated/submitted) and score (when
+    previous_results has merged it onto the matching submission).
+    A summary line at the top gives the agent a quick situational read.
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def _ship(self, handlers, code, name, motivation, candidate_id=""):
+        from agents.openai_sdk.tools import SubmitSignal
+        kwargs = {"code": code, "name": name, "motivation": motivation}
+        if candidate_id:
+            kwargs["candidate_id"] = candidate_id
+        try:
+            handlers["submit"](**kwargs)
+        except SubmitSignal:
+            pass
+
+    def test_hypothesis_with_candidate_id_stores_linkage(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="try patch sizes", candidate_id="cand_a3f24c1d",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["text"] == "try patch sizes"
+        assert bucket[0]["candidate_ids"] == ["cand_a3f24c1d"]
+
+    def test_hypothesis_without_candidate_id_starts_empty_links(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="something to try")
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == []
+
+    def test_duplicate_text_appends_candidate_id(self):
+        """Re-stating the same hypothesis with a new id appends rather
+        than creating a duplicate row."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_aaaaaaaa",
+        )
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_bbbbbbbb",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["candidate_ids"] == [
+            "cand_aaaaaaaa", "cand_bbbbbbbb",
+        ]
+
+    def test_duplicate_candidate_id_does_not_double_append(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_aaaaaaaa",
+        )
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_aaaaaaaa",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == ["cand_aaaaaaaa"]
+
+    def test_legacy_string_hypotheses_auto_upgrade_on_access(
+        self, tmp_path,
+    ):
+        """Old scratchpads with bare-string hypotheses must be wrapped
+        in dicts on first access — no manual migration step."""
+        import json
+        legacy = {
+            "notes": {
+                "open_hypotheses": ["try X", "try Y"],
+                "dead_ends": [],
+                "task_observations": [],
+            },
+        }
+        (tmp_path / "state.json").write_text(json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        # Trigger an access through write_scratchpad — _notes() runs
+        # the upgrade.
+        handlers["write_scratchpad"](hypothesis="try Z")
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert all(isinstance(h, dict) for h in bucket)
+        texts = [h["text"] for h in bucket]
+        assert texts == ["try X", "try Y", "try Z"]
+        # Upgraded entries get an empty candidate_ids list and no
+        # created_at timestamp.
+        upgraded = bucket[0]
+        assert upgraded["candidate_ids"] == []
+        assert upgraded["created_at"] is None
+
+    def test_read_renders_validated_submitted_scored(self):
+        """Full happy path: hypothesis → validate → submit → score
+        merged in. read_scratchpad must render the chain.
+        """
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        # validate creates a candidate with status="validated"
+        validate_out = handlers["validate_code"](code=VALID_CODE)
+        cid = [
+            l for l in validate_out.splitlines()
+            if l.startswith("candidate_id: ")
+        ][-1].split(": ", 1)[1]
+        # link hypothesis → candidate
+        handlers["write_scratchpad"](
+            hypothesis="larger patch sizes", candidate_id=cid,
+        )
+        # ship and merge a score for it
+        self._ship(handlers, "", "m", "ship", candidate_id=cid)
+        state = self._state(handlers)
+        sub = state["submissions"][0]
+        merge_results_into_state(state, [{
+            "round_id": "r1", "code_hash": sub["code_hash"],
+            "score": 0.81, "rank": 3, "rank_total": 9,
+        }])
+        out = handlers["read_scratchpad"]()
+        assert "larger patch sizes" in out
+        line = [l for l in out.splitlines() if cid in l][0]
+        assert "validated" in line
+        assert "submitted" in line
+        assert "scored 0.81" in line
+        assert "rank 3/9" in line
+
+    def test_read_renders_pending_when_candidate_unknown(self):
+        """A candidate_id with no matching candidate or submission
+        record should still render — just say nothing's known yet."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="speculative idea",
+            candidate_id="cand_deadbeef",
+        )
+        out = handlers["read_scratchpad"]()
+        line = [l for l in out.splitlines() if "cand_deadbeef" in l][0]
+        assert "no candidate state yet" in line
+
+    def test_read_renders_validated_only(self):
+        """Validated but not yet submitted: only the 'validated' tag
+        appears, no 'submitted', no score."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        validate_out = handlers["validate_code"](code=VALID_CODE)
+        cid = [
+            l for l in validate_out.splitlines()
+            if l.startswith("candidate_id: ")
+        ][-1].split(": ", 1)[1]
+        handlers["write_scratchpad"](
+            hypothesis="just an idea", candidate_id=cid,
+        )
+        out = handlers["read_scratchpad"]()
+        line = [l for l in out.splitlines() if cid in l][0]
+        assert "validated" in line
+        assert "submitted" not in line
+        assert "scored" not in line
+
+    def test_summary_line_counts_state(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        handlers["write_scratchpad"](hypothesis="h1")
+        handlers["write_scratchpad"](hypothesis="h2")
+        handlers["sketch_architecture"](code=(
+            "import torch.nn as nn\n"
+            "def build_model(context_len, prediction_len, num_variates,"
+            " quantiles):\n"
+            "    return nn.Linear(context_len, prediction_len)\n"
+        ))
+        self._ship(handlers, VALID_CODE, "m", "ship")
+        out = handlers["read_scratchpad"]()
+        summary = out.splitlines()[0]
+        assert "2 hypotheses" in summary
+        assert "1 candidates generated" in summary
+        assert "1 submitted" in summary
+        assert "no scores yet" in summary
+
+    def test_summary_top_score_minimize(self):
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        ch = _make_challenge()
+        ch["score_direction"] = "minimize"
+        handlers = build_handlers(ch)
+        handlers["write_scratchpad"](observation="ok")
+        self._ship(handlers, VALID_CODE, "v1", "first")
+        self._ship(
+            handlers,
+            VALID_CODE.replace("Adam", "Adam  # 2"),
+            "v2", "second",
+        )
+        state = self._state(handlers)
+        merge_results_into_state(state, [
+            {"code_hash": state["submissions"][0]["code_hash"],
+             "score": 0.5, "rank": 1, "round_id": "r1"},
+            {"code_hash": state["submissions"][1]["code_hash"],
+             "score": 0.2, "rank": 1, "round_id": "r2"},
+        ])
+        out = handlers["read_scratchpad"]()
+        # Lower is better when minimizing → 0.2 wins.
+        assert "top score: 0.2" in out.splitlines()[0]
+
+    def test_summary_top_score_maximize(self):
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        ch = _make_challenge()
+        ch["score_direction"] = "maximize"
+        handlers = build_handlers(ch)
+        handlers["write_scratchpad"](observation="ok")
+        self._ship(handlers, VALID_CODE, "v1", "first")
+        self._ship(
+            handlers,
+            VALID_CODE.replace("Adam", "Adam  # 2"),
+            "v2", "second",
+        )
+        state = self._state(handlers)
+        merge_results_into_state(state, [
+            {"code_hash": state["submissions"][0]["code_hash"],
+             "score": 0.5, "rank": 1, "round_id": "r1"},
+            {"code_hash": state["submissions"][1]["code_hash"],
+             "score": 0.2, "rank": 2, "round_id": "r2"},
+        ])
+        out = handlers["read_scratchpad"]()
+        # Higher is better when maximizing → 0.5 wins.
+        assert "top score: 0.5" in out.splitlines()[0]
+
+    def test_empty_state_still_says_first_round(self):
+        """The summary line alone shouldn't suppress the 'first round'
+        message — read_scratchpad should treat an otherwise-empty
+        state as not-yet-populated."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["read_scratchpad"]()
+        assert "first round" in out
+
+
 class TestFileTools:
     def test_write_then_read_roundtrip(self, tmp_path):
         from agents.openai_sdk.tools import build_handlers
@@ -1258,7 +1507,11 @@ class TestScratchpadNotes:
         handlers, state = self._handlers_with_state()
         out = handlers["write_scratchpad"](hypothesis="try SSM backbone")
         assert "hypothesis" in out
-        assert state["notes"]["open_hypotheses"] == ["try SSM backbone"]
+        # Hypotheses are now structured dicts with candidate_ids.
+        bucket = state["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["text"] == "try SSM backbone"
+        assert bucket[0]["candidate_ids"] == []
 
     def test_write_dead_end_with_reason_combines_them(self):
         handlers, state = self._handlers_with_state()
@@ -1291,7 +1544,7 @@ class TestScratchpadNotes:
         )
         for tag in ("hypothesis", "dead_end", "observation"):
             assert tag in out
-        assert state["notes"]["open_hypotheses"] == ["try attention"]
+        assert state["notes"]["open_hypotheses"][0]["text"] == "try attention"
         assert "underfits" in state["notes"]["dead_ends"][0]
         assert state["notes"]["task_observations"] == [
             "input channels are fixed",
@@ -1322,7 +1575,7 @@ class TestScratchpadNotes:
             handlers["write_scratchpad"](hypothesis=f"h{i}")
         bucket = state["notes"]["open_hypotheses"]
         assert len(bucket) == NOTES_MAX_ENTRIES
-        assert bucket[-1] == f"h{NOTES_MAX_ENTRIES + 2}"
+        assert bucket[-1]["text"] == f"h{NOTES_MAX_ENTRIES + 2}"
 
     def test_wrote_this_round_flag_set_after_success(self):
         from agents.openai_sdk.tools import build_handlers

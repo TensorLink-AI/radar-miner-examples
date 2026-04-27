@@ -354,17 +354,82 @@ NOTES_MAX_ENTRIES = 20
 NOTES_SECTIONS = ("open_hypotheses", "dead_ends", "task_observations")
 
 
+def _upgrade_hypotheses(notes: dict) -> None:
+    """Wrap any bare-string entries in ``open_hypotheses`` as the
+    structured dict shape introduced for hypothesis→candidate linkage.
+
+    Idempotent — already-dict entries pass through untouched. Mutates
+    the list in place.
+    """
+    bucket = notes.get("open_hypotheses")
+    if not isinstance(bucket, list):
+        return
+    for i, entry in enumerate(bucket):
+        if isinstance(entry, str):
+            bucket[i] = {
+                "text": entry,
+                "candidate_ids": [],
+                "created_at": None,
+            }
+
+
 def _notes(state: dict) -> dict:
     """Return the ``notes`` sub-dict, creating it (and sections) on demand."""
     notes = state.setdefault("notes", {})
     for section in NOTES_SECTIONS:
         notes.setdefault(section, [])
+    _upgrade_hypotheses(notes)
     return notes
+
+
+def add_hypothesis(state: dict, *, text: str,
+                   candidate_id: str | None = None) -> dict | None:
+    """Add (or update) a hypothesis entry in ``open_hypotheses``.
+
+    Returns the affected record, or None if ``text`` is empty/whitespace.
+    If an existing entry has the same ``text`` (after stripping), the
+    given ``candidate_id`` is appended to its ``candidate_ids`` list
+    instead of creating a duplicate (and duplicate ids within one entry
+    are deduped). New entries cap at ``NOTES_MAX_ENTRIES`` like the
+    other sections.
+    """
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    notes = _notes(state)
+    bucket = notes["open_hypotheses"]
+    # Find existing record by exact stripped text.
+    existing = None
+    for entry in bucket:
+        if isinstance(entry, dict) and entry.get("text") == stripped:
+            existing = entry
+            break
+    if existing is not None:
+        if candidate_id and candidate_id not in existing.setdefault(
+            "candidate_ids", [],
+        ):
+            existing["candidate_ids"].append(candidate_id)
+        return existing
+    record = {
+        "text": stripped,
+        "candidate_ids": [candidate_id] if candidate_id else [],
+        "created_at": time.time(),
+    }
+    bucket.append(record)
+    if len(bucket) > NOTES_MAX_ENTRIES:
+        del bucket[: len(bucket) - NOTES_MAX_ENTRIES]
+    return record
 
 
 def add_note(state: dict, section: str, entry: str) -> dict:
     """Append ``entry`` to ``state['notes'][section]``, capping at
     ``NOTES_MAX_ENTRIES`` by dropping the oldest.
+
+    For ``open_hypotheses`` the entry is stored as a structured dict via
+    ``add_hypothesis``; the other two sections retain the legacy
+    list-of-strings shape.
     """
     if section not in NOTES_SECTIONS:
         raise ValueError(
@@ -372,6 +437,12 @@ def add_note(state: dict, section: str, entry: str) -> dict:
             f"expected one of {NOTES_SECTIONS}"
         )
     if not isinstance(entry, str) or not entry.strip():
+        # Even when the entry is rejected we still want the canonical
+        # ``notes`` skeleton in place so callers can index it safely.
+        _notes(state)
+        return state
+    if section == "open_hypotheses":
+        add_hypothesis(state, text=entry)
         return state
     notes = _notes(state)
     bucket = notes[section]
@@ -382,8 +453,20 @@ def add_note(state: dict, section: str, entry: str) -> dict:
 
 
 def format_notes(state: dict) -> str:
-    """Render the three notes sections as a plain-text summary."""
+    """Render the three notes sections as a plain-text summary.
+
+    For ``open_hypotheses`` each linked candidate id is rendered as a
+    nested line with its current state (validated/submitted) and score
+    (when previous_results has merged a score onto a matching submission).
+    """
     notes = state.get("notes") or {}
+    candidates = state.get("candidates") or {}
+    submissions_by_cid: dict = {}
+    for s in state.get("submissions") or []:
+        cid = s.get("candidate_id")
+        if cid:
+            submissions_by_cid[cid] = s
+
     titles = {
         "open_hypotheses": "Open Hypotheses",
         "dead_ends": "Dead Ends",
@@ -394,9 +477,92 @@ def format_notes(state: dict) -> str:
         items = notes.get(section) or []
         if not items:
             continue
-        rendered = "\n".join(f"- {item}" for item in items)
+        if section == "open_hypotheses":
+            rendered = _render_hypotheses(
+                items, candidates, submissions_by_cid,
+            )
+        else:
+            rendered = "\n".join(f"- {item}" for item in items)
         parts.append(f"## {titles[section]}\n{rendered}")
     return "\n\n".join(parts)
+
+
+def _render_hypotheses(items: list, candidates: dict,
+                       submissions_by_cid: dict) -> str:
+    """Render the hypothesis list with one nested status line per
+    linked candidate id.
+    """
+    lines: list[str] = []
+    for item in items:
+        # Defensive — auto-upgrade should have run, but a bare string
+        # here is still renderable.
+        if isinstance(item, str):
+            lines.append(f"- {item}")
+            continue
+        text = item.get("text", "")
+        cids = item.get("candidate_ids") or []
+        lines.append(f"- {text}")
+        for cid in cids:
+            cand = candidates.get(cid) or {}
+            states: list[str] = []
+            if cand.get("validated"):
+                states.append("validated")
+            if cand.get("submitted"):
+                states.append("submitted")
+            sub = submissions_by_cid.get(cid)
+            if sub and isinstance(sub.get("score"), (int, float)):
+                rank = sub.get("rank")
+                rank_total = sub.get("rank_total")
+                if isinstance(rank, int):
+                    rank_text = (
+                        f" (rank {rank}/{rank_total})"
+                        if isinstance(rank_total, int)
+                        else f" (rank {rank})"
+                    )
+                else:
+                    rank_text = ""
+                states.append(f"scored {sub['score']:.4g}{rank_text}")
+            if not cand and not sub:
+                states.append("(no candidate state yet)")
+            elif not states:
+                states.append("(pending)")
+            lines.append(f"    {cid}: {', '.join(states)}")
+    return "\n".join(lines)
+
+
+def best_score_in_submissions(
+    state: dict, score_direction: str = "minimize",
+) -> float | None:
+    """Return the best submission score, or None if nothing is scored.
+
+    ``score_direction`` is ``"minimize"`` (lower is better) or
+    ``"maximize"`` (higher is better).
+    """
+    scored = [
+        s["score"] for s in get_submissions(state)
+        if isinstance(s.get("score"), (int, float))
+    ]
+    if not scored:
+        return None
+    return max(scored) if score_direction == "maximize" else min(scored)
+
+
+def format_scratchpad_summary(
+    state: dict, score_direction: str = "minimize",
+) -> str:
+    """One-line situational summary for the top of read_scratchpad."""
+    notes = state.get("notes") or {}
+    n_hyp = len(notes.get("open_hypotheses") or [])
+    candidates = state.get("candidates") or {}
+    n_cand = len(candidates)
+    submissions = state.get("submissions") or []
+    n_sub = len(submissions)
+    top = best_score_in_submissions(state, score_direction)
+    top_text = f"top score: {top:.4g}" if top is not None else "no scores yet"
+    return (
+        f"{n_hyp} hypotheses, {n_cand} candidates generated, "
+        f"{n_sub} submitted, {top_text}"
+    )
 
 
 def load_state(scratch_dir: str) -> dict:
