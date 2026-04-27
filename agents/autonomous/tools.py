@@ -126,11 +126,34 @@ TOOLS: list[dict] = [
                 "properties": {
                     "query": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": 500,
                         "description": "Search query (e.g. 'efficient <task_name> neural network')",
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum results to return (default 5)",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                        "description": "Maximum results to return (1-20, default 5)",
+                    },
+                    "tool": {
+                        "type": "string",
+                        "enum": ["arxiv", "web"],
+                        "default": "arxiv",
+                        "description": "Search backend (default 'arxiv')",
+                    },
+                    "date_filter": {
+                        "type": "string",
+                        "enum": [
+                            "PAST_24_HOURS", "PAST_2_DAYS", "PAST_WEEK",
+                            "PAST_2_WEEKS", "PAST_MONTH", "PAST_2_MONTHS",
+                            "PAST_YEAR", "PAST_2_YEARS",
+                        ],
+                        "description": (
+                            "Optional recency filter. Omit to default to "
+                            "PAST_2_YEARS upstream."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -575,14 +598,27 @@ def build_handlers(client, challenge: dict, scratch_dir, deadline: float) -> dic
 
     # ── Research handlers ─────────────────────────────────────────
 
-    def search_papers(query: str, max_results: int = 5) -> str:
+    def search_papers(query: str, max_results: int = 5,
+                      tool: str | None = None,
+                      date_filter: str | None = None) -> str:
         if not desearch_url:
             return "Paper search unavailable (no desearch_url)."
         try:
+            max_results = max(1, min(int(max_results), 20))
+        except (TypeError, ValueError):
+            max_results = 5
+        payload: dict = {"query": query, "max_results": max_results}
+        if tool in ("arxiv", "web"):
+            payload["tool"] = tool
+        if date_filter in {
+            "PAST_24_HOURS", "PAST_2_DAYS", "PAST_WEEK", "PAST_2_WEEKS",
+            "PAST_MONTH", "PAST_2_MONTHS", "PAST_YEAR", "PAST_2_YEARS",
+        }:
+            payload["date_filter"] = date_filter
+        try:
             resp = call_with_timeout(
                 client.post_json,
-                args=(f"{desearch_url}/search",
-                      {"query": query, "max_results": max_results}),
+                args=(f"{desearch_url}/search", payload),
                 timeout=TOOL_HTTP_TIMEOUT,
             )
             results = resp.get("results", [])
