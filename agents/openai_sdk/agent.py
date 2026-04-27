@@ -360,10 +360,10 @@ def _run_tool_loop(
             messages.append({
                 "role": "user",
                 "content": (
-                    "Validation passed. Submit now. Your next tool "
-                    "call must be `write_scratchpad` then `submit` "
-                    "with the validated code. Do not produce another "
-                    "candidate."
+                    "Validation passed. Submit now in a single call: "
+                    "`submit(candidate_id=..., name=..., "
+                    "motivation=..., note=...)`. Do not produce "
+                    "another candidate."
                 ),
             })
 

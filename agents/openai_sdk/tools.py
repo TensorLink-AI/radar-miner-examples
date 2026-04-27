@@ -919,7 +919,9 @@ TOOLS: list[dict] = [
                 "Either pass ``code`` directly, or pass the "
                 "``candidate_id`` returned by ``validate_code`` to ship "
                 "the stored candidate (the candidate is then marked "
-                "submitted in state)."
+                "submitted in state). Pass ``note`` to record a "
+                "scratchpad entry inline so you don't need a separate "
+                "write_scratchpad call."
             ),
             "parameters": {
                 "type": "object",
@@ -951,6 +953,19 @@ TOOLS: list[dict] = [
                             "provided, the candidate's stored code is "
                             "submitted and the ``code`` argument is "
                             "ignored."
+                        ),
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Scratchpad note recorded before "
+                            "shipping. When ``candidate_id`` is also "
+                            "supplied the note is stored as a "
+                            "hypothesis linked to that candidate so "
+                            "next round's read_scratchpad can resolve "
+                            "the outcome; otherwise it's stored as a "
+                            "task observation. Use this to skip a "
+                            "separate write_scratchpad call."
                         ),
                     },
                 },
@@ -1590,12 +1605,12 @@ def build_handlers(
         state_holder["last_validated_candidate_id"] = cid
         return (
             "ok — code passed all checks. THIS IS YOUR FINAL "
-            "ARTIFACT. Your next tool call MUST be `write_scratchpad` "
-            "followed by `submit` with this exact code (you can "
-            f"pass candidate_id={cid} instead of re-pasting). Do not "
-            "call sketch_architecture, size_to_flops, or "
-            "validate_code again unless you have a specific reason "
-            "to revise.\n"
+            "ARTIFACT. Your next tool call should be "
+            f"`submit(candidate_id={cid!r}, name=..., motivation=..., "
+            "note=...)` — pass the scratchpad note inline so you only "
+            "need one call. Do not call sketch_architecture, "
+            "size_to_flops, or validate_code again unless you have a "
+            "specific reason to revise.\n"
             f"candidate_id: {cid}"
         )
 
@@ -2130,7 +2145,23 @@ def build_handlers(
     # ── Control ──────────────────────────────────────────────────
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
-                candidate_id: str = "", **_kwargs) -> str:
+                candidate_id: str = "", note: str = "",
+                **_kwargs) -> str:
+        # Inline scratchpad note. Recorded BEFORE raising SubmitSignal
+        # so the persisted state captures the note even though the
+        # submit terminates the loop. When the submission is tied to a
+        # candidate_id the note is filed as a hypothesis linked to the
+        # candidate (so next round's read_scratchpad shows what
+        # actually shipped). Otherwise it's a generic observation.
+        if note and isinstance(note, str) and note.strip():
+            text = note.strip()
+            state = state_holder["state"]
+            if candidate_id:
+                add_hypothesis(state, text=text, candidate_id=candidate_id)
+            else:
+                add_note(state, "task_observations", text)
+            state_holder["state"] = state
+            state_holder["wrote_this_round"] = True
         # Soft incentive only: if the LLM hasn't written any scratchpad
         # note this round, log a warning and let the submit go through.
         # The harness no longer blocks shipping — notes-for-future-rounds
