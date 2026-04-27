@@ -174,7 +174,6 @@ def _run_tool_loop(
     tools: list[dict],
     handlers: dict,
     deadline: float,
-    max_rounds: int,
     phase: str,
     t_start: float,
     llm_url: str = "",
@@ -183,23 +182,26 @@ def _run_tool_loop(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
 ):
-    """Run tool-calling rounds until ``max_rounds``, deadline, or submit.
+    """Run tool-calling rounds until the deadline approaches or the
+    LLM submits.
 
     Returns ``(updated_messages, submitted_code, submit_sig, failure)``.
     ``failure`` is a short reason string when the loop couldn't produce
     anything useful (``"config: ..."``, ``"chat: timeout"``, etc.), or
     ``None`` on clean exit. The caller uses it to set an honest fallback
-    motivation and, for config errors, to skip later phases.
+    motivation and, for config errors, to skip later work.
     """
     submitted: str | None = None
     failure: str | None = None
     rounds_since_validated = 0
 
-    for round_num in range(max_rounds):
+    round_num = 0
+    while True:
+        round_num += 1
         remaining = deadline - time.monotonic()
-        if remaining < 15:
+        if remaining < 60:
             _log(
-                f"[agent] {phase} round {round_num + 1}: "
+                f"[agent] {phase} round {round_num}: "
                 f"only {remaining:.0f}s left, stopping"
             )
             if failure is None:
@@ -238,22 +240,10 @@ def _run_tool_loop(
             ),
         })
 
-        # Once code has been validated, narrow the tool surface to the
-        # ship path — submit + scratchpad. Removing the exploration
-        # tools is the structural fix for "keep sketching" loops: the
-        # LLM literally cannot pick a non-shipping tool when those
-        # tools aren't on the menu.
-        active_tools = tools
-        if has_validated and phase == "design":
-            keep = {"submit", "write_scratchpad", "read_scratchpad"}
-            active_tools = [
-                t for t in tools if t["function"]["name"] in keep
-            ]
-
         try:
             resp = chat(
                 messages=messages,
-                tools=active_tools,
+                tools=tools,
                 llm_url=llm_url,
                 agent_token=agent_token,
                 miner_uid=miner_uid,
@@ -265,13 +255,13 @@ def _run_tool_loop(
         except Exception as exc:
             if _is_config_error(exc):
                 _log(
-                    f"[agent] {phase} round {round_num + 1} "
+                    f"[agent] {phase} round {round_num} "
                     f"CONFIG ERROR: {exc}"
                 )
                 failure = f"config: {exc}"
             else:
                 _log(
-                    f"[agent] {phase} round {round_num + 1} "
+                    f"[agent] {phase} round {round_num} "
                     f"chat failed: {exc}"
                 )
                 failure = f"chat: {type(exc).__name__}: {exc}"
