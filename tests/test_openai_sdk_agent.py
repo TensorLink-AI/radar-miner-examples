@@ -409,6 +409,24 @@ class TestToolSchema:
         # at runtime.
         assert {"name", "motivation"} <= set(required)
 
+    def test_build_tools_returns_expected_count(self):
+        """Pin the tool count. Future trimming should be intentional —
+        an accidental drop will surface here. Bump this number when
+        you knowingly add or remove a tool."""
+        from agents.openai_sdk.tools import build_tools
+        assert len(build_tools(_make_challenge())) == 27
+
+    def test_system_prompt_under_length_threshold(self):
+        """Pin the system prompt size with headroom (~25% above the
+        current length) so the next time it bloats we notice. Tighten
+        this number when you intentionally make the prompt smaller."""
+        from agents.openai_sdk.prompts import build_system_prompt
+        prompt = build_system_prompt(_make_challenge())
+        assert len(prompt) < 11_000, (
+            f"system prompt grew to {len(prompt)} chars — bloat? "
+            "If this growth is intentional, tighten the threshold."
+        )
+
 
 class TestToolHandlers:
     def test_analyze_task_returns_json(self):
