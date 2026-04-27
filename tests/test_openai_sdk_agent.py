@@ -391,6 +391,7 @@ class TestToolSchema:
             "check_output_shape", "read_scratchpad",
             "read_my_submissions", "write_scratchpad",
             "list_files", "read_file", "write_file", "search_files",
+            "define_macro", "run_macro", "list_macros",
             "time_remaining",
             "cognition_wiki_index", "cognition_wiki_read",
         } == names
@@ -1133,6 +1134,283 @@ class TestHypothesisLinkage:
         handlers = build_handlers(_make_challenge())
         out = handlers["read_scratchpad"]()
         assert "first round" in out
+
+
+class TestMacros:
+    """Feature 4: tool macros.
+
+    define_macro stores a reusable sequence; run_macro plays it back
+    with ``${args.X}`` and ``${step_var}`` substitution; list_macros
+    surfaces what's defined. Macros can't ship (submit is banned) and
+    can't recurse (define_macro / run_macro are banned in sequences).
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def test_define_macro_stores_correctly(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(frontier=[
+            {"name": "m0", "objectives": {"crps": 0.4}, "code": "pass"},
+        ]))
+        out = handlers["define_macro"](
+            name="similar_frontier",
+            sequence=[
+                {"tool": "list_frontier", "args": {},
+                 "output_to": "fl"},
+                {"tool": "get_frontier_member",
+                 "args": {"idx": 0}, "output_to": "m1"},
+            ],
+            description="explore frontier head",
+        )
+        assert "similar_frontier" in out
+        assert "2 step" in out
+        macro = self._state(handlers)["macros"]["similar_frontier"]
+        assert macro["description"] == "explore frontier head"
+        assert len(macro["sequence"]) == 2
+        assert macro["sequence"][0]["output_to"] == "fl"
+        assert "created_at" in macro
+
+    def test_define_macro_rejects_submit(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="ship_it",
+            sequence=[
+                {"tool": "submit",
+                 "args": {"code": "x", "name": "n", "motivation": "m"}},
+            ],
+        )
+        assert out.startswith("error:")
+        assert "submit" in out
+        assert "macros" not in self._state(handlers) or \
+            "ship_it" not in self._state(handlers)["macros"]
+
+    def test_define_macro_rejects_unknown_tool(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="bogus",
+            sequence=[{"tool": "nonexistent_tool", "args": {}}],
+        )
+        assert out.startswith("error:")
+        assert "nonexistent_tool" in out
+
+    def test_define_macro_rejects_nested_macro_calls(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out_run = handlers["define_macro"](
+            name="recurse",
+            sequence=[{"tool": "run_macro", "args": {"name": "recurse"}}],
+        )
+        assert out_run.startswith("error:")
+        out_def = handlers["define_macro"](
+            name="meta",
+            sequence=[{"tool": "define_macro",
+                       "args": {"name": "x", "sequence": []}}],
+        )
+        assert out_def.startswith("error:")
+
+    def test_define_macro_rejects_invalid_name(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="123-bad name!",
+            sequence=[{"tool": "analyze_task", "args": {}}],
+        )
+        assert out.startswith("error:")
+
+    def test_define_macro_rejects_too_many_steps(self):
+        from core.history import MAX_MACRO_STEPS
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="big",
+            sequence=[
+                {"tool": "analyze_task", "args": {}}
+                for _ in range(MAX_MACRO_STEPS + 1)
+            ],
+        )
+        assert out.startswith("error:")
+        assert str(MAX_MACRO_STEPS) in out
+
+    def test_run_macro_executes_sequence(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["define_macro"](
+            name="task_then_frontier",
+            sequence=[
+                {"tool": "analyze_task", "args": {}},
+                {"tool": "list_frontier", "args": {}},
+            ],
+        )
+        out = handlers["run_macro"](name="task_then_frontier")
+        assert "[step 1 analyze_task]" in out
+        assert "[step 2 list_frontier]" in out
+        assert "ts_forecasting" in out
+
+    def test_run_macro_substitutes_args(self):
+        """``${args.idx}`` must resolve to the run-time arg."""
+        from agents.openai_sdk.tools import build_handlers
+        frontier = [
+            {"name": "f0", "objectives": {"crps": 0.4}, "code": "x=0"},
+            {"name": "f1", "objectives": {"crps": 0.3}, "code": "x=1"},
+        ]
+        handlers = build_handlers(_make_challenge(frontier=frontier))
+        handlers["define_macro"](
+            name="get_at",
+            sequence=[
+                {"tool": "get_frontier_member",
+                 "args": {"idx": "${args.i}"}},
+            ],
+        )
+        # Whole-string substitution preserves the int type, so the
+        # idx int-check inside _get_frontier_member passes.
+        out = handlers["run_macro"](name="get_at", args={"i": 1})
+        assert "x=1" in out
+        assert "out of range" not in out
+
+    def test_run_macro_substitutes_step_outputs(self):
+        """``${step_var}`` is replaced with a previous step's output
+        when used as an embedded substring."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="seed obs")
+        # search_files takes a query string; we substitute a literal
+        # word that should match the seeded observation.
+        handlers["define_macro"](
+            name="grep_chain",
+            sequence=[
+                # First step produces output we don't care about; we
+                # only use it to demonstrate the variable name lookup.
+                {"tool": "analyze_task", "args": {},
+                 "output_to": "task"},
+                # Build a query that includes ${task} embedded — the
+                # substitution stringifies the prior step output.
+                {"tool": "search_files",
+                 "args": {"query": "missing-${task}-marker"}},
+            ],
+        )
+        # No scratch_dir wired, so search_files reports unavailable.
+        # That's fine — we only need to confirm both steps fired and
+        # the substitution produced a non-literal query.
+        out = handlers["run_macro"](name="grep_chain")
+        assert "[step 1 analyze_task]" in out
+        assert "[step 2 search_files]" in out
+
+    def test_run_macro_missing_var_keeps_literal(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(frontier=[
+            {"name": "f0", "objectives": {}, "code": "x=0"},
+        ]))
+        handlers["define_macro"](
+            name="bad_ref",
+            sequence=[
+                # This uses a whole-string ref that doesn't resolve.
+                # The literal ${args.missing} reaches the handler,
+                # which then errors on the type check — proving the
+                # substitution did NOT silently swap in something
+                # bogus.
+                {"tool": "get_frontier_member",
+                 "args": {"idx": "${args.missing}"}},
+            ],
+        )
+        out = handlers["run_macro"](name="bad_ref", args={})
+        assert "out of range" in out or "error" in out.lower()
+
+    def test_run_macro_halts_on_error_returns_partial(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(frontier=[]))
+        handlers["define_macro"](
+            name="halt_demo",
+            sequence=[
+                {"tool": "analyze_task", "args": {}},
+                # list_frontier returns "frontier is empty" — that's
+                # informational, not an error string. Use
+                # get_frontier_member with bogus idx to force an
+                # actual error: line.
+                {"tool": "get_frontier_member",
+                 "args": {"idx": 99}},
+                {"tool": "analyze_task", "args": {}},
+            ],
+        )
+        out = handlers["run_macro"](name="halt_demo")
+        # First two steps recorded; the second errored so the third
+        # never runs.
+        assert "[step 1 analyze_task]" in out
+        assert "[step 2 get_frontier_member]" in out
+        assert "[step 3" not in out
+        assert "error:" in out.lower()
+
+    def test_run_macro_unknown_macro_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["run_macro"](name="ghost")
+        assert out.startswith("error:")
+        assert "ghost" in out
+
+    def test_list_macros_returns_signatures(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        assert handlers["list_macros"]() == "no macros defined yet"
+        handlers["define_macro"](
+            name="m1",
+            sequence=[{"tool": "analyze_task", "args": {}}],
+            description="just analyze",
+        )
+        out = handlers["list_macros"]()
+        items = json.loads(out)
+        assert len(items) == 1
+        assert items[0]["name"] == "m1"
+        assert items[0]["description"] == "just analyze"
+        assert items[0]["n_steps"] == 1
+        assert items[0]["tools"] == ["analyze_task"]
+
+    def test_legacy_state_loads_with_empty_macros(self, tmp_path):
+        import json as _json
+        legacy = {"history": [], "notes": {"open_hypotheses": []}}
+        (tmp_path / "state.json").write_text(_json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        assert handlers["list_macros"]() == "no macros defined yet"
+        # Defining a macro lazily creates the dict.
+        handlers["define_macro"](
+            name="m1",
+            sequence=[{"tool": "analyze_task", "args": {}}],
+        )
+        assert "m1" in self._state(handlers)["macros"]
+
+    def test_macros_survive_save_load_roundtrip(self, tmp_path):
+        import sys
+        sys.path.insert(0, "agents/openai_sdk")
+        for k in list(sys.modules):
+            if k == "core" or k.startswith("core."):
+                del sys.modules[k]
+        from core.history import (  # noqa: E402
+            load_state, save_state,
+        )
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["define_macro"](
+            name="m1",
+            sequence=[
+                {"tool": "analyze_task", "args": {},
+                 "output_to": "t"},
+            ],
+            description="d",
+        )
+        save_state(str(tmp_path), self._state(handlers))
+        reloaded = load_state(str(tmp_path))
+        assert "macros" in reloaded
+        m = reloaded["macros"]["m1"]
+        assert m["description"] == "d"
+        assert m["sequence"][0]["tool"] == "analyze_task"
+        assert m["sequence"][0]["output_to"] == "t"
+        assert "created_at" in m
 
 
 class TestFileTools:

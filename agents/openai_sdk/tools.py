@@ -21,6 +21,7 @@ import copy
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 import time
@@ -33,11 +34,12 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    add_hypothesis, add_note, add_submission, extract_flops_budget,
-    find_candidate, format_history, format_notes,
-    format_scratchpad_summary, get_history, get_submissions,
-    load_state, mark_candidate_submitted, mark_candidate_validated,
-    save_state, upsert_candidate,
+    MAX_MACRO_STEPS, MAX_MACROS, add_hypothesis, add_macro, add_note,
+    add_submission, extract_flops_budget, find_candidate, find_macro,
+    format_history, format_notes, format_scratchpad_summary,
+    get_history, get_macros, get_submissions, load_state,
+    mark_candidate_submitted, mark_candidate_validated, save_state,
+    upsert_candidate,
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
@@ -521,6 +523,117 @@ TOOLS: list[dict] = [
                         ),
                     },
                 },
+                "required": [],
+            },
+        },
+    },
+    # ── Composing tools ─────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "define_macro",
+            "description": (
+                "Save a named sequence of tool calls so you can "
+                "replay it as one action. Each step is "
+                "``{tool: str, args: dict, output_to?: str}``. "
+                "Within ``args`` you can reference run-time "
+                "arguments via ``${args.foo}`` and prior step "
+                "outputs via ``${step_var}`` (the variable name set "
+                "by an earlier step's ``output_to``). When a string "
+                "value is exactly one substitution reference its "
+                "type is preserved; embedded refs stringify. "
+                "Restrictions: ``submit``, ``define_macro``, and "
+                "``run_macro`` cannot appear in a sequence — macros "
+                "cannot ship code or recurse into other macros. Up "
+                f"to {MAX_MACRO_STEPS} steps per macro, "
+                f"{MAX_MACROS} macros stored per miner."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Macro name (alnum / underscore). "
+                            "Re-using a name overwrites the macro."
+                        ),
+                    },
+                    "sequence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {"type": "string"},
+                                "args": {"type": "object"},
+                                "output_to": {"type": "string"},
+                            },
+                            "required": ["tool"],
+                        },
+                        "description": (
+                            "Ordered list of steps. Example: "
+                            "[{\"tool\": \"list_frontier\", "
+                            "\"args\": {}, \"output_to\": \"fl\"}]"
+                        ),
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "Optional human-readable description, "
+                            "shown by list_macros."
+                        ),
+                    },
+                },
+                "required": ["name", "sequence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_macro",
+            "description": (
+                "Execute a previously defined macro. Substitutes "
+                "``${args.X}`` placeholders with the corresponding "
+                "value from ``args`` and ``${var}`` with the output "
+                "of a prior step labelled via ``output_to``. Returns "
+                "the concatenated outputs of every step, each "
+                "prefixed with ``[step N tool_name]``. Halts on the "
+                "first error (handler exception OR a result starting "
+                "with ``error:``/``errors:``) and returns the partial "
+                "output."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Macro name to execute.",
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Optional dict of run-time arguments "
+                            "referenced inside the macro via "
+                            "``${args.foo}``."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_macros",
+            "description": (
+                "List the macros defined in this miner's state. "
+                "Each entry shows name, description, step count, "
+                "and the tool names invoked in the sequence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
                 "required": [],
             },
         },
@@ -1502,6 +1615,218 @@ def build_handlers(
             )
         return "\n\n".join(parts)
 
+    # ── Macros ──────────────────────────────────────────────────
+    #
+    # Macro execution calls the same wrapped handler dict the LLM
+    # uses, so circuit breakers and call counts apply uniformly to
+    # macro-driven invocations. The dict isn't built yet at this
+    # point in build_handlers — we stash a reference once it's
+    # finalized below and read from the box at run time.
+
+    handlers_box: dict = {}
+    MACRO_FORBIDDEN_TOOLS = frozenset({
+        "submit", "define_macro", "run_macro",
+    })
+    MACRO_NAME_RE = re.compile(r"^[A-Za-z_][\w]{0,63}$")
+    MACRO_REF_RE = re.compile(r"\$\{([\w.]+)\}")
+
+    def _resolve_ref(ref: str, run_args: dict, step_outputs: dict):
+        if ref.startswith("args."):
+            key = ref[len("args."):]
+            if isinstance(run_args, dict) and key in run_args:
+                return run_args[key], True
+            return None, False
+        if ref in step_outputs:
+            return step_outputs[ref], True
+        return None, False
+
+    def _substitute(value, run_args: dict, step_outputs: dict):
+        """Recursively substitute ``${...}`` refs in args. A whole-
+        string ref preserves the source value's type; embedded refs
+        stringify. Missing refs leave the literal ``${name}`` in
+        place so the LLM can see what didn't resolve.
+        """
+        if isinstance(value, str):
+            full = MACRO_REF_RE.fullmatch(value)
+            if full is not None:
+                resolved, ok = _resolve_ref(
+                    full.group(1), run_args, step_outputs,
+                )
+                return resolved if ok else value
+
+            def replace(m):
+                resolved, ok = _resolve_ref(
+                    m.group(1), run_args, step_outputs,
+                )
+                return str(resolved) if ok else m.group(0)
+
+            return MACRO_REF_RE.sub(replace, value)
+        if isinstance(value, dict):
+            return {
+                k: _substitute(v, run_args, step_outputs)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [_substitute(v, run_args, step_outputs) for v in value]
+        return value
+
+    def _validate_macro_sequence(
+        sequence, available_tools: set,
+    ) -> str | None:
+        """Return None if sequence is valid, else an error string."""
+        if not isinstance(sequence, list) or not sequence:
+            return "error: sequence must be a non-empty list of steps"
+        if len(sequence) > MAX_MACRO_STEPS:
+            return (
+                f"error: sequence has {len(sequence)} steps; max "
+                f"is {MAX_MACRO_STEPS}"
+            )
+        for i, step in enumerate(sequence, 1):
+            if not isinstance(step, dict):
+                return f"error: step {i} is not a dict"
+            tool = step.get("tool")
+            if not isinstance(tool, str) or not tool:
+                return f"error: step {i} missing 'tool' name"
+            if tool in MACRO_FORBIDDEN_TOOLS:
+                return (
+                    f"error: step {i} calls {tool!r} which is not "
+                    "allowed in a macro (submit ships code; "
+                    "define_macro and run_macro would let macros "
+                    "recurse)"
+                )
+            if tool not in available_tools:
+                return (
+                    f"error: step {i} references unknown tool "
+                    f"{tool!r}"
+                )
+            args = step.get("args", {})
+            if args is not None and not isinstance(args, dict):
+                return (
+                    f"error: step {i} args must be a dict (got "
+                    f"{type(args).__name__})"
+                )
+            output_to = step.get("output_to")
+            if output_to is not None and (
+                not isinstance(output_to, str) or not output_to
+            ):
+                return (
+                    f"error: step {i} output_to must be a non-empty "
+                    "string when set"
+                )
+        return None
+
+    def _define_macro(name: str = "", sequence: list | None = None,
+                      description: str = "", **_kwargs) -> str:
+        if not isinstance(name, str) or not MACRO_NAME_RE.match(name):
+            return (
+                "error: macro name must match [A-Za-z_]\\w{0,63} "
+                "(alphanumeric / underscore, up to 64 chars, must "
+                "not start with a digit)"
+            )
+        # The full set of tools the LLM can dispatch — derived from
+        # the wrapped dict once it's finalized; before that we fall
+        # back to the raw dict's keys.
+        wrapped = handlers_box.get("handlers")
+        available = set(
+            wrapped.keys() if wrapped is not None else raw.keys()
+        )
+        err = _validate_macro_sequence(sequence, available)
+        if err:
+            return err
+        # Strip unknown step keys; keep only the schema-blessed
+        # subset so persisted state stays clean.
+        clean_sequence = []
+        for step in sequence:
+            entry = {
+                "tool": step["tool"],
+                "args": step.get("args") or {},
+            }
+            if step.get("output_to"):
+                entry["output_to"] = step["output_to"]
+            clean_sequence.append(entry)
+        add_macro(
+            state_holder["state"],
+            name=name,
+            sequence=clean_sequence,
+            description=str(description or ""),
+        )
+        signature = ", ".join(
+            f"{i + 1}.{s['tool']}" for i, s in enumerate(clean_sequence)
+        )
+        return (
+            f"macro {name!r} stored ({len(clean_sequence)} step(s): "
+            f"{signature})"
+        )
+
+    def _run_macro(name: str = "", args: dict | None = None,
+                   **_kwargs) -> str:
+        if not isinstance(name, str) or not name:
+            return "error: macro name is required"
+        macro = find_macro(state_holder["state"], name)
+        if macro is None:
+            return f"error: macro {name!r} not found"
+        sequence = macro.get("sequence") or []
+        run_args = args if isinstance(args, dict) else {}
+        step_outputs: dict = {}
+        wrapped = handlers_box.get("handlers") or {}
+        parts: list[str] = []
+
+        for i, step in enumerate(sequence, 1):
+            tool = step.get("tool", "")
+            raw_args = step.get("args") or {}
+            output_to = step.get("output_to")
+            resolved = _substitute(raw_args, run_args, step_outputs)
+
+            label = f"[step {i} {tool}]"
+            handler = wrapped.get(tool)
+            if handler is None:
+                parts.append(f"{label}\nerror: tool not found")
+                return "\n\n".join(parts)
+            if not isinstance(resolved, dict):
+                parts.append(
+                    f"{label}\nerror: args resolved to "
+                    f"{type(resolved).__name__}, expected dict"
+                )
+                return "\n\n".join(parts)
+
+            try:
+                result = handler(**resolved)
+            except SubmitSignal:
+                # Should be unreachable — submit is banned at define
+                # time — but if a caller injected a macro directly,
+                # don't let SubmitSignal silently ship.
+                parts.append(
+                    f"{label}\nerror: submit is not allowed in macros"
+                )
+                return "\n\n".join(parts)
+            except Exception as exc:
+                parts.append(f"{label}\nerror: {exc}")
+                return "\n\n".join(parts)
+
+            result_str = str(result)
+            parts.append(f"{label}\n{result_str}")
+            if output_to:
+                step_outputs[output_to] = result_str
+            if result_str.lower().startswith(("error:", "errors:")):
+                return "\n\n".join(parts)
+
+        return "\n\n".join(parts)
+
+    def _list_macros(**_kwargs) -> str:
+        macros = get_macros(state_holder["state"])
+        if not macros:
+            return "no macros defined yet"
+        items = []
+        for name, m in macros.items():
+            seq = m.get("sequence") or []
+            items.append({
+                "name": name,
+                "description": m.get("description") or "",
+                "n_steps": len(seq),
+                "tools": [s.get("tool") for s in seq],
+            })
+        return json.dumps(items, indent=2, default=str)
+
     def _read_scratchpad(**_kwargs) -> str:
         state = state_holder["state"]
         history_entries = get_history(state)
@@ -1788,6 +2113,9 @@ def build_handlers(
         "trace_architecture": _trace_architecture,
         "check_output_shape": _check_output_shape,
         "validate_code": _validate_code,
+        "define_macro": _define_macro,
+        "run_macro": _run_macro,
+        "list_macros": _list_macros,
         "read_scratchpad": _read_scratchpad,
         "read_my_submissions": _read_my_submissions,
         "write_scratchpad": _write_scratchpad,
@@ -1848,6 +2176,10 @@ def build_handlers(
 
     handlers = {name: _wrap(name, fn) for name, fn in raw.items()}
     handlers["submit"] = _SubmitWrapper()
+    # Make the wrapped dict visible to _run_macro so macro-driven
+    # invocations go through the same circuit breaker / counter path
+    # as direct LLM calls.
+    handlers_box["handlers"] = handlers
     return handlers
 
 

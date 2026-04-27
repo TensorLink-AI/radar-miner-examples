@@ -565,6 +565,62 @@ def format_scratchpad_summary(
     )
 
 
+# ── Macros ───────────────────────────────────────────────────────────
+#
+# A macro is a named sequence of tool calls the agent can replay as
+# one action. Stored per-miner in scratchpad state; not shared across
+# miners. Each step is ``{tool, args, output_to}``; ``args`` may use
+# ``${args.foo}`` and ``${step_var}`` placeholders that ``run_macro``
+# substitutes at execution time.
+#
+# Tool-existence and "no submit / nested macros" validation lives in
+# the handler layer (it needs to know what tools exist); these helpers
+# are structural only.
+
+MAX_MACROS = 20
+MAX_MACRO_STEPS = 10
+
+
+def get_macros(state: dict) -> dict:
+    """Return the macros dict (read-only view; defaults to empty)."""
+    return state.get("macros", {})
+
+
+def _macros(state: dict) -> dict:
+    """Return the mutable macros dict, creating it on demand."""
+    return state.setdefault("macros", {})
+
+
+def find_macro(state: dict, name: str) -> dict | None:
+    """Look up a macro by name. Returns None if not found."""
+    return get_macros(state).get(name)
+
+
+def add_macro(state: dict, *, name: str, sequence: list,
+              description: str = "") -> dict:
+    """Insert (or overwrite) a macro record. Caller is responsible for
+    sequence validation — this stores whatever it gets and bumps the
+    cap to ``MAX_MACROS`` by dropping the oldest macro by ``created_at``
+    when the dict overflows.
+    """
+    macros = _macros(state)
+    record = {
+        "name": name,
+        "sequence": sequence,
+        "description": description,
+        "created_at": time.time(),
+    }
+    macros[name] = record
+    if len(macros) > MAX_MACROS:
+        oldest = sorted(
+            macros.items(),
+            key=lambda kv: kv[1].get("created_at") or 0.0,
+        )
+        for n, _ in oldest[: len(macros) - MAX_MACROS]:
+            macros.pop(n, None)
+    return record
+
+
 def load_state(scratch_dir: str) -> dict:
     """Load state dict from scratch_dir/state.json."""
     path = os.path.join(scratch_dir, "state.json")
