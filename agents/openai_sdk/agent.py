@@ -251,7 +251,7 @@ def _run_tool_loop(
                 miner_uid=miner_uid,
                 model=model,
                 temperature=temperature,
-                max_tokens=4096,
+                max_tokens=8192,
                 deadline=deadline,
             )
         except Exception as exc:
