@@ -34,12 +34,12 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    MAX_MACRO_STEPS, MAX_MACROS, add_hypothesis, add_macro, add_note,
-    add_submission, extract_flops_budget, find_candidate, find_macro,
-    format_history, format_notes, format_scratchpad_summary,
-    get_history, get_macros, get_submissions, load_state,
-    mark_candidate_submitted, mark_candidate_validated, save_state,
-    upsert_candidate,
+    HYPOTHESIS_VERDICTS, MAX_MACRO_STEPS, MAX_MACROS, add_hypothesis,
+    add_macro, add_note, add_submission, extract_flops_budget,
+    find_candidate, find_macro, format_history, format_notes,
+    format_scratchpad_summary, get_history, get_macros, get_submissions,
+    link_hypothesis, load_state, mark_candidate_submitted,
+    mark_candidate_validated, save_state, upsert_candidate,
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
@@ -763,6 +763,55 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "link_hypothesis",
+            "description": (
+                "Late-bind a candidate id and/or a verdict to an "
+                "existing hypothesis. Use when you realize mid-round "
+                "that a hypothesis from earlier matches the candidate "
+                "you just sketched, or when you want to mark the "
+                "hypothesis as supported/refuted before its score "
+                "lands. Looks up the hypothesis by its exact text — "
+                "pass the same string you used in "
+                "write_scratchpad(hypothesis=…). Returns an error "
+                "string when no hypothesis matches."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hypothesis": {
+                        "type": "string",
+                        "description": (
+                            "Exact text of an existing hypothesis. "
+                            "Call read_scratchpad to see what's "
+                            "stored."
+                        ),
+                    },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Candidate id to attach. "
+                            "Appended to the hypothesis's "
+                            "candidate_ids list (deduped)."
+                        ),
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "enum": list(HYPOTHESIS_VERDICTS),
+                        "description": (
+                            "Optional. Manual judgement. Sets "
+                            "outcome.verdict; score / rank are left "
+                            "null until the next round's "
+                            "previous_results fills them in."
+                        ),
+                    },
+                },
+                "required": ["hypothesis"],
             },
         },
     },
@@ -1900,6 +1949,37 @@ def build_handlers(
         state_holder["wrote_this_round"] = True
         return f"scratchpad updated ({', '.join(wrote)})"
 
+    def _link_hypothesis(hypothesis: str = "", candidate_id: str = "",
+                         verdict: str = "", **_kwargs) -> str:
+        if not hypothesis or not hypothesis.strip():
+            return "error: hypothesis text is required"
+        if verdict and verdict not in HYPOTHESIS_VERDICTS:
+            return (
+                "error: verdict must be one of "
+                f"{', '.join(HYPOTHESIS_VERDICTS)} (got {verdict!r})"
+            )
+        if not candidate_id and not verdict:
+            return "error: pass candidate_id, verdict, or both"
+        record = link_hypothesis(
+            state_holder["state"],
+            text=hypothesis,
+            candidate_id=candidate_id or None,
+            verdict=verdict or None,
+        )
+        if record is None:
+            return (
+                f"error: hypothesis {hypothesis.strip()!r} not found "
+                "— call read_scratchpad to see what's stored"
+            )
+        parts = [f"text={record['text']!r}"]
+        cids = record.get("candidate_ids") or []
+        if cids:
+            parts.append(f"candidate_ids={cids}")
+        outcome = record.get("outcome") or {}
+        if outcome.get("verdict"):
+            parts.append(f"verdict={outcome['verdict']}")
+        return "linked — " + ", ".join(parts)
+
     # ── Files (scratchpad directory) ─────────────────────────────
 
     def _safe_file_path(name: str) -> tuple[str | None, str | None]:
@@ -2119,6 +2199,7 @@ def build_handlers(
         "read_scratchpad": _read_scratchpad,
         "read_my_submissions": _read_my_submissions,
         "write_scratchpad": _write_scratchpad,
+        "link_hypothesis": _link_hypothesis,
         "list_files": _list_files,
         "read_file": _read_file,
         "write_file": _write_file,

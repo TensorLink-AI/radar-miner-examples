@@ -423,6 +423,61 @@ def add_hypothesis(state: dict, *, text: str,
     return record
 
 
+HYPOTHESIS_VERDICTS = ("supported", "refuted", "inconclusive")
+
+
+def link_hypothesis(state: dict, *, text: str,
+                    candidate_id: str | None = None,
+                    verdict: str | None = None) -> dict | None:
+    """Late-bind a candidate id and/or a verdict to an existing
+    hypothesis, looked up by exact stripped ``text``.
+
+    Returns the updated record, or None if no hypothesis matches.
+    Raises ``ValueError`` for an invalid verdict (callers should
+    pre-validate with HYPOTHESIS_VERDICTS to surface a clean error
+    string instead of an exception).
+
+    When ``verdict`` is set on a hypothesis with no ``outcome`` yet, an
+    outcome dict is created with ``score=None``, ``rank=None``, and
+    only ``verdict`` populated — score/rank land later via
+    ``merge_results_into_state``-style propagation.
+    """
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if verdict is not None and verdict not in HYPOTHESIS_VERDICTS:
+        raise ValueError(
+            f"unknown verdict {verdict!r}; expected one of "
+            f"{HYPOTHESIS_VERDICTS}"
+        )
+    notes = _notes(state)
+    bucket = notes["open_hypotheses"]
+    record = None
+    for entry in bucket:
+        if isinstance(entry, dict) and entry.get("text") == stripped:
+            record = entry
+            break
+    if record is None:
+        return None
+    if candidate_id:
+        cids = record.setdefault("candidate_ids", [])
+        if candidate_id not in cids:
+            cids.append(candidate_id)
+    if verdict is not None:
+        outcome = record.get("outcome")
+        if outcome is None:
+            record["outcome"] = {
+                "score": None,
+                "rank": None,
+                "verdict": verdict,
+            }
+        else:
+            outcome["verdict"] = verdict
+    return record
+
+
 def add_note(state: dict, section: str, entry: str) -> dict:
     """Append ``entry`` to ``state['notes'][section]``, capping at
     ``NOTES_MAX_ENTRIES`` by dropping the oldest.
@@ -501,7 +556,12 @@ def _render_hypotheses(items: list, candidates: dict,
             continue
         text = item.get("text", "")
         cids = item.get("candidate_ids") or []
-        lines.append(f"- {text}")
+        outcome = item.get("outcome") or {}
+        verdict = outcome.get("verdict") if isinstance(outcome, dict) else None
+        header = f"- {text}"
+        if verdict:
+            header += f" [verdict: {verdict}]"
+        lines.append(header)
         for cid in cids:
             cand = candidates.get(cid) or {}
             states: list[str] = []

@@ -1,16 +1,16 @@
-# openai_sdk Agent — Extended State Schema Design
+# openai_sdk Agent — Extended State Schema
 
-Planning doc for four features that share the scratchpad-persisted state
-object managed by `core/history.py`:
+Living schema doc for the four-feature substrate that shares the
+scratchpad-persisted state object managed by `core/history.py`:
 
-1. Code lineage / candidate IDs
-2. `read_my_submissions` tool
-3. Structured scratchpad readback (hypothesis → candidate → outcome)
-4. Tool macros
+1. Code lineage / candidate IDs (shipped)
+2. `read_my_submissions` tool (shipped)
+3. Structured scratchpad readback (hypothesis ↔ candidate ↔ outcome) (shipped)
+4. Tool macros (shipped)
 
-The features ship in order, but they extend one schema, so the schema is
-designed up front. No code yet — this doc is for review before
-implementation of feature 1.
+§§1–4 describe the as-shipped schema and tool surface. §5 records the
+decisions made during implementation, including places where the
+original plan changed. §6 tracks delivery.
 
 ---
 
@@ -18,8 +18,9 @@ implementation of feature 1.
 
 Everything below lives in `state.json` inside the scratchpad directory.
 Loaded by `history.load_state` and saved by `history.save_state`. The
-in-memory wrapper `state_holder` (in `tools.py:831`) holds the dict plus
-two round-scoped flags; only the `state` sub-dict is persisted.
+in-memory wrapper `state_holder` (in `tools.py`, inside `build_handlers`)
+holds the dict plus two round-scoped flags; only the `state` sub-dict
+is persisted.
 
 ### 1.1 Persisted keys
 
@@ -67,20 +68,26 @@ reconstruct what was actually submitted from history alone.
 
 ---
 
-## 2. Proposed extended schema
+## 2. Extended schema (as shipped)
 
-Three new top-level persisted keys: `candidates`, `hypotheses`, `macros`.
-The existing `history` entries gain one new field (`candidate_id`). The
-existing `notes` block stays as-is for backwards compatibility but the
-LLM is steered toward the structured `hypotheses` list instead.
+Three new top-level persisted keys: `candidates`, `submissions`,
+`macros`. Hypotheses live inside the existing `notes.open_hypotheses`
+section, upgraded from `list[str]` to `list[HypothesisRecord]` in place
+(see §2.4). The existing `history` and `agent_notes` keys are unchanged.
 
 ### 2.1 New top-level keys
 
-| Key            | Type                       | Used by features |
-|----------------|----------------------------|------------------|
-| `candidates`   | `dict[str, CandidateRecord]` (keyed by `cand_<8 hex>`) | 1, 3 (link target) |
-| `hypotheses`   | `list[HypothesisRecord]`   | 3 |
-| `macros`       | `dict[str, MacroRecord]`   | 4 |
+| Key            | Type                                                | Used by features |
+|----------------|------------------------------------------------------|------------------|
+| `candidates`   | `dict[str, CandidateRecord]` keyed by `cand_<8 hex>` | 1, 3 (link target) |
+| `submissions`  | `list[SubmissionRecord]`                             | 2, 3 (score source) |
+| `macros`       | `dict[str, MacroRecord]` keyed by name               | 4 |
+
+> **Diverged from plan:** §2.1 originally proposed `hypotheses` as a
+> separate top-level list. Shipped instead by upgrading
+> `notes.open_hypotheses` in place — keeps the cap/section semantics
+> the rest of the notes already use, and avoids a parallel rendering
+> path. See §5.0(6) for the decision.
 
 ### 2.2 `CandidateRecord` — feature 1 (as shipped)
 
@@ -123,122 +130,166 @@ in-conversation id is enough for feature 1's needs.
 **Cap:** none for now. Hash-keyed dedup keeps growth proportional to
 unique designs, not call count.
 
-### 2.3 Submission records — feature 2
+### 2.3 `SubmissionRecord` — feature 2 (as shipped)
 
-**No new top-level key.** Submissions already live in `state["history"]`
-and are merged with `previous_results` on round entry by
-`history.merge_results_into_state` at `agent.py:422`. We just add one
-field to the existing entry shape:
-
-```python
-{
-    # ... existing fields (name, motivation, code_hash, ...) ...
-    "candidate_id": str | None,   # NEW — the candidate this entry was submitted from
-}
-```
-
-**Reads:** new tool `read_my_submissions` walks `state["history"]` and
-formats it. Optional flags: `scored_only=True`, `limit=N`,
-`include_code=False` (would require us to also store `code` in candidate
-records, which is feature 1's job).
-
-The contract is: if you want the **code** of a prior submission, you
-follow `history_entry.candidate_id → candidate.code`. History stays
-hash-only.
-
-### 2.4 `HypothesisRecord` — feature 3
-
-The current `notes.open_hypotheses` is `list[str]`. We add a new
-top-level `hypotheses` list of structured records that link a hypothesis
-to a candidate it spawned and an outcome (score) once the round closes.
+A new top-level `submissions` list, separate from `history`. Each entry
+retains the **full code blob** so the agent can re-read what it shipped
+in a later round (history stayed hash-only). Capped at 50 entries
+(`MAX_SUBMISSIONS`); join key with `previous_results` is `code_hash`.
 
 ```python
-{
-    "id": str,                       # "hyp_0007"
-    "round_id": str,                 # round it was authored in
-    "created_at": float,
-    "text": str,                     # the hypothesis itself
-    "candidate_id": str | None,      # candidate produced to test it (set later)
-    "outcome": {                     # filled in once previous_results arrives
-        "score": float,
+state["submissions"] = [
+    {
+        "code": str,                # full source the agent shipped
+        "code_hash": int,           # join key for previous_results
+        "name": str,
+        "motivation": str,
+        "candidate_id": str | None, # the cand_<8 hex> this came from
+        "round_id": str,
+        "score": float | None,      # filled by merge_results_into_state
         "rank": int | None,
+        "rank_total": int | None,
+        "submitted_at": float,
+        # added when previous_results is merged:
         "scored_round_id": str,
-        "verdict": str,              # "supported" | "refuted" | "inconclusive"
-    } | None,
-}
+    },
+    ...
+]
 ```
 
 **Writes:**
-- `write_scratchpad(hypothesis=..., hypothesis_candidate_id=...)`
-  appends a record. If `hypothesis_candidate_id` is omitted the link can
-  be filled in later.
-- New tool `link_hypothesis(id, candidate_id=..., verdict=...)` for
-  late-binding (or for marking "tried it, didn't help").
-- On round entry, after `merge_results_into_state` runs, an
-  auto-link pass populates `outcome` for any hypothesis whose
-  `candidate_id` matches a now-scored history entry.
+- `_submit` calls `add_submission` before raising `SubmitSignal` so a
+  later round's `previous_results` has a `code_hash` join target.
+- `merge_results_into_state` (called at `agent.py` round entry)
+  attaches `score`/`rank`/`rank_total`/`error`/`scored_round_id` to
+  matching entries by `code_hash`.
 
-**Reads:**
-- `read_scratchpad` renders open hypotheses with their resolved
-  outcomes: e.g. `"hyp_0007: try patchTST patches → cand_0042 → score=0.18 (rank 3/12) [supported]"`.
-- The legacy `notes.open_hypotheses` block stays in the rendered output
-  as a separate "free-form hypotheses" section so older notes aren't
-  hidden, but new hypotheses go into `hypotheses`.
+**Reads:** `read_my_submissions(n=3)` renders newest-first with
+truncation (`n>1` truncates code per entry to ~40 lines; `n=1` returns
+full code).
 
-**Cap:** 50 records, drop oldest first. Resolved (outcome != None)
-hypotheses are preserved over open ones when capping (i.e. the cap
-considers open hypotheses droppable first), so we keep evidence.
+> **Diverged from plan:** §2.3 originally said "no new top-level key —
+> reuse `state['history']`". That didn't work because the openai_sdk
+> agent never populates `history` (it's an autonomous-agent helper);
+> code blobs would have nowhere to live. Decided in §5.0(5) to add a
+> dedicated `submissions` list.
 
-### 2.5 `MacroRecord` — feature 4
+### 2.4 `HypothesisRecord` — feature 3 (as shipped)
 
-Macros are reusable tool sequences. Stored in a dict keyed by name for
-O(1) lookup.
+`notes.open_hypotheses` is upgraded in place from `list[str]` to
+`list[dict]`. Each entry can carry zero or more candidate ids (one
+hypothesis can spawn multiple candidates) and an optional manual
+verdict. Score is **not** stored on the hypothesis — it's resolved at
+render time by joining `candidate_ids` against `state["submissions"]`.
+
+```python
+{
+    "text": str,                     # the hypothesis itself; lookup key
+    "candidate_ids": list[str],      # set by write_scratchpad / link_hypothesis
+    "created_at": float | None,      # None for legacy upgraded entries
+    # only present after link_hypothesis(verdict=…):
+    "outcome": {
+        "score": None,               # left None — score lives on submissions
+        "rank": None,
+        "verdict": "supported" | "refuted" | "inconclusive",
+    },
+}
+```
+
+**Lookup key is `text`** (no separate `id` field). `add_hypothesis`
+deduplicates by exact stripped text; `link_hypothesis` looks the entry
+up the same way.
+
+**Auto-upgrade:** `_upgrade_hypotheses` walks any bare-string entries
+on first access via `_notes(state)` and wraps them as
+`{"text": s, "candidate_ids": [], "created_at": None}`. Idempotent.
+
+**Writes:**
+- `write_scratchpad(hypothesis=..., candidate_id=...)` appends a record
+  (or appends the id to an existing record with the same text).
+- `link_hypothesis(hypothesis=..., candidate_id?=, verdict?=)` —
+  late-bind: append a candidate id and/or set `outcome.verdict`. Errors
+  out (string return, not exception) for unknown text or invalid
+  verdict.
+
+**Reads:** `read_scratchpad` renders hypotheses with one nested status
+line per linked candidate id, resolving live state from
+`state["candidates"]` (validated/submitted flags) and
+`state["submissions"]` (score/rank). Verdict, when present, is shown
+on the hypothesis line itself:
+
+```
+- patches help [verdict: supported]
+    cand_a3f24c1d: validated, submitted, scored 0.81 (rank 3/9)
+```
+
+**Cap:** 20 (the existing `NOTES_MAX_ENTRIES`).
+
+> **Diverged from plan:** the original §2.4 proposed a top-level
+> `hypotheses` list with `id` / `round_id` / `outcome.score` etc. and
+> an auto-link pass. Shipped without ids (text is the key), without an
+> auto-link pass (score is joined at render time, verdict is manual via
+> `link_hypothesis`), and without a parallel rendering path (we
+> upgraded the existing notes section in place). See §5.0(6) and
+> §5.1(4).
+
+### 2.5 `MacroRecord` — feature 4 (as shipped)
+
+Reusable tool sequences. Stored in a dict keyed by name for O(1) lookup.
 
 ```python
 {
     "name": str,
-    "created_at": float,
     "sequence": [
-        {"tool": str, "args": dict},   # args may contain "{{var}}" placeholders
+        {"tool": str, "args": dict, "output_to": str | None},
         ...
     ],
-    "param_names": list[str],          # named placeholders the macro accepts
-    "run_count": int,
-    "last_run_at": float | None,
-    "last_run_round_id": str | None,
+    "description": str,                # optional; rendered by list_macros
+    "created_at": float,
 }
 ```
 
-**Writes:** `define_macro(name, sequence, param_names=...)` inserts /
-overwrites. `run_macro(name, args)` bumps `run_count` and `last_run_at`.
+**Substitution:** `${args.foo}` in step args resolves to the
+corresponding `run_macro(args=...)` value; `${var}` resolves to a
+prior step's output captured via `output_to`. Whole-string refs
+preserve type (so `idx: "${args.idx}"` resolves to an int); embedded
+refs stringify; missing refs leave the literal in place.
 
-**Reads:** `list_macros`, `run_macro`. `read_scratchpad` shows a
-"Macros: 3 defined" one-liner so the LLM is reminded they exist.
+**Writes:** `define_macro(name, sequence, description="")` inserts or
+overwrites. Validation happens at define time: tool names must exist,
+no `submit` / `define_macro` / `run_macro` in a sequence.
+
+**Reads:** `list_macros`, `run_macro`. `run_macro` halts on the first
+step whose handler raises or whose result starts with
+`error:`/`errors:` and returns the partial output.
 
 **Caps:**
 - `MAX_MACROS = 20`
 - `MAX_MACRO_STEPS = 10` per sequence
-- `MAX_MACRO_ARGS_BYTES = 8192` for the JSON-serialized args of a single step
 
-### 2.6 Schema-at-a-glance
+> **Diverged from plan:** §2.5 originally listed `param_names`,
+> `run_count`, `last_run_at`, `last_run_round_id`, and an arg-bytes
+> cap. None of those shipped — we deferred to YAGNI; a usage counter
+> can be added later if we need it. `param_names` was redundant with
+> the implicit set of `${args.X}` references.
+
+### 2.6 Schema-at-a-glance (as shipped)
 
 ```python
 state = {
-    # existing
+    # pre-feature
     "history":          list[HistoryEntry],            # cap 50
     "notes": {
-        "open_hypotheses":  list[str],                 # cap 20
+        "open_hypotheses":  list[HypothesisRecord],    # cap 20 (upgraded in place)
         "dead_ends":        list[str],                 # cap 20
         "task_observations": list[str],                # cap 20
     },
     "agent_notes":      str,                           # legacy, optional
 
-    # new
-    "candidates":       list[CandidateRecord],         # cap 50
-    "hypotheses":       list[HypothesisRecord],        # cap 50
+    # added by features 1-4
+    "candidates":       dict[str, CandidateRecord],    # uncapped; sha1-keyed dedup
+    "submissions":      list[SubmissionRecord],        # cap 50
     "macros":           dict[str, MacroRecord],        # cap 20
-    "next_candidate_seq": int,                         # monotonic counter
-    "next_hypothesis_seq": int,                        # monotonic counter
 }
 ```
 
@@ -257,38 +308,49 @@ already follows for `history` and `notes`.
 disk. Defaults are applied at the helper level:
 
 ```python
-def get_candidates(state: dict) -> list[dict]:
-    return state.get("candidates", [])
+def get_candidates(state: dict) -> dict:
+    return state.get("candidates", {})
 
-def _candidates(state: dict) -> list[dict]:
-    return state.setdefault("candidates", [])
+def _candidates(state: dict) -> dict:
+    return state.setdefault("candidates", {})
 ```
 
-Same pattern for `hypotheses`, `macros`, `next_candidate_seq` (default
-`1`), `next_hypothesis_seq` (default `1`).
+Same pattern for `submissions` (default `[]`) and `macros` (default
+`{}`).
 
-### 3.2 Why no auto-upgrade
+### 3.2 Hypothesis auto-upgrade
 
+`notes.open_hypotheses` is the one section that **does** auto-upgrade:
+`_upgrade_hypotheses(notes)` walks the list on first access via
+`_notes(state)` and wraps any bare string `s` as
+`{"text": s, "candidate_ids": [], "created_at": None}`. Idempotent —
+already-dict entries pass through. This was the only place auto-upgrade
+made sense: the data is in the same section, the new shape is a strict
+superset, and the LLM expects to keep referring to old hypotheses by
+their text.
+
+Other migrations are skipped:
 - A `history` entry from before feature 1 has no `candidate_id`. We
-  could fabricate one, but the candidate record wouldn't have any code,
-  flops, or sketch results — it'd be a stub. Better to leave
-  `candidate_id` absent and treat it as "pre-lineage".
-- Old `notes.open_hypotheses` strings could in principle be moved into
-  `hypotheses` records, but they have no candidate linkage and no round
-  metadata. Same reasoning — leave them where they are; new structured
-  hypotheses go into the new list.
+  could fabricate one, but the candidate record wouldn't have any code
+  or flops — it'd be a stub. Leave `candidate_id` absent.
+- `submissions` starts empty; old rounds have no full code blob to
+  back-fill, so they don't appear in `read_my_submissions`. Acceptable
+  loss given the alternative (storing full code in `history` going
+  back) is just as expensive.
 
 ### 3.3 Failure mode coverage
 
 If `state.json` predates these changes:
-- `read_scratchpad` — sees empty `candidates`/`hypotheses`/`macros`,
-  renders the legacy `history` and `notes` blocks normally.
-- `read_my_submissions` — works against legacy history, just doesn't
-  show `candidate_id` for old entries.
-- `list_candidates` / `list_macros` — return empty.
-- First `write_scratchpad(hypothesis=...)` after upgrade creates the
-  `hypotheses` key on demand and the file is rewritten with the new
-  shape on the next `save_state`.
+- `read_scratchpad` — sees empty `candidates` / `submissions` /
+  `macros`; the hypothesis upgrade fires lazily on first `_notes()`
+  call.
+- `read_my_submissions` — returns `"no submissions yet"`.
+- `list_macros` — returns `"no macros defined yet"`.
+- `link_hypothesis` against a legacy bare-string hypothesis works
+  because the upgrade ran when `_notes` was accessed.
+- First `define_macro` / sketched candidate / submit creates the
+  corresponding key on demand; the file picks up the new shape on the
+  next `save_state`.
 
 ### 3.4 Forward compatibility
 
@@ -299,7 +361,7 @@ it does (`history.py:269`). No data loss on downgrade.
 
 ---
 
-## 4. Tool surface changes
+## 4. Tool surface (as shipped)
 
 ### 4.1 Feature 1 — candidate IDs
 
@@ -307,77 +369,89 @@ it does (`history.py:269`). No data loss on downgrade.
 
 | Tool | Change |
 |---|---|
-| `sketch_architecture(code, parent_candidate_id?)` | Adds optional `parent_candidate_id` (string). Result string gains a final line: `candidate_id: cand_0042`. Side effect: writes a `CandidateRecord` with `status="sketched"`. |
-| `validate_code(code, candidate_id?)` | Adds optional `candidate_id`. If given, updates the existing candidate's `validate_result` and (on ok) flips `status="validated"`. If omitted, creates a fresh candidate with no parent. Result string gains `candidate_id: cand_0042` line. |
-| `submit(code, name, motivation, candidate_id?)` | Adds optional `candidate_id`. Both the new history entry and the submitted candidate get linked. |
+| `sketch_architecture(code)` | Side effect: `upsert_candidate` keyed by sha1 hash of code. Result string ends with `candidate_id: cand_<8 hex>`. |
+| `validate_code(code?, candidate_id?)` | Adds optional `candidate_id`. When set, looks up the source from `state["candidates"]` and ignores the `code` arg. On success, sets `validated=True` (creating the candidate if no id was passed). |
+| `submit(code?, name, motivation, candidate_id?)` | Adds optional `candidate_id`. When set, ships the stored code from state and flips `submitted=True`. Without an id, behaves as before. |
 
-**New tools:**
-
-| Tool | Signature | Returns |
-|---|---|---|
-| `list_candidates()` | no args | JSON array of `{id, status, parent_id, flops_estimated, name}` for the most recent N |
-| `get_candidate(candidate_id)` | `candidate_id: str` | Full record incl. code |
+> **Diverged from plan:** `parent_candidate_id`, `list_candidates`,
+> `get_candidate`, the `status` enum, and the auto-write of a history
+> entry on submit were all dropped in the feature-1 rework (see
+> §5.0(3) and §5.0(5)).
 
 ### 4.2 Feature 2 — `read_my_submissions`
 
 **New tool:**
 
 ```
-read_my_submissions(limit?: int = 10, scored_only?: bool = false,
-                    include_code?: bool = false) -> str
+read_my_submissions(n: int = 3) -> str
 ```
 
-Returns each prior submission as `{name, motivation, candidate_id,
-score?, rank?, rank_total?, scored_round_id?, code? (if include_code and
-candidate_id resolves)}`. Pulls from `state["history"]`. Code only
-appears when `include_code=true` AND the entry's `candidate_id` resolves
-to a candidate record we still have.
+Returns the n most recent entries from `state["submissions"]` (newest
+first), each rendered with `round_id`, `name`, `score` (or `pending`),
+`rank`, `candidate_id`, `motivation`, and code. Code is truncated to
+~40 lines per entry when `n > 1`; full code when `n = 1`.
 
-No modifications to existing tools. The existing `read_scratchpad`
-continues to render a summary view; `read_my_submissions` is the
-detail view.
+`_submit` populates `state["submissions"]` on ship;
+`merge_results_into_state` attaches `score`/`rank` by `code_hash` when
+the next round's `previous_results` arrives.
+
+> **Diverged from plan:** original signature had `limit`, `scored_only`,
+> `include_code` flags and pulled from `state["history"]`. Shipped
+> simpler — single `n` arg, dedicated `submissions` list, code always
+> available (truncated when n>1).
 
 ### 4.3 Feature 3 — structured scratchpad
 
 **Modified tool — `write_scratchpad`:**
 
 Existing kwargs (`hypothesis`, `dead_end`, `reason`, `observation`,
-`notes`) all still work. New kwargs:
+`notes`) all still work. New kwarg:
 
 | Kwarg | Type | Effect |
 |---|---|---|
-| `hypothesis_candidate_id` | `str` | When `hypothesis=...` is passed, links the new hypothesis record to this candidate. Ignored if `hypothesis` is empty. |
-| `hypothesis_outcome` | `dict` | `{verdict: "supported" \| "refuted" \| "inconclusive"}` — sets a manual verdict without waiting for `previous_results`. Score/rank are filled in later automatically. |
+| `candidate_id` | `str` | Only meaningful with `hypothesis`. Links the new (or existing-by-text) hypothesis record to this candidate. |
 
-The legacy `notes.open_hypotheses` list still receives the same
-hypothesis text (so the old prompt rendering keeps working) AND a
-structured record is added to `hypotheses`. We can remove the
-double-write later once we're confident nothing reads the legacy list.
+Setting a manual verdict via `write_scratchpad` was deferred — use
+`link_hypothesis(verdict=...)` instead.
 
 **New tool:**
 
 ```
-link_hypothesis(hypothesis_id: str,
+link_hypothesis(hypothesis: str,
                 candidate_id?: str,
                 verdict?: "supported" | "refuted" | "inconclusive") -> str
 ```
 
-Late-bind a candidate or a manual verdict to an existing hypothesis.
-Useful when the LLM realizes mid-round that an earlier hypothesis
-matches the candidate it just sketched.
+Late-bind a candidate id and/or a verdict to an existing hypothesis.
+Looks up by exact text. Returns an error string (not exception) for
+unknown text or invalid verdict. Setting `verdict` on a hypothesis
+with no `outcome` yet creates the outcome dict with `score=None`,
+`rank=None`, and only `verdict` populated.
 
 **Modified tool — `read_scratchpad`:**
 
-Adds a new section to the rendered output:
+Output gains a one-line summary at the top:
 
 ```
-## Hypotheses
-- hyp_0007: try patchTST patches → cand_0042 → score=0.18 (rank 3/12) [supported]
-- hyp_0008: drop dropout for tiny bucket → (no candidate yet)
-- hyp_0005: bigger context → cand_0033 → score=0.31 (rank 9/12) [refuted]
+2 hypotheses, 1 candidates generated, 1 submitted, top score: 0.18
 ```
 
-Order: open (no outcome) first, then resolved most-recent-first.
+The `Open Hypotheses` section's renderer now resolves linked candidate
+ids against `state["candidates"]` and `state["submissions"]`:
+
+```
+## Open Hypotheses
+- patches help [verdict: supported]
+    cand_a3f24c1d: validated, submitted, scored 0.81 (rank 3/9)
+- bigger context → no candidate state yet
+```
+
+> **Diverged from plan:** §4.3 originally proposed
+> `hypothesis_candidate_id` and `hypothesis_outcome` kwargs on
+> `write_scratchpad`, and a `## Hypotheses` section with `hyp_NNNN`
+> ids. Shipped flatter: a single `candidate_id` kwarg, lookup by text,
+> verdict via `link_hypothesis`, and rendering inside the existing
+> `Open Hypotheses` section.
 
 ### 4.4 Feature 4 — macros
 
@@ -385,104 +459,133 @@ Order: open (no outcome) first, then resolved most-recent-first.
 
 ```
 define_macro(name: str,
-             sequence: list[{tool: str, args: dict}],
-             param_names?: list[str]) -> str
+             sequence: list[{tool: str, args: dict, output_to?: str}],
+             description?: str) -> str
 
 run_macro(name: str, args?: dict) -> str
 
 list_macros() -> str
 ```
 
-`run_macro` substitutes `{{var}}` strings inside step args with values
-from the `args` dict before invoking each tool. Steps run sequentially
-through the same handler dict the LLM uses, so circuit breakers and
-counters apply transparently. Failure of any step aborts the macro
-(open question §5.6).
+`run_macro` substitutes `${args.foo}` and `${var}` placeholders inside
+step args (whole-string refs preserve type; embedded refs stringify;
+missing refs leave the literal in place). Steps run through the same
+wrapped handler dict the LLM uses, so circuit breakers and call counts
+apply uniformly. Halts on the first step whose handler raises or whose
+result starts with `error:` / `errors:`, returns the partial output
+with all preceding step labels.
+
+`submit`, `define_macro`, and `run_macro` are forbidden inside macro
+sequences — macros never ship and never recurse.
+
+> **Diverged from plan:** §4.4 proposed `param_names` on
+> `define_macro` and `{{var}}`-style substitution. Shipped without
+> `param_names` (the implicit set of `${args.X}` refs is enough) and
+> with `${var}` syntax. See §5.0(7).
 
 ---
 
-## 5. Resolved decisions and open questions
+## 5. Decisions and open questions
 
-### 5.0 Resolved (locked in for feature 1)
+Items below are kept as the original review-time entries with one-line
+**decided:** annotations. Where the eventual implementation differs
+from the original recommendation, the annotation says so explicitly —
+the doc is a living record of what we picked and why, not a
+retroactively clean spec.
 
-1. **Code storage in candidates.** Store code only for `status in
-   {"validated", "submitted"}`. Sketched-only candidates carry
-   `code = None`. Keeps scratchpad lean while preserving the records
-   that are actually worth re-reading.
+### 5.0 Resolved before feature 1 shipped
 
-2. **Cap-when-referenced.** No reference-aware logic. Cap at
-   `MAX_CANDIDATES = 100` and drop oldest first. Simpler; the larger
-   cap absorbs the loss.
+1. **Code storage in candidates.** Originally: store code only for
+   `status in {"validated", "submitted"}`; sketched candidates carry
+   `code = None`.
+   **decided:** changed during the rework — every candidate stores its
+   code. Hash-keyed dedup keeps growth proportional to unique designs,
+   not call counts, so the savings of dropping sketch-only code
+   weren't worth the asymmetry.
 
-3. **Candidate ID format.** Monotonic `cand_0042` via
-   `next_candidate_seq`. Easier to reason about in logs and prompts
-   than random hashes.
+2. **Cap-when-referenced.** Originally: cap at `MAX_CANDIDATES = 100`
+   and drop oldest first.
+   **decided:** dropped the cap entirely. Hash-keyed dedup means the
+   dict only grows with unique designs; bounding it would just make
+   stale-id resolution probabilistic.
+
+3. **Candidate ID format.** Originally: monotonic `cand_0042` via
+   `next_candidate_seq`.
+   **decided:** changed to sha1-derived `cand_<8 hex>`. Identical code
+   then yields the same id, so sketch-then-validate of the same source
+   is one record, not two. The counter wasn't pulling its weight.
 
 4. **Implicit candidate creation in `validate_code`.** Auto-create a
    candidate ONLY when validation passes. Failed validates do not
-   create a record. Sketched candidates passed in via `candidate_id`
-   are updated in place and gain `status="validated"` plus the code
-   payload.
+   create a record.
+   **decided:** shipped as-recommended.
 
-5. **Submission also writes a history entry.** Today the openai_sdk
-   agent never calls `history.add_entry`, so `state["history"]` is
-   permanently empty and `merge_results_into_state` has nothing to
-   join against. Feature 1 fixes this by having `_submit` add a
-   history entry (with `candidate_id`) before raising `SubmitSignal`.
-   This is in scope because it's where the `candidate_id` ↔ history
-   join lives. Auto-submit recovery (when the LLM never explicitly
-   calls submit) does NOT add a history entry — keeping that gap
-   matches today's behaviour and avoids creeping scope.
+5. **Submission also writes a history entry.** Originally: `_submit`
+   adds a history entry so `merge_results_into_state` has a join
+   target.
+   **decided:** changed in feature 2 — score/rank flow through a new
+   top-level `submissions` list instead. `history` stays unused by the
+   openai_sdk agent (it's an autonomous-agent helper). `merge_results`
+   was extended to update both lists.
 
-### 5.1 Still open (don't block feature 1)
+6. **Hypothesis storage location.** Originally: a new top-level
+   `hypotheses` list with `id` / `round_id` / `outcome.score` etc., in
+   parallel with the legacy `notes.open_hypotheses` strings.
+   **decided (during feature 3):** upgrade `notes.open_hypotheses` in
+   place (list[str] → list[dict]) instead of running two parallel
+   stores. Lookup key is `text` (no `id` field). Score is **not**
+   stored on the hypothesis — joined at render time from
+   `state["submissions"]`. Verdict is the only field on `outcome` and
+   is set manually via `link_hypothesis`.
+
+7. **Macro substitution syntax.** Originally: `{{var}}`.
+   **decided (during feature 4):** `${args.foo}` and `${var}`. The
+   `${args.X}` namespace makes the source of each ref obvious; the
+   `${...}` form survives JSON quoting more cleanly than `{{...}}`.
+
+### 5.1 Still open at planning time
 
 1. **Cross-round candidate visibility.** Should `list_candidates`
-   default to "this round only" or "all-time"? Leaning all-time with a
-   `recent_only=True` flag, since the lineage tree's value is
-   long-term. Decide before the tool ships in feature 1's PR.
+   default to "this round only" or "all-time"?
+   **decided:** moot — `list_candidates` / `get_candidate` were
+   dropped from the surface. The id flows through tool-result text
+   in-conversation; that turned out to be enough.
 
 2. **Macro failure semantics.** Step fails → abort vs continue?
-   Default abort, but expose `continue_on_error: bool = False` per
-   step? I'd start with always-abort to keep the spec small.
+   **decided:** always-abort (no `continue_on_error` flag). Halt-on-
+   first-error and return the partial output with step labels.
 
-3. **Macro nesting.** Can a macro call `run_macro`? Risk: infinite
-   recursion. Easy fix: forbid `run_macro` and `define_macro` from
-   appearing inside a macro `sequence` (validate at define time).
+3. **Macro nesting.** Can a macro call `run_macro`?
+   **decided:** forbidden at define time. `submit`, `define_macro`,
+   and `run_macro` all reject in a sequence.
 
-4. **`previous_results` → hypothesis outcome auto-link.** This needs
-   the join key. We have `history.candidate_id` and
-   `hypothesis.candidate_id`, so the join is
-   `hypothesis.candidate_id == history.candidate_id`, then read the
-   score off the history entry after `merge_results_into_state` runs.
-   Verdict (supported/refuted/inconclusive) — auto-derive from rank
-   relative to frontier? Or leave as `"inconclusive"` until the LLM
-   judges manually? **My recommendation:** auto-fill score/rank only;
-   leave verdict to the LLM via `link_hypothesis`.
+4. **`previous_results` → hypothesis outcome auto-link.** Originally:
+   auto-fill `outcome.score`/`rank` after merge.
+   **decided:** no separate auto-link pass. Score is resolved at
+   `read_scratchpad` render time by walking
+   `hypothesis.candidate_ids → state.submissions[*].score`. Verdict
+   stays manual (`link_hypothesis(verdict=...)`).
 
-5. **Notes vs hypotheses double-write.** During the migration window,
-   `write_scratchpad(hypothesis=...)` writes both to
-   `notes.open_hypotheses` (list[str]) and `hypotheses` (structured).
-   When do we stop the double-write? Probably after one round of
-   in-the-wild verification.
+5. **Notes vs hypotheses double-write.** Originally: write to both
+   the legacy list[str] section and a new structured store during a
+   migration window.
+   **decided:** moot — we upgraded the existing section in place. No
+   double-write needed.
 
-6. **Token budget impact on `read_scratchpad`.** Adding the
-    `Hypotheses` and `Candidates` sections inflates the read result.
-    `read_scratchpad` already returns up to ~10 history entries; we
-    should probably cap each new section at 10 visible items too, with
-    "(N more, use list_candidates/...)" footers.
+6. **Token budget impact on `read_scratchpad`.** Adding new sections
+   inflates the read result.
+   **decided:** partially addressed. We added a one-line summary at
+   the top, but per-section visible-item caps weren't introduced.
+   Still open if read_scratchpad output grows past comfortable.
 
 ---
 
-## 6. Implementation order (for reference, not part of the schema)
+## 6. Delivery
 
-1. **Feature 1** lands the `candidates` list, the seq counter, and the
-   modified tool signatures. Adds `read_my_submissions` would come now
-   too if cheap — it's just a read against existing state plus the new
-   `candidate_id` field on history.
-2. **Feature 2** finalizes `read_my_submissions` (the modification of
-   history entries to carry `candidate_id` was done in feature 1).
-3. **Feature 3** adds `hypotheses` and the auto-link pass.
-4. **Feature 4** adds `macros`.
-
-After feature 1 is in, the schema for the rest is a matter of adding
-keys, not redesigning.
+| Feature | Status | Commit landed |
+|---|---|---|
+| 1 — candidate IDs / lineage | shipped | `72f2b75` |
+| 2 — `read_my_submissions` | shipped | `846cea3` |
+| 3 — hypothesis ↔ candidate ↔ outcome linkage + summary line | shipped | `8400810` |
+| 3.5 — `link_hypothesis` (late-bind) | shipped | follow-up |
+| 4 — tool macros | shipped | `ae2a963` |

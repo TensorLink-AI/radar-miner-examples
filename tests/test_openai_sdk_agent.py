@@ -390,6 +390,7 @@ class TestToolSchema:
             "sketch_architecture", "trace_architecture",
             "check_output_shape", "read_scratchpad",
             "read_my_submissions", "write_scratchpad",
+            "link_hypothesis",
             "list_files", "read_file", "write_file", "search_files",
             "define_macro", "run_macro", "list_macros",
             "time_remaining",
@@ -1134,6 +1135,106 @@ class TestHypothesisLinkage:
         handlers = build_handlers(_make_challenge())
         out = handlers["read_scratchpad"]()
         assert "first round" in out
+
+    # ── link_hypothesis (late-bind) ──────────────────────────────
+
+    def test_link_hypothesis_appends_candidate_id(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help", candidate_id="cand_a3f24c1d",
+        )
+        assert out.startswith("linked")
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == ["cand_a3f24c1d"]
+
+    def test_link_hypothesis_dedupes_candidate_id(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="patches help", candidate_id="cand_aaaaaaaa",
+        )
+        handlers["link_hypothesis"](
+            hypothesis="patches help", candidate_id="cand_aaaaaaaa",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == ["cand_aaaaaaaa"]
+
+    def test_link_hypothesis_sets_verdict_creates_outcome(self):
+        """Setting a verdict on an unscored hypothesis creates the
+        outcome dict with score / rank as None."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help", verdict="supported",
+        )
+        assert "verdict=supported" in out
+        record = self._state(handlers)["notes"]["open_hypotheses"][0]
+        assert record["outcome"] == {
+            "score": None, "rank": None, "verdict": "supported",
+        }
+
+    def test_link_hypothesis_combined_candidate_and_verdict(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help",
+            candidate_id="cand_a3f24c1d",
+            verdict="refuted",
+        )
+        assert "linked" in out
+        record = self._state(handlers)["notes"]["open_hypotheses"][0]
+        assert record["candidate_ids"] == ["cand_a3f24c1d"]
+        assert record["outcome"]["verdict"] == "refuted"
+
+    def test_link_hypothesis_unknown_text_returns_error(self):
+        """Linking a nonexistent hypothesis returns an error string —
+        does not raise."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["link_hypothesis"](
+            hypothesis="never written",
+            candidate_id="cand_a3f24c1d",
+        )
+        assert out.startswith("error:")
+        assert "not found" in out
+        assert "never written" in out
+
+    def test_link_hypothesis_invalid_verdict_returns_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help", verdict="maybe",
+        )
+        assert out.startswith("error:")
+        assert "maybe" in out
+
+    def test_link_hypothesis_requires_some_action(self):
+        """Calling with neither candidate_id nor verdict is a no-op —
+        return an error so the LLM doesn't waste a tool slot."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](hypothesis="patches help")
+        assert out.startswith("error:")
+
+    def test_link_hypothesis_render_shows_verdict(self):
+        """read_scratchpad surfaces the verdict on the hypothesis line."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        handlers["link_hypothesis"](
+            hypothesis="patches help", verdict="supported",
+        )
+        out = handlers["read_scratchpad"]()
+        line = [
+            l for l in out.splitlines() if "patches help" in l
+        ][0]
+        assert "[verdict: supported]" in line
 
 
 class TestMacros:
