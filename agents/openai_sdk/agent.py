@@ -52,13 +52,6 @@ except ImportError:
 
 
 FALLBACK_RESERVE_SECONDS = 30
-RESEARCH_BUDGET_FRAC = 0.20
-RESEARCH_BUDGET_MAX = 90
-RESEARCH_BUDGET_MIN = 60
-
-# Small per-phase tool-loop caps so the LLM doesn't sprawl.
-RESEARCH_MAX_ROUNDS = 2
-DESIGN_MAX_ROUNDS = 6
 
 DEFAULT_MODEL = "moonshotai/Kimi-K2.5-TEE"
 
