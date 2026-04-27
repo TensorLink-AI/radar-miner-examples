@@ -185,11 +185,12 @@ def _run_tool_loop(
     """Run tool-calling rounds until the deadline approaches or the
     LLM submits.
 
-    Returns ``(updated_messages, submitted_code, submit_sig, failure)``.
-    ``failure`` is a short reason string when the loop couldn't produce
-    anything useful (``"config: ..."``, ``"chat: timeout"``, etc.), or
-    ``None`` on clean exit. The caller uses it to set an honest fallback
-    motivation and, for config errors, to skip later work.
+    Returns ``(updated_messages, submitted_code, submit_sig, failure,
+    rounds_run)``. ``failure`` is a short reason string when the loop
+    couldn't produce anything useful (``"config: ..."``,
+    ``"chat: timeout"``, etc.), or ``None`` on clean exit.
+    ``rounds_run`` is the number of LLM turns the loop completed —
+    the caller uses it for diagnostic logs and fallback motivations.
     """
     submitted: str | None = None
     failure: str | None = None
@@ -319,7 +320,7 @@ def _run_tool_loop(
                         f"[agent] {phase}: model submitted "
                         f"({len(submitted)} chars, name={sig.name})"
                     )
-                    return messages, submitted, sig, None
+                    return messages, submitted, sig, None, round_num
                 except Exception as exc:
                     result = f"tool error: {exc}"
 
@@ -373,7 +374,7 @@ def _run_tool_loop(
                 )
                 break
 
-    return messages, submitted, None, failure
+    return messages, submitted, None, failure, round_num
 
 
 def design_architecture(challenge: dict, gated_client=None) -> dict:
@@ -477,12 +478,13 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     last_validation_errors: list[str] = []
     submit_sig: SubmitSignal | None = None
     design_failure: str | None = None
+    rounds_run = 0
 
     if config_broken:
         # Nothing we can do without an LLM — skip straight to packaging.
         _log("[agent] config broken, skipping main loop")
     else:
-        messages, candidate_code, submit_sig, design_failure = (
+        messages, candidate_code, submit_sig, design_failure, rounds_run = (
             _run_tool_loop(
                 messages=messages,
                 tools=tools,
@@ -590,7 +592,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         else:
             fallback_motivation = (
                 f"LLM returned no parseable code after "
-                f"{RESEARCH_MAX_ROUNDS + DESIGN_MAX_ROUNDS} rounds"
+                f"{rounds_run} rounds"
             )
 
     # Stage A: auto-submit recovery. If the LLM called validate_code
