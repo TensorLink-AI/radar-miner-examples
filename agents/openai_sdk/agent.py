@@ -389,16 +389,10 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     t_start = time.monotonic()
     budget = _agent_budget(challenge)
     deadline = t_start + budget - FALLBACK_RESERVE_SECONDS
-    research_window = max(
-        RESEARCH_BUDGET_MIN,
-        min(RESEARCH_BUDGET_MAX, int(budget * RESEARCH_BUDGET_FRAC)),
-    )
-    research_deadline = min(t_start + research_window, deadline)
 
     _log(
         f"[agent] start budget={budget}s "
-        f"deadline_in={budget - FALLBACK_RESERVE_SECONDS}s "
-        f"research_in={int(research_deadline - t_start)}s"
+        f"deadline_in={budget - FALLBACK_RESERVE_SECONDS}s"
     )
 
     flops_min, flops_max = extract_flops_budget(challenge)
@@ -482,76 +476,41 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     last_proposed_code: str | None = None
     last_validation_errors: list[str] = []
     submit_sig: SubmitSignal | None = None
-    research_failure: str | None = None
     design_failure: str | None = None
 
     if config_broken:
-        # Skip both phases — nothing we can do without an LLM.
-        _log("[agent] config broken, skipping research+design phases")
+        # Nothing we can do without an LLM — skip straight to packaging.
+        _log("[agent] config broken, skipping main loop")
     else:
-        # ── Phase 1: research ────────────────────────────────────────
-        _log("[agent] phase=research")
-        messages, _candidate, submit_sig, research_failure = _run_tool_loop(
-            messages=messages,
-            tools=tools,
-            handlers=handlers,
-            deadline=research_deadline,
-            max_rounds=RESEARCH_MAX_ROUNDS,
-            phase="research",
-            t_start=t_start,
-            llm_url=llm_url,
-            agent_token=agent_token,
-            miner_uid=miner_uid,
-        )
-        if research_failure and research_failure.startswith("config:"):
-            config_broken = True
-            config_error = research_failure.replace("config:", "config error:", 1)
-
-        # If the model already submitted in research (eager), accept it
-        # and skip straight to packaging. Otherwise run design unless
-        # config is broken.
-        if submit_sig is None and not config_broken:
-            # ── Phase 2: design ─────────────────────────────────────
-            _log("[agent] phase=design")
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Now propose a model. Call validate_code on your "
-                    "candidate; if it fails, iterate. When the code "
-                    "passes, call submit with the final code, a short "
-                    "name, and a motivation."
-                ),
-            })
-            messages, candidate_code, submit_sig, design_failure = (
-                _run_tool_loop(
-                    messages=messages,
-                    tools=tools,
-                    handlers=handlers,
-                    deadline=deadline,
-                    max_rounds=DESIGN_MAX_ROUNDS,
-                    phase="design",
-                    t_start=t_start,
-                    llm_url=llm_url,
-                    agent_token=agent_token,
-                    miner_uid=miner_uid,
-                )
+        messages, candidate_code, submit_sig, design_failure = (
+            _run_tool_loop(
+                messages=messages,
+                tools=tools,
+                handlers=handlers,
+                deadline=deadline,
+                phase="main",
+                t_start=t_start,
+                llm_url=llm_url,
+                agent_token=agent_token,
+                miner_uid=miner_uid,
             )
-            if design_failure and design_failure.startswith("config:"):
-                config_broken = True
-                config_error = design_failure.replace(
-                    "config:", "config error:", 1,
+        )
+        if design_failure and design_failure.startswith("config:"):
+            config_broken = True
+            config_error = design_failure.replace(
+                "config:", "config error:", 1,
+            )
+        if candidate_code:
+            ok, errors = validate_code(candidate_code, challenge)
+            if ok:
+                last_validated_code = candidate_code
+            else:
+                last_proposed_code = candidate_code
+                last_validation_errors = list(errors)
+                _log(
+                    f"[agent] candidate code didn't fully validate: "
+                    f"{errors}"
                 )
-            if candidate_code:
-                ok, errors = validate_code(candidate_code, challenge)
-                if ok:
-                    last_validated_code = candidate_code
-                else:
-                    last_proposed_code = candidate_code
-                    last_validation_errors = list(errors)
-                    _log(
-                        f"[agent] candidate code didn't fully validate: "
-                        f"{errors}"
-                    )
 
     # ── Scratchpad save ──────────────────────────────────────────────
     # Persist any notes the LLM stashed via ``write_scratchpad`` before
@@ -617,18 +576,11 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     if config_error:
         fallback_motivation = config_error
     else:
-        # Prefer the later phase's failure; research-only failure is
-        # reported when design never ran.
-        failure = design_failure or research_failure
+        failure = design_failure
         if failure and failure.startswith("chat:"):
             detail = failure.split(":", 1)[1].strip()
             if "timeout" in detail.lower() or "timed out" in detail.lower():
-                phase_name = (
-                    "design" if design_failure else "research"
-                )
-                fallback_motivation = (
-                    f"LLM timeout in {phase_name} phase"
-                )
+                fallback_motivation = "LLM timeout"
             else:
                 fallback_motivation = f"LLM chat failed: {detail}"
         elif failure == "deadline":
