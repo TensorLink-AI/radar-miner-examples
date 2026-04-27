@@ -2180,3 +2180,248 @@ class TestExtractCodeBlock:
         from agents.openai_sdk.agent import _extract_code_block
         text = "```\nprint('hi')\n```"
         assert _extract_code_block(text) == "print('hi')"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  6. Submit-error recovery + inline-note + post-validation grace
+# ══════════════════════════════════════════════════════════════════
+
+class TestSubmitInlineNote:
+    """Inline ``note`` on submit replaces the separate
+    write_scratchpad+submit handshake. With a candidate_id the note
+    becomes a hypothesis linked to that candidate; without one it's a
+    plain task observation."""
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def test_submit_with_note_no_candidate_records_observation(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE,
+                name="m",
+                motivation="x",
+                note="patches helped on the small bucket",
+            )
+        notes = self._state(handlers).get("notes", {})
+        observations = notes.get("task_observations") or []
+        assert any(
+            "patches helped on the small bucket" in str(o)
+            for o in observations
+        )
+
+    def test_submit_with_note_and_candidate_id_links_hypothesis(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        # Validate first so we have a candidate_id in state.
+        handlers["validate_code"](code=VALID_CODE)
+        cands = self._state(handlers)["candidates"]
+        cid = next(iter(cands))
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                candidate_id=cid,
+                name="m",
+                motivation="x",
+                note="depthwise sep should beat dense at this bucket",
+            )
+        bucket = (
+            self._state(handlers)["notes"]["open_hypotheses"]
+        )
+        match = [
+            h for h in bucket
+            if h.get("text")
+            == "depthwise sep should beat dense at this bucket"
+        ]
+        assert len(match) == 1
+        assert cid in match[0].get("candidate_ids", [])
+
+    def test_submit_note_satisfies_wrote_this_round(self, capsys):
+        """An inline note counts as a scratchpad write for the round —
+        the no-note warning should not fire."""
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        with pytest.raises(SubmitSignal):
+            handlers["submit"](
+                code=VALID_CODE,
+                name="m",
+                motivation="x",
+                note="single-call submit",
+            )
+        captured = capsys.readouterr()
+        assert (
+            "submit without scratchpad note this round"
+            not in captured.err
+        )
+
+    def test_submit_schema_advertises_note_param(self):
+        from agents.openai_sdk.tools import TOOLS
+        submit = next(
+            t for t in TOOLS if t["function"]["name"] == "submit"
+        )
+        props = submit["function"]["parameters"]["properties"]
+        assert "note" in props
+        assert props["note"]["type"] == "string"
+
+
+class TestSubmitErrorRecovery:
+    """When submit returns an error string (didn't raise SubmitSignal),
+    the loop must reset the validated-and-stalled counter and inject a
+    corrective user message naming the exact error, the stored
+    validated candidate_id, and a literal example of the correct call.
+    Asserted by mocking the chat client and inspecting the messages
+    sent on the round AFTER the failed submit."""
+
+    def test_error_recovery_reprompts_with_corrective_context(
+        self, mock_openai,
+    ):
+        from agents.openai_sdk import agent
+
+        captured_messages: list[list[dict]] = []
+
+        def chat_side_effect(*args, **kwargs):
+            msgs = kwargs.get("messages") or (args[0] if args else [])
+            # Deep-copy each message so later mutations don't leak in.
+            captured_messages.append([
+                {**m} for m in msgs if isinstance(m, dict)
+            ])
+            call_idx = len(captured_messages)
+            if call_idx == 1:
+                return _make_completion(tool_calls=[
+                    _make_tool_call(
+                        "validate_code",
+                        {"code": VALID_CODE},
+                        "call_v1",
+                    ),
+                ])
+            if call_idx == 2:
+                # Bad candidate_id → submit returns an error string.
+                return _make_completion(tool_calls=[
+                    _make_tool_call(
+                        "submit",
+                        {
+                            "candidate_id": "cand_deadbeef",
+                            "name": "bad",
+                            "motivation": "wrong id",
+                        },
+                        "call_s1",
+                    ),
+                ])
+            if call_idx == 3:
+                # Round 3: ship cleanly with the right id. We pull the
+                # actual id off the corrective message (the example
+                # string carries it). That id is what the LLM would
+                # see and act on.
+                third_msgs = captured_messages[2]
+                corrective = next(
+                    m for m in third_msgs
+                    if m.get("role") == "user"
+                    and "Your `submit` call failed" in str(
+                        m.get("content", "")
+                    )
+                )
+                # The corrective content embeds the candidate_id in
+                # an example like submit(candidate_id="cand_xxxx", ...)
+                import re
+                m = re.search(
+                    r'candidate_id="(cand_[0-9a-f]+)"',
+                    corrective["content"],
+                )
+                assert m is not None
+                cid = m.group(1)
+                return _make_completion(tool_calls=[
+                    _make_tool_call(
+                        "submit",
+                        {
+                            "candidate_id": cid,
+                            "name": "good",
+                            "motivation": "fixed",
+                            "note": "shipped after retry",
+                        },
+                        "call_s2",
+                    ),
+                ])
+            # No further calls expected, but be safe.
+            return _make_completion(content="")
+
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            chat_side_effect
+        )
+
+        ch = _make_challenge(with_flops=False)
+        ch["agent_seconds"] = 1800
+        result = agent.design_architecture(ch, gated_client=None)
+
+        # Must have at least three chat calls — round 3 is where we
+        # check the corrective context.
+        assert len(captured_messages) >= 3
+        third_call_msgs = captured_messages[2]
+        corrective = [
+            m for m in third_call_msgs
+            if m.get("role") == "user"
+            and "Your `submit` call failed" in str(
+                m.get("content", "")
+            )
+        ]
+        assert len(corrective) == 1
+        content = corrective[0]["content"]
+        # Carries the exact submit error.
+        assert "cand_deadbeef" in content or "not found" in content
+        # Names the stored validated candidate_id explicitly.
+        assert "Validated candidate_id on file:" in content
+        # Includes a literal example of the correct call.
+        assert 'submit(candidate_id="cand_' in content
+        assert "name=" in content and "motivation=" in content
+        # Round 3's submit shipped successfully.
+        assert result["name"] == "good"
+
+
+class TestPostValidationGraceWindow:
+    """The grace counter must NOT increment on the round where
+    validation actually happened — the LLM gets a clean fresh turn to
+    ship before the counter ticks. Threshold raised from 2 to 4."""
+
+    def test_grace_window_skips_validation_round(self, mock_openai):
+        """validate in round 1, then keep returning a benign tool call
+        (time_remaining) on each subsequent round. With the old
+        behavior (counter on validate round, threshold=2) the loop
+        would exit after 2 chat calls. With the new behavior (skip
+        validation round, threshold=4) the loop should stay alive for
+        5 chat calls before breaking (1 validate + 4 stalled rounds)."""
+        from agents.openai_sdk import agent
+
+        call_count = {"n": 0}
+
+        def chat_side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            n = call_count["n"]
+            if n == 1:
+                return _make_completion(tool_calls=[
+                    _make_tool_call(
+                        "validate_code",
+                        {"code": VALID_CODE},
+                        f"call_v{n}",
+                    ),
+                ])
+            # Subsequent rounds: a benign no-op tool call so the loop
+            # keeps going (an empty content with no tool_calls would
+            # break the loop early via the no-tool-calls path).
+            return _make_completion(tool_calls=[
+                _make_tool_call(
+                    "time_remaining", {}, f"call_t{n}",
+                ),
+            ])
+
+        mock_openai.return_value.chat.completions.create.side_effect = (
+            chat_side_effect
+        )
+
+        ch = _make_challenge(with_flops=False)
+        ch["agent_seconds"] = 1800
+        agent.design_architecture(ch, gated_client=None)
+
+        # 1 validate + 4 stalled rounds = 5 chat calls before break.
+        # If the validation round counted (old behavior, threshold 2)
+        # we'd see only 2.
+        assert call_count["n"] == 5
