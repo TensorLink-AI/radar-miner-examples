@@ -215,9 +215,12 @@ class TestAddNote:
     def test_appends_to_hypothesis_section(self):
         state: dict = {}
         add_note(state, "open_hypotheses", "try depthwise-sep convs")
-        assert state["notes"]["open_hypotheses"] == [
-            "try depthwise-sep convs",
-        ]
+        # Hypotheses are now structured dicts (with optional
+        # candidate_ids); add_note delegates to add_hypothesis.
+        bucket = state["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["text"] == "try depthwise-sep convs"
+        assert bucket[0]["candidate_ids"] == []
 
     def test_appends_to_dead_ends_section(self):
         state: dict = {}
@@ -234,7 +237,9 @@ class TestAddNote:
     def test_strips_whitespace(self):
         state: dict = {}
         add_note(state, "open_hypotheses", "  idea one  \n")
-        assert state["notes"]["open_hypotheses"] == ["idea one"]
+        bucket = state["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["text"] == "idea one"
 
     def test_rejects_unknown_section(self):
         import pytest

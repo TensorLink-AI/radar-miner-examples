@@ -21,6 +21,7 @@ import copy
 import io
 import json
 import os
+import re
 import sys
 import tarfile
 import time
@@ -33,8 +34,12 @@ from core import call_with_timeout
 from core.arch_knowledge import scan_frontier_ops
 from core.flops_estimator import estimate_flops, suggest_resize
 from core.history import (
-    add_note, extract_flops_budget, format_history, format_notes,
-    get_history, load_state, save_state,
+    HYPOTHESIS_VERDICTS, MAX_MACRO_STEPS, MAX_MACROS, add_hypothesis,
+    add_macro, add_note, add_submission, extract_flops_budget,
+    find_candidate, find_macro, format_history, format_notes,
+    format_scratchpad_summary, get_history, get_macros, get_submissions,
+    link_hypothesis, load_state, mark_candidate_submitted,
+    mark_candidate_validated, save_state, upsert_candidate,
 )
 from core.input_shape import infer_input
 from core.output_shape import infer_output_shape, verify_output_shape
@@ -295,7 +300,11 @@ TOOLS: list[dict] = [
                 "traces per-layer shapes, and checks output shape against "
                 "the task constraint. build_optimizer is auto-added if "
                 "missing. Use this to validate a design before writing "
-                "full production code."
+                "full production code. Each call stores the code as a "
+                "candidate keyed by a stable id (``cand_<8 hex>``) and "
+                "reports the id at the end of the output — pass that id "
+                "to ``validate_code`` and ``submit`` to avoid re-pasting "
+                "the source."
             ),
             "parameters": {
                 "type": "object",
@@ -488,21 +497,184 @@ TOOLS: list[dict] = [
                 "Validate a candidate model. Returns 'ok' or 'errors: ...' "
                 "covering syntax, missing build_model/build_optimizer, "
                 "forbidden imports, FLOPs out of bucket, and output-shape "
-                "mismatches. Always call this before `submit`."
+                "mismatches. Always call this before `submit`. The "
+                "validated candidate id is reported on the last line "
+                "(e.g. 'candidate_id: cand_a3f24c1d') so you can pass "
+                "it to ``submit``."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Full Python source to validate.",
+                        "description": (
+                            "Full Python source to validate. Optional "
+                            "when ``candidate_id`` is supplied."
+                        ),
+                    },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. ID of a stored candidate "
+                            "(returned by ``sketch_architecture``). "
+                            "When provided, the code is loaded from "
+                            "state and the ``code`` argument is "
+                            "ignored."
+                        ),
                     },
                 },
-                "required": ["code"],
+                "required": [],
+            },
+        },
+    },
+    # ── Composing tools ─────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "define_macro",
+            "description": (
+                "Save a named sequence of tool calls so you can "
+                "replay it as one action. Each step is "
+                "``{tool: str, args: dict, output_to?: str}``. "
+                "Within ``args`` you can reference run-time "
+                "arguments via ``${args.foo}`` and prior step "
+                "outputs via ``${step_var}`` (the variable name set "
+                "by an earlier step's ``output_to``). When a string "
+                "value is exactly one substitution reference its "
+                "type is preserved; embedded refs stringify. "
+                "Restrictions: ``submit``, ``define_macro``, and "
+                "``run_macro`` cannot appear in a sequence — macros "
+                "cannot ship code or recurse into other macros. Up "
+                f"to {MAX_MACRO_STEPS} steps per macro, "
+                f"{MAX_MACROS} macros stored per miner."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Macro name (alnum / underscore). "
+                            "Re-using a name overwrites the macro."
+                        ),
+                    },
+                    "sequence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {"type": "string"},
+                                "args": {"type": "object"},
+                                "output_to": {"type": "string"},
+                            },
+                            "required": ["tool"],
+                        },
+                        "description": (
+                            "Ordered list of steps. Example: "
+                            "[{\"tool\": \"list_frontier\", "
+                            "\"args\": {}, \"output_to\": \"fl\"}]"
+                        ),
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "Optional human-readable description, "
+                            "shown by list_macros."
+                        ),
+                    },
+                },
+                "required": ["name", "sequence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_macro",
+            "description": (
+                "Execute a previously defined macro. Substitutes "
+                "``${args.X}`` placeholders with the corresponding "
+                "value from ``args`` and ``${var}`` with the output "
+                "of a prior step labelled via ``output_to``. Returns "
+                "the concatenated outputs of every step, each "
+                "prefixed with ``[step N tool_name]``. Halts on the "
+                "first error (handler exception OR a result starting "
+                "with ``error:``/``errors:``) and returns the partial "
+                "output."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Macro name to execute.",
+                    },
+                    "args": {
+                        "type": "object",
+                        "description": (
+                            "Optional dict of run-time arguments "
+                            "referenced inside the macro via "
+                            "``${args.foo}``."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_macros",
+            "description": (
+                "List the macros defined in this miner's state. "
+                "Each entry shows name, description, step count, "
+                "and the tool names invoked in the sequence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         },
     },
     # ── State ────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "read_my_submissions",
+            "description": (
+                "Show the agent's own prior submissions (newest "
+                "first) with full code, scores, and ranks. Each entry "
+                "shows round_id, name, score (or 'pending' when the "
+                "validator hasn't returned a result yet), rank, "
+                "candidate_id, motivation, and code. When ``n`` > 1 "
+                "the code per entry is truncated to the first ~40 "
+                "lines; call with ``n=1`` to see full code of just "
+                "the latest submission. Useful when read_scratchpad's "
+                "summary isn't enough — e.g. you want to compare what "
+                "you actually shipped against a new sketch."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 3,
+                        "description": (
+                            "Most-recent N submissions to show "
+                            "(default 3). ``n=1`` returns full code "
+                            "for the latest; larger values truncate "
+                            "per entry."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -530,9 +702,14 @@ TOOLS: list[dict] = [
                 "+ `reason` (an approach that failed and why), or "
                 "`observation` (a task-agnostic fact learned). Each "
                 "section is capped at 20 entries (oldest is dropped). "
-                "You MUST write at least one note before calling "
-                "`submit`. The deprecated free-form `notes` field is "
-                "still accepted but prefer the structured fields."
+                "When the note is a `hypothesis` you can also pass "
+                "`candidate_id` to link it to a sketched/validated "
+                "candidate — read_scratchpad will then surface that "
+                "candidate's status and (eventually) score under the "
+                "hypothesis. You MUST write at least one note before "
+                "calling `submit`. The deprecated free-form `notes` "
+                "field is still accepted but prefer the structured "
+                "fields."
             ),
             "parameters": {
                 "type": "object",
@@ -543,6 +720,19 @@ TOOLS: list[dict] = [
                             "Appended to open_hypotheses. Example: "
                             "'Try depthwise-sep convs for the same "
                             "receptive field at lower FLOPs.'"
+                        ),
+                    },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Only meaningful with "
+                            "`hypothesis`. Links the hypothesis to "
+                            "a candidate (e.g. 'cand_a3f24c1d') so "
+                            "the next round's read_scratchpad can "
+                            "show what the candidate's outcome was. "
+                            "If a hypothesis with the same text "
+                            "already exists, the id is appended to "
+                            "its candidate_ids list."
                         ),
                     },
                     "dead_end": {
@@ -573,6 +763,55 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "link_hypothesis",
+            "description": (
+                "Late-bind a candidate id and/or a verdict to an "
+                "existing hypothesis. Use when you realize mid-round "
+                "that a hypothesis from earlier matches the candidate "
+                "you just sketched, or when you want to mark the "
+                "hypothesis as supported/refuted before its score "
+                "lands. Looks up the hypothesis by its exact text — "
+                "pass the same string you used in "
+                "write_scratchpad(hypothesis=…). Returns an error "
+                "string when no hypothesis matches."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hypothesis": {
+                        "type": "string",
+                        "description": (
+                            "Exact text of an existing hypothesis. "
+                            "Call read_scratchpad to see what's "
+                            "stored."
+                        ),
+                    },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. Candidate id to attach. "
+                            "Appended to the hypothesis's "
+                            "candidate_ids list (deduped)."
+                        ),
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "enum": list(HYPOTHESIS_VERDICTS),
+                        "description": (
+                            "Optional. Manual judgement. Sets "
+                            "outcome.verdict; score / rank are left "
+                            "null until the next round's "
+                            "previous_results fills them in."
+                        ),
+                    },
+                },
+                "required": ["hypothesis"],
             },
         },
     },
@@ -676,14 +915,21 @@ TOOLS: list[dict] = [
             "name": "submit",
             "description": (
                 "Terminal tool — submit the validated model code, ending "
-                "the loop. Code MUST have passed `validate_code` first."
+                "the loop. Code MUST have passed `validate_code` first. "
+                "Either pass ``code`` directly, or pass the "
+                "``candidate_id`` returned by ``validate_code`` to ship "
+                "the stored candidate (the candidate is then marked "
+                "submitted in state)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Final validated Python source.",
+                        "description": (
+                            "Final validated Python source. Optional "
+                            "when ``candidate_id`` is supplied."
+                        ),
                     },
                     "name": {
                         "type": "string",
@@ -697,8 +943,18 @@ TOOLS: list[dict] = [
                             "Why this design — what it improves."
                         ),
                     },
+                    "candidate_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional. ID of a stored candidate to "
+                            "ship (e.g. 'cand_a3f24c1d'). When "
+                            "provided, the candidate's stored code is "
+                            "submitted and the ``code`` argument is "
+                            "ignored."
+                        ),
+                    },
                 },
-                "required": ["code", "name", "motivation"],
+                "required": ["name", "motivation"],
             },
         },
     },
@@ -823,6 +1079,11 @@ def build_handlers(
     desearch_url = (challenge.get("desearch_url") or "").rstrip("/")
     flops_min, flops_max = extract_flops_budget(challenge)
     target_flops = int(flops_max * 0.6) if flops_max else 0
+    round_id = str(
+        challenge.get("round_id")
+        or challenge.get("challenge_id")
+        or ""
+    )
 
     if state is None:
         state = load_state(scratch_dir) if scratch_dir else {}
@@ -1125,6 +1386,18 @@ def build_handlers(
             "\nNote: sketch_architecture does NOT reject on FLOPs bounds. "
             "Use validate_code for the final pre-submission check."
         )
+
+        trace_text = (
+            format_trace(entries, max_rows=40)
+            if not trace_err and entries else None
+        )
+        cid = upsert_candidate(
+            state_holder["state"],
+            code=code,
+            flops=int(estimated) if estimated is not None else None,
+            trace=trace_text,
+        )
+        lines.append(f"\ncandidate_id: {cid}")
         return "\n".join(lines)
 
     def _estimate_flops(code: str = "", **_kwargs) -> str:
@@ -1294,24 +1567,314 @@ def build_handlers(
             f"(B, {expected_pretty})."
         )
 
-    def _validate_code(code: str = "", **_kwargs) -> str:
+    def _validate_code(code: str = "", candidate_id: str = "",
+                       **_kwargs) -> str:
+        state = state_holder["state"]
+        if candidate_id:
+            record = find_candidate(state, candidate_id)
+            if record is None:
+                return (
+                    f"errors: candidate_id {candidate_id!r} not found"
+                )
+            code = record.get("code") or ""
         if not code:
             return "errors: empty code"
         ok, errors = validate_code(code, challenge)
-        if ok:
-            # Stash the most recent validated code so the agent can
-            # auto-submit it if the LLM never calls submit explicitly.
-            state_holder["last_validated_code"] = code
-            return (
-                "ok — code passed all checks. THIS IS YOUR FINAL "
-                "ARTIFACT. Your next tool call MUST be `write_scratchpad` "
-                "followed by `submit` with this exact code. Do not call "
-                "sketch_architecture, size_to_flops, or validate_code "
-                "again unless you have a specific reason to revise."
-            )
-        return "errors: " + "; ".join(errors)
+        if not ok:
+            return "errors: " + "; ".join(errors)
+        # Stash the most recent validated code so the agent can
+        # auto-submit it if the LLM never calls submit explicitly.
+        state_holder["last_validated_code"] = code
+        cid = candidate_id or upsert_candidate(state, code=code)
+        mark_candidate_validated(state, cid)
+        state_holder["last_validated_candidate_id"] = cid
+        return (
+            "ok — code passed all checks. THIS IS YOUR FINAL "
+            "ARTIFACT. Your next tool call MUST be `write_scratchpad` "
+            "followed by `submit` with this exact code (you can "
+            f"pass candidate_id={cid} instead of re-pasting). Do not "
+            "call sketch_architecture, size_to_flops, or "
+            "validate_code again unless you have a specific reason "
+            "to revise.\n"
+            f"candidate_id: {cid}"
+        )
 
     # ── State ────────────────────────────────────────────────────
+
+    READ_MY_SUBMISSIONS_TRUNC_LINES = 40
+
+    def _read_my_submissions(n: int = 3, **_kwargs) -> str:
+        try:
+            n = max(1, min(int(n), 20))
+        except (TypeError, ValueError):
+            n = 3
+        subs = get_submissions(state_holder["state"])
+        if not subs:
+            return "no submissions yet"
+        # Newest first.
+        recent = list(reversed(subs[-n:]))
+        parts: list[str] = []
+        for i, sub in enumerate(recent, 1):
+            score = sub.get("score")
+            if isinstance(score, (int, float)):
+                score_text = f"{score:.4g}"
+            else:
+                score_text = "pending"
+            rank = sub.get("rank")
+            rank_total = sub.get("rank_total")
+            if isinstance(rank, int):
+                rank_text = (
+                    f"{rank}/{rank_total}"
+                    if isinstance(rank_total, int) else str(rank)
+                )
+            else:
+                rank_text = "?"
+            cid = sub.get("candidate_id") or "—"
+            sub_round = sub.get("round_id") or "?"
+            sub_name = sub.get("name") or "?"
+            motivation = sub.get("motivation") or ""
+            code = sub.get("code") or ""
+            code_lines = code.splitlines()
+            # Full code only when n=1; otherwise truncate per entry.
+            if n > 1 and len(code_lines) > READ_MY_SUBMISSIONS_TRUNC_LINES:
+                shown = "\n".join(
+                    code_lines[:READ_MY_SUBMISSIONS_TRUNC_LINES]
+                )
+                more = len(code_lines) - READ_MY_SUBMISSIONS_TRUNC_LINES
+                code_block = (
+                    f"{shown}\n... ({more} more lines truncated; "
+                    "call read_my_submissions(n=1) for full code)"
+                )
+            else:
+                code_block = code
+            header = (
+                f"## Submission {i} of {len(recent)} "
+                f"(round {sub_round}, name={sub_name})"
+            )
+            meta_lines = [
+                f"score: {score_text} (rank {rank_text})",
+                f"candidate_id: {cid}",
+            ]
+            if motivation:
+                meta_lines.append(f"motivation: {motivation}")
+            parts.append(
+                f"{header}\n"
+                + "\n".join(meta_lines)
+                + f"\n```python\n{code_block}\n```"
+            )
+        return "\n\n".join(parts)
+
+    # ── Macros ──────────────────────────────────────────────────
+    #
+    # Macro execution calls the same wrapped handler dict the LLM
+    # uses, so circuit breakers and call counts apply uniformly to
+    # macro-driven invocations. The dict isn't built yet at this
+    # point in build_handlers — we stash a reference once it's
+    # finalized below and read from the box at run time.
+
+    handlers_box: dict = {}
+    MACRO_FORBIDDEN_TOOLS = frozenset({
+        "submit", "define_macro", "run_macro",
+    })
+    MACRO_NAME_RE = re.compile(r"^[A-Za-z_][\w]{0,63}$")
+    MACRO_REF_RE = re.compile(r"\$\{([\w.]+)\}")
+
+    def _resolve_ref(ref: str, run_args: dict, step_outputs: dict):
+        if ref.startswith("args."):
+            key = ref[len("args."):]
+            if isinstance(run_args, dict) and key in run_args:
+                return run_args[key], True
+            return None, False
+        if ref in step_outputs:
+            return step_outputs[ref], True
+        return None, False
+
+    def _substitute(value, run_args: dict, step_outputs: dict):
+        """Recursively substitute ``${...}`` refs in args. A whole-
+        string ref preserves the source value's type; embedded refs
+        stringify. Missing refs leave the literal ``${name}`` in
+        place so the LLM can see what didn't resolve.
+        """
+        if isinstance(value, str):
+            full = MACRO_REF_RE.fullmatch(value)
+            if full is not None:
+                resolved, ok = _resolve_ref(
+                    full.group(1), run_args, step_outputs,
+                )
+                return resolved if ok else value
+
+            def replace(m):
+                resolved, ok = _resolve_ref(
+                    m.group(1), run_args, step_outputs,
+                )
+                return str(resolved) if ok else m.group(0)
+
+            return MACRO_REF_RE.sub(replace, value)
+        if isinstance(value, dict):
+            return {
+                k: _substitute(v, run_args, step_outputs)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [_substitute(v, run_args, step_outputs) for v in value]
+        return value
+
+    def _validate_macro_sequence(
+        sequence, available_tools: set,
+    ) -> str | None:
+        """Return None if sequence is valid, else an error string."""
+        if not isinstance(sequence, list) or not sequence:
+            return "error: sequence must be a non-empty list of steps"
+        if len(sequence) > MAX_MACRO_STEPS:
+            return (
+                f"error: sequence has {len(sequence)} steps; max "
+                f"is {MAX_MACRO_STEPS}"
+            )
+        for i, step in enumerate(sequence, 1):
+            if not isinstance(step, dict):
+                return f"error: step {i} is not a dict"
+            tool = step.get("tool")
+            if not isinstance(tool, str) or not tool:
+                return f"error: step {i} missing 'tool' name"
+            if tool in MACRO_FORBIDDEN_TOOLS:
+                return (
+                    f"error: step {i} calls {tool!r} which is not "
+                    "allowed in a macro (submit ships code; "
+                    "define_macro and run_macro would let macros "
+                    "recurse)"
+                )
+            if tool not in available_tools:
+                return (
+                    f"error: step {i} references unknown tool "
+                    f"{tool!r}"
+                )
+            args = step.get("args", {})
+            if args is not None and not isinstance(args, dict):
+                return (
+                    f"error: step {i} args must be a dict (got "
+                    f"{type(args).__name__})"
+                )
+            output_to = step.get("output_to")
+            if output_to is not None and (
+                not isinstance(output_to, str) or not output_to
+            ):
+                return (
+                    f"error: step {i} output_to must be a non-empty "
+                    "string when set"
+                )
+        return None
+
+    def _define_macro(name: str = "", sequence: list | None = None,
+                      description: str = "", **_kwargs) -> str:
+        if not isinstance(name, str) or not MACRO_NAME_RE.match(name):
+            return (
+                "error: macro name must match [A-Za-z_]\\w{0,63} "
+                "(alphanumeric / underscore, up to 64 chars, must "
+                "not start with a digit)"
+            )
+        # The full set of tools the LLM can dispatch — derived from
+        # the wrapped dict once it's finalized; before that we fall
+        # back to the raw dict's keys.
+        wrapped = handlers_box.get("handlers")
+        available = set(
+            wrapped.keys() if wrapped is not None else raw.keys()
+        )
+        err = _validate_macro_sequence(sequence, available)
+        if err:
+            return err
+        # Strip unknown step keys; keep only the schema-blessed
+        # subset so persisted state stays clean.
+        clean_sequence = []
+        for step in sequence:
+            entry = {
+                "tool": step["tool"],
+                "args": step.get("args") or {},
+            }
+            if step.get("output_to"):
+                entry["output_to"] = step["output_to"]
+            clean_sequence.append(entry)
+        add_macro(
+            state_holder["state"],
+            name=name,
+            sequence=clean_sequence,
+            description=str(description or ""),
+        )
+        signature = ", ".join(
+            f"{i + 1}.{s['tool']}" for i, s in enumerate(clean_sequence)
+        )
+        return (
+            f"macro {name!r} stored ({len(clean_sequence)} step(s): "
+            f"{signature})"
+        )
+
+    def _run_macro(name: str = "", args: dict | None = None,
+                   **_kwargs) -> str:
+        if not isinstance(name, str) or not name:
+            return "error: macro name is required"
+        macro = find_macro(state_holder["state"], name)
+        if macro is None:
+            return f"error: macro {name!r} not found"
+        sequence = macro.get("sequence") or []
+        run_args = args if isinstance(args, dict) else {}
+        step_outputs: dict = {}
+        wrapped = handlers_box.get("handlers") or {}
+        parts: list[str] = []
+
+        for i, step in enumerate(sequence, 1):
+            tool = step.get("tool", "")
+            raw_args = step.get("args") or {}
+            output_to = step.get("output_to")
+            resolved = _substitute(raw_args, run_args, step_outputs)
+
+            label = f"[step {i} {tool}]"
+            handler = wrapped.get(tool)
+            if handler is None:
+                parts.append(f"{label}\nerror: tool not found")
+                return "\n\n".join(parts)
+            if not isinstance(resolved, dict):
+                parts.append(
+                    f"{label}\nerror: args resolved to "
+                    f"{type(resolved).__name__}, expected dict"
+                )
+                return "\n\n".join(parts)
+
+            try:
+                result = handler(**resolved)
+            except SubmitSignal:
+                # Should be unreachable — submit is banned at define
+                # time — but if a caller injected a macro directly,
+                # don't let SubmitSignal silently ship.
+                parts.append(
+                    f"{label}\nerror: submit is not allowed in macros"
+                )
+                return "\n\n".join(parts)
+            except Exception as exc:
+                parts.append(f"{label}\nerror: {exc}")
+                return "\n\n".join(parts)
+
+            result_str = str(result)
+            parts.append(f"{label}\n{result_str}")
+            if output_to:
+                step_outputs[output_to] = result_str
+            if result_str.lower().startswith(("error:", "errors:")):
+                return "\n\n".join(parts)
+
+        return "\n\n".join(parts)
+
+    def _list_macros(**_kwargs) -> str:
+        macros = get_macros(state_holder["state"])
+        if not macros:
+            return "no macros defined yet"
+        items = []
+        for name, m in macros.items():
+            seq = m.get("sequence") or []
+            items.append({
+                "name": name,
+                "description": m.get("description") or "",
+                "n_steps": len(seq),
+                "tools": [s.get("tool") for s in seq],
+            })
+        return json.dumps(items, indent=2, default=str)
 
     def _read_scratchpad(**_kwargs) -> str:
         state = state_holder["state"]
@@ -1321,6 +1884,9 @@ def build_handlers(
             challenge.get("score_direction") or "minimize"
         )
         parts = []
+        # One-line situational summary at the top so the agent gets a
+        # quick read on what's been tried before scrolling the details.
+        parts.append(format_scratchpad_summary(state, score_direction))
         structured = format_notes(state)
         if structured:
             parts.append(structured)
@@ -1335,17 +1901,24 @@ def build_handlers(
                     score_direction=score_direction,
                 )
             )
-        if not parts:
+        # The summary line alone isn't enough to imply "scratchpad is
+        # populated" — if it's the only part we have, treat the round as
+        # the first one.
+        if len(parts) <= 1:
             return "scratchpad is empty — this is your first round"
         return "\n\n".join(parts)
 
     def _write_scratchpad(hypothesis: str = "", dead_end: str = "",
                           reason: str = "", observation: str = "",
-                          notes: str = "", **_kwargs) -> str:
+                          candidate_id: str = "", notes: str = "",
+                          **_kwargs) -> str:
         state = state_holder["state"]
         wrote: list[str] = []
         if hypothesis and hypothesis.strip():
-            add_note(state, "open_hypotheses", hypothesis)
+            add_hypothesis(
+                state, text=hypothesis,
+                candidate_id=candidate_id or None,
+            )
             wrote.append("hypothesis")
         if dead_end and dead_end.strip():
             combined = (
@@ -1375,6 +1948,37 @@ def build_handlers(
         state_holder["state"] = state
         state_holder["wrote_this_round"] = True
         return f"scratchpad updated ({', '.join(wrote)})"
+
+    def _link_hypothesis(hypothesis: str = "", candidate_id: str = "",
+                         verdict: str = "", **_kwargs) -> str:
+        if not hypothesis or not hypothesis.strip():
+            return "error: hypothesis text is required"
+        if verdict and verdict not in HYPOTHESIS_VERDICTS:
+            return (
+                "error: verdict must be one of "
+                f"{', '.join(HYPOTHESIS_VERDICTS)} (got {verdict!r})"
+            )
+        if not candidate_id and not verdict:
+            return "error: pass candidate_id, verdict, or both"
+        record = link_hypothesis(
+            state_holder["state"],
+            text=hypothesis,
+            candidate_id=candidate_id or None,
+            verdict=verdict or None,
+        )
+        if record is None:
+            return (
+                f"error: hypothesis {hypothesis.strip()!r} not found "
+                "— call read_scratchpad to see what's stored"
+            )
+        parts = [f"text={record['text']!r}"]
+        cids = record.get("candidate_ids") or []
+        if cids:
+            parts.append(f"candidate_ids={cids}")
+        outcome = record.get("outcome") or {}
+        if outcome.get("verdict"):
+            parts.append(f"verdict={outcome['verdict']}")
+        return "linked — " + ", ".join(parts)
 
     # ── Files (scratchpad directory) ─────────────────────────────
 
@@ -1526,7 +2130,7 @@ def build_handlers(
     # ── Control ──────────────────────────────────────────────────
 
     def _submit(code: str = "", name: str = "", motivation: str = "",
-                **_kwargs) -> str:
+                candidate_id: str = "", **_kwargs) -> str:
         # Soft incentive only: if the LLM hasn't written any scratchpad
         # note this round, log a warning and let the submit go through.
         # The harness no longer blocks shipping — notes-for-future-rounds
@@ -1537,6 +2141,28 @@ def build_handlers(
                 file=sys.stderr,
                 flush=True,
             )
+        if candidate_id:
+            record = find_candidate(state_holder["state"], candidate_id)
+            if record is None:
+                return f"error: candidate_id {candidate_id!r} not found"
+            code = record.get("code") or code
+            mark_candidate_submitted(state_holder["state"], candidate_id)
+        if not code:
+            return (
+                "error: nothing to submit — pass either ``code`` or a "
+                "stored ``candidate_id``"
+            )
+        # Record the submission so read_my_submissions can show it back
+        # in a later round, and so merge_results_into_state has a
+        # code_hash target when the validator's previous_results arrive.
+        add_submission(
+            state_holder["state"],
+            code=code,
+            name=name,
+            motivation=motivation,
+            candidate_id=candidate_id or None,
+            round_id=round_id,
+        )
         raise SubmitSignal(code=code, name=name, motivation=motivation)
 
     def _time_remaining(**_kwargs) -> str:
@@ -1567,8 +2193,13 @@ def build_handlers(
         "trace_architecture": _trace_architecture,
         "check_output_shape": _check_output_shape,
         "validate_code": _validate_code,
+        "define_macro": _define_macro,
+        "run_macro": _run_macro,
+        "list_macros": _list_macros,
         "read_scratchpad": _read_scratchpad,
+        "read_my_submissions": _read_my_submissions,
         "write_scratchpad": _write_scratchpad,
+        "link_hypothesis": _link_hypothesis,
         "list_files": _list_files,
         "read_file": _read_file,
         "write_file": _write_file,
@@ -1626,6 +2257,10 @@ def build_handlers(
 
     handlers = {name: _wrap(name, fn) for name, fn in raw.items()}
     handlers["submit"] = _SubmitWrapper()
+    # Make the wrapped dict visible to _run_macro so macro-driven
+    # invocations go through the same circuit breaker / counter path
+    # as direct LLM calls.
+    handlers_box["handlers"] = handlers
     return handlers
 
 

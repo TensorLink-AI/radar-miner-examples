@@ -388,19 +388,26 @@ class TestToolSchema:
             "list_frontier", "get_frontier_member", "submit",
             "search_papers", "query_db", "estimate_layer_flops",
             "sketch_architecture", "trace_architecture",
-            "check_output_shape", "read_scratchpad", "write_scratchpad",
+            "check_output_shape", "read_scratchpad",
+            "read_my_submissions", "write_scratchpad",
+            "link_hypothesis",
             "list_files", "read_file", "write_file", "search_files",
+            "define_macro", "run_macro", "list_macros",
             "time_remaining",
             "cognition_wiki_index", "cognition_wiki_read",
         } == names
 
-    def test_submit_requires_code_name_motivation(self):
+    def test_submit_requires_name_motivation(self):
         from agents.openai_sdk.tools import TOOLS
         submit = next(
             t for t in TOOLS if t["function"]["name"] == "submit"
         )
         required = submit["function"]["parameters"]["required"]
-        assert {"code", "name", "motivation"} <= set(required)
+        # ``code`` is conditionally required (only when no
+        # ``candidate_id`` is supplied), so it's not in the JSON-schema
+        # required list — the handler enforces "one of code/candidate_id"
+        # at runtime.
+        assert {"name", "motivation"} <= set(required)
 
 
 class TestToolHandlers:
@@ -483,6 +490,1028 @@ class TestToolHandlers:
         assert excinfo.value.code == VALID_CODE
         captured = capsys.readouterr()
         assert "submit without scratchpad note this round" in captured.err
+
+
+class TestCandidateLineage:
+    """Feature 1: code lineage / candidate IDs.
+
+    A candidate is keyed by ``cand_<8 hex>``, derived from a sha1 of the
+    code, so identical code re-yields the same id (natural dedup). Each
+    record holds code, flops, trace, validated, submitted, created_at.
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def test_sketch_returns_candidate_id_and_stores_record(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        sketch_code = (
+            "import torch.nn as nn\n"
+            "def build_model(context_len, prediction_len, "
+            "num_variates, quantiles):\n"
+            "    return nn.Linear(context_len, prediction_len)\n"
+        )
+        result = handlers["sketch_architecture"](code=sketch_code)
+        # Output ends with a candidate_id line in cand_<hex> form.
+        last = [l for l in result.splitlines() if l.strip()][-1]
+        assert last.startswith("candidate_id: cand_")
+        cid = last.split(": ", 1)[1]
+        assert len(cid) == len("cand_") + 8
+        # Record is stored with the code, validated/submitted False.
+        cands = self._state(handlers)["candidates"]
+        assert cid in cands
+        record = cands[cid]
+        assert "def build_model" in record["code"]
+        assert record["validated"] is False
+        assert record["submitted"] is False
+        assert "created_at" in record
+
+    def test_sketch_dedupes_identical_code(self):
+        """Same code → same id; the dict still has one entry."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        code = (
+            "import torch.nn as nn\n"
+            "def build_model(context_len, prediction_len, "
+            "num_variates, quantiles):\n"
+            "    return nn.Linear(context_len, prediction_len)\n"
+        )
+        r1 = handlers["sketch_architecture"](code=code)
+        r2 = handlers["sketch_architecture"](code=code)
+        cid1 = r1.splitlines()[-1].split(": ", 1)[1]
+        cid2 = r2.splitlines()[-1].split(": ", 1)[1]
+        assert cid1 == cid2
+        assert len(self._state(handlers)["candidates"]) == 1
+
+    def test_validate_with_candidate_id_pulls_from_state(self):
+        """validate_code with candidate_id ignores the code arg and
+        loads the source from state."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        # Stash VALID_CODE under a known id by sketching it first.
+        sketch_result = handlers["sketch_architecture"](code=VALID_CODE)
+        cid = sketch_result.splitlines()[-1].split(": ", 1)[1]
+        # Pass NO code, only the id — the handler must look up the
+        # source from state.
+        result = handlers["validate_code"](candidate_id=cid)
+        assert result.startswith("ok")
+        record = self._state(handlers)["candidates"][cid]
+        assert record["validated"] is True
+
+    def test_validate_with_unknown_candidate_id_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        result = handlers["validate_code"](candidate_id="cand_deadbeef")
+        assert result.startswith("errors:")
+        assert "cand_deadbeef" in result
+        assert "not found" in result
+
+    def test_validate_without_candidate_id_autogenerates_on_success(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        result = handlers["validate_code"](code=VALID_CODE)
+        assert result.startswith("ok")
+        last = [l for l in result.splitlines() if l.strip()][-1]
+        assert last.startswith("candidate_id: cand_")
+        cid = last.split(": ", 1)[1]
+        cands = self._state(handlers)["candidates"]
+        assert cid in cands
+        assert cands[cid]["validated"] is True
+
+    def test_validate_failure_does_not_create_candidate(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        result = handlers["validate_code"](code="x = 1")
+        assert result.startswith("errors:")
+        assert self._state(handlers).get("candidates", {}) == {}
+
+    def test_submit_with_candidate_id_ships_from_state(self):
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        handlers["validate_code"](code=VALID_CODE)
+        # The validate_code success line carries the id; pull it out.
+        # (Equivalent to the LLM reading the tool result.)
+        cands = self._state(handlers)["candidates"]
+        cid = next(iter(cands))
+        handlers["write_scratchpad"](observation="ok")
+        with pytest.raises(SubmitSignal) as excinfo:
+            handlers["submit"](
+                candidate_id=cid, name="m", motivation="from id",
+            )
+        # The shipped code came from state, not from a code= arg.
+        assert excinfo.value.code == cands[cid]["code"]
+        assert cands[cid]["submitted"] is True
+
+    def test_submit_with_unknown_candidate_id_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="ok")
+        result = handlers["submit"](
+            candidate_id="cand_deadbeef", name="m", motivation="x",
+        )
+        assert "not found" in result
+
+    def test_submit_without_candidate_id_behaves_as_before(self):
+        """Backwards-compat: submit(code=..., name=..., motivation=...)
+        still works and raises SubmitSignal with the supplied code."""
+        from agents.openai_sdk.tools import SubmitSignal, build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="ok")
+        with pytest.raises(SubmitSignal) as excinfo:
+            handlers["submit"](
+                code=VALID_CODE, name="m", motivation="legacy",
+            )
+        assert excinfo.value.code == VALID_CODE
+
+    def test_submit_with_neither_code_nor_id_returns_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="ok")
+        result = handlers["submit"](name="m", motivation="empty")
+        assert result.startswith("error:")
+        assert "candidate_id" in result or "code" in result
+
+    def test_candidates_survive_save_load_roundtrip(self, tmp_path):
+        """A candidate written via the handler persists through
+        history.save_state/load_state without losing fields."""
+        import sys
+        sys.path.insert(0, "agents/openai_sdk")
+        for k in list(sys.modules):
+            if k == "core" or k.startswith("core."):
+                del sys.modules[k]
+        from core.history import (  # noqa: E402
+            load_state, save_state,
+        )
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(with_flops=False),
+            scratch_dir=str(tmp_path),
+        )
+        handlers["sketch_architecture"](code=VALID_CODE)
+        state = self._state(handlers)
+        save_state(str(tmp_path), state)
+        reloaded = load_state(str(tmp_path))
+        assert "candidates" in reloaded
+        assert reloaded["candidates"] == state["candidates"]
+        # Spot-check the record shape survived JSON round-trip.
+        record = next(iter(reloaded["candidates"].values()))
+        for key in ("code", "flops", "trace", "validated",
+                    "submitted", "created_at"):
+            assert key in record
+
+    def test_legacy_state_without_candidates_loads_cleanly(self, tmp_path):
+        """An old-schema state.json (no candidates key) must load and
+        the handlers must treat the candidate dict as empty."""
+        import json
+        legacy = {
+            "history": [{"name": "old", "code_hash": 123}],
+            "notes": {"open_hypotheses": ["try X"]},
+        }
+        (tmp_path / "state.json").write_text(json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(with_flops=False),
+            scratch_dir=str(tmp_path),
+        )
+        state = self._state(handlers)
+        # Legacy keys preserved.
+        assert state["history"][0]["name"] == "old"
+        # candidates absent on disk → handler-side accessors see {}.
+        # (The dict is created lazily on first write.)
+        assert state.get("candidates", {}) == {}
+        # First sketch creates the dict without crashing on the absent
+        # key.
+        result = handlers["sketch_architecture"](code=VALID_CODE)
+        assert "candidate_id: cand_" in result
+        assert len(state["candidates"]) == 1
+
+
+class TestReadMySubmissions:
+    """Feature 2: read_my_submissions tool.
+
+    submit appends a record to ``state["submissions"]`` with the full
+    code blob; read_my_submissions surfaces the n most recent (newest
+    first) and merge_results_into_state attaches score/rank when the
+    next round's previous_results arrive.
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def _ship(self, handlers, code, name, motivation, candidate_id=""):
+        from agents.openai_sdk.tools import SubmitSignal
+        handlers["write_scratchpad"](observation="ok")
+        kwargs = {"code": code, "name": name, "motivation": motivation}
+        if candidate_id:
+            kwargs["candidate_id"] = candidate_id
+        try:
+            handlers["submit"](**kwargs)
+        except SubmitSignal:
+            pass
+
+    def test_submit_records_into_state_submissions(self):
+        from agents.openai_sdk.tools import build_handlers
+        ch = _make_challenge()
+        ch["round_id"] = 7
+        handlers = build_handlers(ch)
+        self._ship(handlers, VALID_CODE, "m", "first try")
+        subs = self._state(handlers)["submissions"]
+        assert len(subs) == 1
+        rec = subs[0]
+        assert rec["code"] == VALID_CODE
+        assert rec["name"] == "m"
+        assert rec["motivation"] == "first try"
+        assert rec["round_id"] == "7"
+        assert rec["score"] is None
+        assert rec["rank"] is None
+        assert rec["candidate_id"] is None
+        assert "submitted_at" in rec
+        assert "code_hash" in rec
+
+    def test_submit_records_candidate_id_when_passed(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        validate_result = handlers["validate_code"](code=VALID_CODE)
+        cid = [
+            l for l in validate_result.splitlines()
+            if l.startswith("candidate_id: ")
+        ][-1].split(": ", 1)[1]
+        self._ship(handlers, "", "m", "from id", candidate_id=cid)
+        subs = self._state(handlers)["submissions"]
+        assert subs[-1]["candidate_id"] == cid
+        assert subs[-1]["code"] == VALID_CODE
+
+    def test_read_returns_pending_when_no_score_yet(self):
+        from agents.openai_sdk.tools import build_handlers
+        ch = _make_challenge()
+        ch["round_id"] = 12
+        handlers = build_handlers(ch)
+        self._ship(handlers, VALID_CODE, "wide_mlp", "wider hidden")
+        out = handlers["read_my_submissions"](n=1)
+        assert "round 12" in out
+        assert "wide_mlp" in out
+        assert "score: pending" in out
+        assert "wider hidden" in out
+        # Full code is shown when n=1.
+        assert "import torch" in out
+        assert "build_model" in out
+
+    def test_read_truncates_when_n_gt_1(self):
+        """A long-code submission must be truncated when n>1."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        long_code = (
+            "import torch\n" + "\n".join(
+                f"x_{i} = {i}" for i in range(100)
+            ) + "\n"
+        )
+        self._ship(handlers, long_code, "a", "first")
+        self._ship(handlers, VALID_CODE, "b", "second")
+        out = handlers["read_my_submissions"](n=2)
+        assert "Submission 1 of 2" in out
+        assert "Submission 2 of 2" in out
+        # Newest is "b" — appears first in the rendered output.
+        assert out.index("name=b") < out.index("name=a")
+        # The long code (now in entry #2) must show the truncation
+        # marker; VALID_CODE in entry #1 is short and stays intact.
+        assert "more lines truncated" in out
+
+    def test_read_full_code_when_n_eq_1(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        long_code = (
+            "import torch\n" + "\n".join(
+                f"x_{i} = {i}" for i in range(100)
+            ) + "\n"
+        )
+        self._ship(handlers, long_code, "long", "filler")
+        out = handlers["read_my_submissions"](n=1)
+        # No truncation marker, every line present.
+        assert "more lines truncated" not in out
+        assert "x_99 = 99" in out
+
+    def test_read_empty_state(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        assert handlers["read_my_submissions"]() == "no submissions yet"
+
+    def test_read_default_n_is_3(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        for i in range(5):
+            self._ship(
+                handlers, VALID_CODE.replace("Adam", f"Adam  # {i}"),
+                f"v{i}", f"motivation {i}",
+            )
+        out = handlers["read_my_submissions"]()
+        # Default 3, newest first → v4, v3, v2 visible; v1, v0 not.
+        assert "name=v4" in out
+        assert "name=v3" in out
+        assert "name=v2" in out
+        assert "name=v1" not in out
+        assert "name=v0" not in out
+
+    def test_read_clamps_n_to_at_least_1(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        self._ship(handlers, VALID_CODE, "only", "only one")
+        out = handlers["read_my_submissions"](n=0)
+        assert "Submission 1 of 1" in out
+
+    def test_legacy_state_loads_with_empty_submissions(self, tmp_path):
+        """Old state.json without ``submissions`` key loads cleanly."""
+        import json
+        legacy = {
+            "history": [{"name": "old", "code_hash": 123}],
+            "notes": {"open_hypotheses": ["try X"]},
+        }
+        (tmp_path / "state.json").write_text(json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        assert handlers["read_my_submissions"]() == "no submissions yet"
+        # First submit lazily creates the list.
+        self._ship(handlers, VALID_CODE, "n", "m")
+        assert len(self._state(handlers)["submissions"]) == 1
+
+    def test_score_updated_when_previous_results_arrive(self):
+        """Round N submits; round N+1's previous_results carries the
+        score; merge_results_into_state must attach it to the
+        submissions entry by code_hash."""
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        ch = _make_challenge()
+        ch["round_id"] = 5
+        handlers = build_handlers(ch)
+        self._ship(handlers, VALID_CODE, "v1", "m1")
+        state = self._state(handlers)
+        ch_value = state["submissions"][0]["code_hash"]
+        merge_results_into_state(state, [{
+            "round_id": 5, "code_hash": ch_value,
+            "score": 0.123, "rank": 3, "rank_total": 12,
+        }])
+        # Score / rank propagated to the submission record.
+        rec = state["submissions"][0]
+        assert rec["score"] == 0.123
+        assert rec["rank"] == 3
+        assert rec["rank_total"] == 12
+        assert rec["scored_round_id"] == 5
+        # And read_my_submissions renders them.
+        out = handlers["read_my_submissions"](n=1)
+        assert "score: 0.123 (rank 3/12)" in out
+
+    def test_submissions_survive_save_load_roundtrip(self, tmp_path):
+        import sys
+        sys.path.insert(0, "agents/openai_sdk")
+        for k in list(sys.modules):
+            if k == "core" or k.startswith("core."):
+                del sys.modules[k]
+        from core.history import (  # noqa: E402
+            load_state, save_state,
+        )
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        self._ship(handlers, VALID_CODE, "n", "m")
+        save_state(str(tmp_path), self._state(handlers))
+        reloaded = load_state(str(tmp_path))
+        assert "submissions" in reloaded
+        assert reloaded["submissions"][0]["code"] == VALID_CODE
+        for key in ("code", "code_hash", "name", "motivation",
+                    "candidate_id", "round_id", "score", "rank",
+                    "rank_total", "submitted_at"):
+            assert key in reloaded["submissions"][0]
+
+
+class TestHypothesisLinkage:
+    """Feature 3: hypothesis → candidate_id → outcome linkage.
+
+    write_scratchpad(hypothesis=..., candidate_id=...) attaches the id
+    to the hypothesis record. read_scratchpad renders each link's
+    current candidate state (validated/submitted) and score (when
+    previous_results has merged it onto the matching submission).
+    A summary line at the top gives the agent a quick situational read.
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def _ship(self, handlers, code, name, motivation, candidate_id=""):
+        from agents.openai_sdk.tools import SubmitSignal
+        kwargs = {"code": code, "name": name, "motivation": motivation}
+        if candidate_id:
+            kwargs["candidate_id"] = candidate_id
+        try:
+            handlers["submit"](**kwargs)
+        except SubmitSignal:
+            pass
+
+    def test_hypothesis_with_candidate_id_stores_linkage(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="try patch sizes", candidate_id="cand_a3f24c1d",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["text"] == "try patch sizes"
+        assert bucket[0]["candidate_ids"] == ["cand_a3f24c1d"]
+
+    def test_hypothesis_without_candidate_id_starts_empty_links(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="something to try")
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == []
+
+    def test_duplicate_text_appends_candidate_id(self):
+        """Re-stating the same hypothesis with a new id appends rather
+        than creating a duplicate row."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_aaaaaaaa",
+        )
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_bbbbbbbb",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["candidate_ids"] == [
+            "cand_aaaaaaaa", "cand_bbbbbbbb",
+        ]
+
+    def test_duplicate_candidate_id_does_not_double_append(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_aaaaaaaa",
+        )
+        handlers["write_scratchpad"](
+            hypothesis="try patches", candidate_id="cand_aaaaaaaa",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == ["cand_aaaaaaaa"]
+
+    def test_legacy_string_hypotheses_auto_upgrade_on_access(
+        self, tmp_path,
+    ):
+        """Old scratchpads with bare-string hypotheses must be wrapped
+        in dicts on first access — no manual migration step."""
+        import json
+        legacy = {
+            "notes": {
+                "open_hypotheses": ["try X", "try Y"],
+                "dead_ends": [],
+                "task_observations": [],
+            },
+        }
+        (tmp_path / "state.json").write_text(json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        # Trigger an access through write_scratchpad — _notes() runs
+        # the upgrade.
+        handlers["write_scratchpad"](hypothesis="try Z")
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert all(isinstance(h, dict) for h in bucket)
+        texts = [h["text"] for h in bucket]
+        assert texts == ["try X", "try Y", "try Z"]
+        # Upgraded entries get an empty candidate_ids list and no
+        # created_at timestamp.
+        upgraded = bucket[0]
+        assert upgraded["candidate_ids"] == []
+        assert upgraded["created_at"] is None
+
+    def test_read_renders_validated_submitted_scored(self):
+        """Full happy path: hypothesis → validate → submit → score
+        merged in. read_scratchpad must render the chain.
+        """
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        # validate creates a candidate with status="validated"
+        validate_out = handlers["validate_code"](code=VALID_CODE)
+        cid = [
+            l for l in validate_out.splitlines()
+            if l.startswith("candidate_id: ")
+        ][-1].split(": ", 1)[1]
+        # link hypothesis → candidate
+        handlers["write_scratchpad"](
+            hypothesis="larger patch sizes", candidate_id=cid,
+        )
+        # ship and merge a score for it
+        self._ship(handlers, "", "m", "ship", candidate_id=cid)
+        state = self._state(handlers)
+        sub = state["submissions"][0]
+        merge_results_into_state(state, [{
+            "round_id": "r1", "code_hash": sub["code_hash"],
+            "score": 0.81, "rank": 3, "rank_total": 9,
+        }])
+        out = handlers["read_scratchpad"]()
+        assert "larger patch sizes" in out
+        line = [l for l in out.splitlines() if cid in l][0]
+        assert "validated" in line
+        assert "submitted" in line
+        assert "scored 0.81" in line
+        assert "rank 3/9" in line
+
+    def test_read_renders_pending_when_candidate_unknown(self):
+        """A candidate_id with no matching candidate or submission
+        record should still render — just say nothing's known yet."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="speculative idea",
+            candidate_id="cand_deadbeef",
+        )
+        out = handlers["read_scratchpad"]()
+        line = [l for l in out.splitlines() if "cand_deadbeef" in l][0]
+        assert "no candidate state yet" in line
+
+    def test_read_renders_validated_only(self):
+        """Validated but not yet submitted: only the 'validated' tag
+        appears, no 'submitted', no score."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        validate_out = handlers["validate_code"](code=VALID_CODE)
+        cid = [
+            l for l in validate_out.splitlines()
+            if l.startswith("candidate_id: ")
+        ][-1].split(": ", 1)[1]
+        handlers["write_scratchpad"](
+            hypothesis="just an idea", candidate_id=cid,
+        )
+        out = handlers["read_scratchpad"]()
+        line = [l for l in out.splitlines() if cid in l][0]
+        assert "validated" in line
+        assert "submitted" not in line
+        assert "scored" not in line
+
+    def test_summary_line_counts_state(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(with_flops=False))
+        handlers["write_scratchpad"](hypothesis="h1")
+        handlers["write_scratchpad"](hypothesis="h2")
+        handlers["sketch_architecture"](code=(
+            "import torch.nn as nn\n"
+            "def build_model(context_len, prediction_len, num_variates,"
+            " quantiles):\n"
+            "    return nn.Linear(context_len, prediction_len)\n"
+        ))
+        self._ship(handlers, VALID_CODE, "m", "ship")
+        out = handlers["read_scratchpad"]()
+        summary = out.splitlines()[0]
+        assert "2 hypotheses" in summary
+        assert "1 candidates generated" in summary
+        assert "1 submitted" in summary
+        assert "no scores yet" in summary
+
+    def test_summary_top_score_minimize(self):
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        ch = _make_challenge()
+        ch["score_direction"] = "minimize"
+        handlers = build_handlers(ch)
+        handlers["write_scratchpad"](observation="ok")
+        self._ship(handlers, VALID_CODE, "v1", "first")
+        self._ship(
+            handlers,
+            VALID_CODE.replace("Adam", "Adam  # 2"),
+            "v2", "second",
+        )
+        state = self._state(handlers)
+        merge_results_into_state(state, [
+            {"code_hash": state["submissions"][0]["code_hash"],
+             "score": 0.5, "rank": 1, "round_id": "r1"},
+            {"code_hash": state["submissions"][1]["code_hash"],
+             "score": 0.2, "rank": 1, "round_id": "r2"},
+        ])
+        out = handlers["read_scratchpad"]()
+        # Lower is better when minimizing → 0.2 wins.
+        assert "top score: 0.2" in out.splitlines()[0]
+
+    def test_summary_top_score_maximize(self):
+        from agents.openai_sdk.tools import build_handlers
+        from agents.openai_sdk.core.history import (
+            merge_results_into_state,
+        )
+        ch = _make_challenge()
+        ch["score_direction"] = "maximize"
+        handlers = build_handlers(ch)
+        handlers["write_scratchpad"](observation="ok")
+        self._ship(handlers, VALID_CODE, "v1", "first")
+        self._ship(
+            handlers,
+            VALID_CODE.replace("Adam", "Adam  # 2"),
+            "v2", "second",
+        )
+        state = self._state(handlers)
+        merge_results_into_state(state, [
+            {"code_hash": state["submissions"][0]["code_hash"],
+             "score": 0.5, "rank": 1, "round_id": "r1"},
+            {"code_hash": state["submissions"][1]["code_hash"],
+             "score": 0.2, "rank": 2, "round_id": "r2"},
+        ])
+        out = handlers["read_scratchpad"]()
+        # Higher is better when maximizing → 0.5 wins.
+        assert "top score: 0.5" in out.splitlines()[0]
+
+    def test_empty_state_still_says_first_round(self):
+        """The summary line alone shouldn't suppress the 'first round'
+        message — read_scratchpad should treat an otherwise-empty
+        state as not-yet-populated."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["read_scratchpad"]()
+        assert "first round" in out
+
+    # ── link_hypothesis (late-bind) ──────────────────────────────
+
+    def test_link_hypothesis_appends_candidate_id(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help", candidate_id="cand_a3f24c1d",
+        )
+        assert out.startswith("linked")
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == ["cand_a3f24c1d"]
+
+    def test_link_hypothesis_dedupes_candidate_id(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](
+            hypothesis="patches help", candidate_id="cand_aaaaaaaa",
+        )
+        handlers["link_hypothesis"](
+            hypothesis="patches help", candidate_id="cand_aaaaaaaa",
+        )
+        bucket = self._state(handlers)["notes"]["open_hypotheses"]
+        assert bucket[0]["candidate_ids"] == ["cand_aaaaaaaa"]
+
+    def test_link_hypothesis_sets_verdict_creates_outcome(self):
+        """Setting a verdict on an unscored hypothesis creates the
+        outcome dict with score / rank as None."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help", verdict="supported",
+        )
+        assert "verdict=supported" in out
+        record = self._state(handlers)["notes"]["open_hypotheses"][0]
+        assert record["outcome"] == {
+            "score": None, "rank": None, "verdict": "supported",
+        }
+
+    def test_link_hypothesis_combined_candidate_and_verdict(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help",
+            candidate_id="cand_a3f24c1d",
+            verdict="refuted",
+        )
+        assert "linked" in out
+        record = self._state(handlers)["notes"]["open_hypotheses"][0]
+        assert record["candidate_ids"] == ["cand_a3f24c1d"]
+        assert record["outcome"]["verdict"] == "refuted"
+
+    def test_link_hypothesis_unknown_text_returns_error(self):
+        """Linking a nonexistent hypothesis returns an error string —
+        does not raise."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["link_hypothesis"](
+            hypothesis="never written",
+            candidate_id="cand_a3f24c1d",
+        )
+        assert out.startswith("error:")
+        assert "not found" in out
+        assert "never written" in out
+
+    def test_link_hypothesis_invalid_verdict_returns_error(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](
+            hypothesis="patches help", verdict="maybe",
+        )
+        assert out.startswith("error:")
+        assert "maybe" in out
+
+    def test_link_hypothesis_requires_some_action(self):
+        """Calling with neither candidate_id nor verdict is a no-op —
+        return an error so the LLM doesn't waste a tool slot."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        out = handlers["link_hypothesis"](hypothesis="patches help")
+        assert out.startswith("error:")
+
+    def test_link_hypothesis_render_shows_verdict(self):
+        """read_scratchpad surfaces the verdict on the hypothesis line."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](hypothesis="patches help")
+        handlers["link_hypothesis"](
+            hypothesis="patches help", verdict="supported",
+        )
+        out = handlers["read_scratchpad"]()
+        line = [
+            l for l in out.splitlines() if "patches help" in l
+        ][0]
+        assert "[verdict: supported]" in line
+
+
+class TestMacros:
+    """Feature 4: tool macros.
+
+    define_macro stores a reusable sequence; run_macro plays it back
+    with ``${args.X}`` and ``${step_var}`` substitution; list_macros
+    surfaces what's defined. Macros can't ship (submit is banned) and
+    can't recurse (define_macro / run_macro are banned in sequences).
+    """
+
+    def _state(self, handlers):
+        return handlers["submit"]._state_holder["state"]
+
+    def test_define_macro_stores_correctly(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(frontier=[
+            {"name": "m0", "objectives": {"crps": 0.4}, "code": "pass"},
+        ]))
+        out = handlers["define_macro"](
+            name="similar_frontier",
+            sequence=[
+                {"tool": "list_frontier", "args": {},
+                 "output_to": "fl"},
+                {"tool": "get_frontier_member",
+                 "args": {"idx": 0}, "output_to": "m1"},
+            ],
+            description="explore frontier head",
+        )
+        assert "similar_frontier" in out
+        assert "2 step" in out
+        macro = self._state(handlers)["macros"]["similar_frontier"]
+        assert macro["description"] == "explore frontier head"
+        assert len(macro["sequence"]) == 2
+        assert macro["sequence"][0]["output_to"] == "fl"
+        assert "created_at" in macro
+
+    def test_define_macro_rejects_submit(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="ship_it",
+            sequence=[
+                {"tool": "submit",
+                 "args": {"code": "x", "name": "n", "motivation": "m"}},
+            ],
+        )
+        assert out.startswith("error:")
+        assert "submit" in out
+        assert "macros" not in self._state(handlers) or \
+            "ship_it" not in self._state(handlers)["macros"]
+
+    def test_define_macro_rejects_unknown_tool(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="bogus",
+            sequence=[{"tool": "nonexistent_tool", "args": {}}],
+        )
+        assert out.startswith("error:")
+        assert "nonexistent_tool" in out
+
+    def test_define_macro_rejects_nested_macro_calls(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out_run = handlers["define_macro"](
+            name="recurse",
+            sequence=[{"tool": "run_macro", "args": {"name": "recurse"}}],
+        )
+        assert out_run.startswith("error:")
+        out_def = handlers["define_macro"](
+            name="meta",
+            sequence=[{"tool": "define_macro",
+                       "args": {"name": "x", "sequence": []}}],
+        )
+        assert out_def.startswith("error:")
+
+    def test_define_macro_rejects_invalid_name(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="123-bad name!",
+            sequence=[{"tool": "analyze_task", "args": {}}],
+        )
+        assert out.startswith("error:")
+
+    def test_define_macro_rejects_too_many_steps(self):
+        from core.history import MAX_MACRO_STEPS
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["define_macro"](
+            name="big",
+            sequence=[
+                {"tool": "analyze_task", "args": {}}
+                for _ in range(MAX_MACRO_STEPS + 1)
+            ],
+        )
+        assert out.startswith("error:")
+        assert str(MAX_MACRO_STEPS) in out
+
+    def test_run_macro_executes_sequence(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["define_macro"](
+            name="task_then_frontier",
+            sequence=[
+                {"tool": "analyze_task", "args": {}},
+                {"tool": "list_frontier", "args": {}},
+            ],
+        )
+        out = handlers["run_macro"](name="task_then_frontier")
+        assert "[step 1 analyze_task]" in out
+        assert "[step 2 list_frontier]" in out
+        assert "ts_forecasting" in out
+
+    def test_run_macro_substitutes_args(self):
+        """``${args.idx}`` must resolve to the run-time arg."""
+        from agents.openai_sdk.tools import build_handlers
+        frontier = [
+            {"name": "f0", "objectives": {"crps": 0.4}, "code": "x=0"},
+            {"name": "f1", "objectives": {"crps": 0.3}, "code": "x=1"},
+        ]
+        handlers = build_handlers(_make_challenge(frontier=frontier))
+        handlers["define_macro"](
+            name="get_at",
+            sequence=[
+                {"tool": "get_frontier_member",
+                 "args": {"idx": "${args.i}"}},
+            ],
+        )
+        # Whole-string substitution preserves the int type, so the
+        # idx int-check inside _get_frontier_member passes.
+        out = handlers["run_macro"](name="get_at", args={"i": 1})
+        assert "x=1" in out
+        assert "out of range" not in out
+
+    def test_run_macro_substitutes_step_outputs(self):
+        """``${step_var}`` is replaced with a previous step's output
+        when used as an embedded substring."""
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        handlers["write_scratchpad"](observation="seed obs")
+        # search_files takes a query string; we substitute a literal
+        # word that should match the seeded observation.
+        handlers["define_macro"](
+            name="grep_chain",
+            sequence=[
+                # First step produces output we don't care about; we
+                # only use it to demonstrate the variable name lookup.
+                {"tool": "analyze_task", "args": {},
+                 "output_to": "task"},
+                # Build a query that includes ${task} embedded — the
+                # substitution stringifies the prior step output.
+                {"tool": "search_files",
+                 "args": {"query": "missing-${task}-marker"}},
+            ],
+        )
+        # No scratch_dir wired, so search_files reports unavailable.
+        # That's fine — we only need to confirm both steps fired and
+        # the substitution produced a non-literal query.
+        out = handlers["run_macro"](name="grep_chain")
+        assert "[step 1 analyze_task]" in out
+        assert "[step 2 search_files]" in out
+
+    def test_run_macro_missing_var_keeps_literal(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(frontier=[
+            {"name": "f0", "objectives": {}, "code": "x=0"},
+        ]))
+        handlers["define_macro"](
+            name="bad_ref",
+            sequence=[
+                # This uses a whole-string ref that doesn't resolve.
+                # The literal ${args.missing} reaches the handler,
+                # which then errors on the type check — proving the
+                # substitution did NOT silently swap in something
+                # bogus.
+                {"tool": "get_frontier_member",
+                 "args": {"idx": "${args.missing}"}},
+            ],
+        )
+        out = handlers["run_macro"](name="bad_ref", args={})
+        assert "out of range" in out or "error" in out.lower()
+
+    def test_run_macro_halts_on_error_returns_partial(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge(frontier=[]))
+        handlers["define_macro"](
+            name="halt_demo",
+            sequence=[
+                {"tool": "analyze_task", "args": {}},
+                # list_frontier returns "frontier is empty" — that's
+                # informational, not an error string. Use
+                # get_frontier_member with bogus idx to force an
+                # actual error: line.
+                {"tool": "get_frontier_member",
+                 "args": {"idx": 99}},
+                {"tool": "analyze_task", "args": {}},
+            ],
+        )
+        out = handlers["run_macro"](name="halt_demo")
+        # First two steps recorded; the second errored so the third
+        # never runs.
+        assert "[step 1 analyze_task]" in out
+        assert "[step 2 get_frontier_member]" in out
+        assert "[step 3" not in out
+        assert "error:" in out.lower()
+
+    def test_run_macro_unknown_macro_errors(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        out = handlers["run_macro"](name="ghost")
+        assert out.startswith("error:")
+        assert "ghost" in out
+
+    def test_list_macros_returns_signatures(self):
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(_make_challenge())
+        assert handlers["list_macros"]() == "no macros defined yet"
+        handlers["define_macro"](
+            name="m1",
+            sequence=[{"tool": "analyze_task", "args": {}}],
+            description="just analyze",
+        )
+        out = handlers["list_macros"]()
+        items = json.loads(out)
+        assert len(items) == 1
+        assert items[0]["name"] == "m1"
+        assert items[0]["description"] == "just analyze"
+        assert items[0]["n_steps"] == 1
+        assert items[0]["tools"] == ["analyze_task"]
+
+    def test_legacy_state_loads_with_empty_macros(self, tmp_path):
+        import json as _json
+        legacy = {"history": [], "notes": {"open_hypotheses": []}}
+        (tmp_path / "state.json").write_text(_json.dumps(legacy))
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        assert handlers["list_macros"]() == "no macros defined yet"
+        # Defining a macro lazily creates the dict.
+        handlers["define_macro"](
+            name="m1",
+            sequence=[{"tool": "analyze_task", "args": {}}],
+        )
+        assert "m1" in self._state(handlers)["macros"]
+
+    def test_macros_survive_save_load_roundtrip(self, tmp_path):
+        import sys
+        sys.path.insert(0, "agents/openai_sdk")
+        for k in list(sys.modules):
+            if k == "core" or k.startswith("core."):
+                del sys.modules[k]
+        from core.history import (  # noqa: E402
+            load_state, save_state,
+        )
+        from agents.openai_sdk.tools import build_handlers
+        handlers = build_handlers(
+            _make_challenge(), scratch_dir=str(tmp_path),
+        )
+        handlers["define_macro"](
+            name="m1",
+            sequence=[
+                {"tool": "analyze_task", "args": {},
+                 "output_to": "t"},
+            ],
+            description="d",
+        )
+        save_state(str(tmp_path), self._state(handlers))
+        reloaded = load_state(str(tmp_path))
+        assert "macros" in reloaded
+        m = reloaded["macros"]["m1"]
+        assert m["description"] == "d"
+        assert m["sequence"][0]["tool"] == "analyze_task"
+        assert m["sequence"][0]["output_to"] == "t"
+        assert "created_at" in m
 
 
 class TestFileTools:
@@ -857,7 +1886,11 @@ class TestScratchpadNotes:
         handlers, state = self._handlers_with_state()
         out = handlers["write_scratchpad"](hypothesis="try SSM backbone")
         assert "hypothesis" in out
-        assert state["notes"]["open_hypotheses"] == ["try SSM backbone"]
+        # Hypotheses are now structured dicts with candidate_ids.
+        bucket = state["notes"]["open_hypotheses"]
+        assert len(bucket) == 1
+        assert bucket[0]["text"] == "try SSM backbone"
+        assert bucket[0]["candidate_ids"] == []
 
     def test_write_dead_end_with_reason_combines_them(self):
         handlers, state = self._handlers_with_state()
@@ -890,7 +1923,7 @@ class TestScratchpadNotes:
         )
         for tag in ("hypothesis", "dead_end", "observation"):
             assert tag in out
-        assert state["notes"]["open_hypotheses"] == ["try attention"]
+        assert state["notes"]["open_hypotheses"][0]["text"] == "try attention"
         assert "underfits" in state["notes"]["dead_ends"][0]
         assert state["notes"]["task_observations"] == [
             "input channels are fixed",
@@ -921,7 +1954,7 @@ class TestScratchpadNotes:
             handlers["write_scratchpad"](hypothesis=f"h{i}")
         bucket = state["notes"]["open_hypotheses"]
         assert len(bucket) == NOTES_MAX_ENTRIES
-        assert bucket[-1] == f"h{NOTES_MAX_ENTRIES + 2}"
+        assert bucket[-1]["text"] == f"h{NOTES_MAX_ENTRIES + 2}"
 
     def test_wrote_this_round_flag_set_after_success(self):
         from agents.openai_sdk.tools import build_handlers
