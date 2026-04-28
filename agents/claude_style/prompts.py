@@ -60,12 +60,26 @@ def build_designer_user_prompt(challenge: dict, brief: dict) -> str:
     )
 
 
+def build_critic_system_prompt() -> str:
+    """STUB."""
+    return (
+        "You are the critic subagent. You see the designer's current "
+        "code and the latest validate_code result. Your job is to "
+        "give the designer one short, structured critique it can act "
+        "on immediately.\n\n"
+        "Reply with EXACTLY three lines:\n"
+        "KEEP: <one sentence — what is working / should not be touched>\n"
+        "CHANGE: <one sentence — the single most impactful revision>\n"
+        "DROP: <one sentence — what to remove or stop doing>\n\n"
+        "If validation passed (`ok ...`), KEEP the architecture and "
+        "tell the designer to submit. If validation failed, focus "
+        "CHANGE on the specific failing constraint."
+    )
+
+
 def build_critic_prompt(code: str, validation_result: str) -> str:
     """STUB."""
     return (
-        "You are the critic. Read the latest validation result and "
-        "the current code. Reply with three short bullets: keep, "
-        "change, drop.\n\n"
-        f"validation:\n{validation_result}\n\ncode:\n```python\n"
-        f"{code[:4000]}\n```"
+        f"validation result:\n{validation_result}\n\n"
+        f"current code:\n```python\n{code[:4000]}\n```"
     )

@@ -76,6 +76,10 @@ class Subagent:
     ``max_rounds`` caps the number of LLM turns this subagent will
     take. ``llm_kwargs`` forwards llm_url / agent_token / miner_uid /
     model / temperature into ``chat()``.
+    ``on_tool_result``, when set, is called after each tool dispatch
+    with ``(name, args, result, state)``. If it returns a non-empty
+    string the string is appended to the message list as a user-role
+    message — the hook the designer uses to inject critic feedback.
     """
 
     name: str
@@ -88,6 +92,9 @@ class Subagent:
     state: dict = field(default_factory=dict)
     max_rounds: int = 8
     llm_kwargs: dict = field(default_factory=dict)
+    on_tool_result: Optional[
+        Callable[[str, dict, str, dict], Optional[str]]
+    ] = None
     # Min seconds remaining required to start a new chat round. Below
     # this, the loop bails to leave room for the orchestrator's
     # packaging window.
@@ -189,6 +196,27 @@ class Subagent:
                         "validate_history", [],
                     )
                     history.append({"round": round_num, "ok": ok})
+
+                # Per-tool post-result callback. Used by the designer
+                # to fire the critic between iterations. Returning a
+                # non-empty string appends a user-role message; None
+                # is a no-op.
+                if self.on_tool_result is not None:
+                    try:
+                        injected = self.on_tool_result(
+                            name, args, str(tool_result), self.state,
+                        )
+                    except Exception as exc:
+                        _log(
+                            f"[{self.name}] on_tool_result raised: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        injected = None
+                    if injected:
+                        messages.append({
+                            "role": "user",
+                            "content": str(injected)[:4000],
+                        })
 
             if stopped:
                 break
