@@ -158,10 +158,24 @@ TOOLS: list[dict] = [
         "function": {
             "name": "query_db",
             "description": (
-                "Experiment DB. Paths: /frontier, /experiments/recent, "
-                "/experiments/pareto, /experiments/{id}, "
-                "/experiments/stats, POST /experiments/search, "
-                "/experiments/lineage/{id}, /experiments/diff/{a}/{b}."
+                "Experiment DB (read-only). ~60 calls/min budget; calls are "
+                "logged under your hotkey and shown on the public dashboard.\n"
+                "Frontier+listing: /frontier?task=, /experiments/pareto?task=, "
+                "/experiments/recent?n=, /experiments/failures?n=, "
+                "/experiments/families?task=, /experiments/stats?task=, "
+                "/experiments/tasks, /challenge.\n"
+                "Per-experiment: /experiments/{idx}, "
+                "/experiments/{idx}/diff (credits read), "
+                "/experiments/lineage/{idx}, "
+                "/experiments/{idx}/lineage_diffs, "
+                "/experiments/diff/{a}/{b} (does NOT credit reads), "
+                "POST /experiments/search body {\"query\": \"...\"}.\n"
+                "Provenance: /provenance/{idx}/similar?top_k= "
+                "(novelty check before submit), "
+                "/provenance/{idx}/influences, /provenance/{idx}/impact, "
+                "/provenance/{idx}/graph, /provenance/components, "
+                "/provenance/component_stats, /provenance/dead_ends.\n"
+                "Responses >256 KB are returned but don't credit reads."
             ),
             "parameters": {
                 "type": "object",
