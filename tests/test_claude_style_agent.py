@@ -135,6 +135,37 @@ def _make_challenge(with_flops: bool = True) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  0. Prompt sizing — pin per-subagent length so future bloat shows up
+# ══════════════════════════════════════════════════════════════════
+
+class TestPromptSizing:
+    """Pin the per-subagent system-prompt sizes with ~25% headroom
+    above the current length. Tighten when you intentionally shrink
+    a prompt; loosen only if growth is genuinely needed."""
+
+    def test_researcher_under_threshold(self):
+        from agents.claude_style.prompts import build_researcher_system_prompt
+        prompt = build_researcher_system_prompt(_make_challenge())
+        assert len(prompt) < 4_500, (
+            f"researcher prompt grew to {len(prompt)} chars"
+        )
+
+    def test_designer_under_threshold(self):
+        from agents.claude_style.prompts import build_designer_system_prompt
+        prompt = build_designer_system_prompt(_make_challenge())
+        assert len(prompt) < 8_000, (
+            f"designer prompt grew to {len(prompt)} chars"
+        )
+
+    def test_critic_under_threshold(self):
+        from agents.claude_style.prompts import build_critic_system_prompt
+        prompt = build_critic_system_prompt()
+        assert len(prompt) < 1_500, (
+            f"critic prompt grew to {len(prompt)} chars"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════
 #  1. tools.build_tools — role parameter splits the surface
 # ══════════════════════════════════════════════════════════════════
 
