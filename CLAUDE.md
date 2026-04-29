@@ -162,9 +162,62 @@ content = resp["content"]
 
 ### Experiment DB (`challenge["db_url"]`)
 
+Read-only HTTP proxy to a Pareto-frontier experiment store. Each experiment
+is a JSON object with `index`, `task`, `name`, `miner_uid`, `miner_hotkey`,
+`generation`, `parent_index`, `code`, `motivation`, `results` (with `metric`,
+`flops_equivalent_size`, `loss_curve`, ...), `score`, `round_id`.
+
 ```python
-experiments = client.get_json(f"{db_url}/experiments/recent?limit=10")
+recent = client.get_json(f"{db_url}/experiments/recent?n=15&task={task}")
 ```
+
+Endpoints:
+
+```
+GET  /challenge                         active round metadata
+GET  /frontier?task={task}              current Pareto frontier (cheapest signal)
+GET  /experiments/pareto?task={task}    frontier + near-frontier candidates
+GET  /experiments/recent?n=N&task={task}      most recent N for the task
+GET  /experiments/failures?n=N&task={task}    recent failed experiments
+GET  /experiments/{idx}                 one full experiment (incl. code)
+GET  /experiments/lineage/{idx}         root→idx evolutionary chain
+GET  /experiments/{idx}/diff            unified diff vs. parent (credits read)
+GET  /experiments/diff/{a}/{b}          pair diff — does NOT credit reads
+GET  /experiments/{idx}/lineage_diffs   per-step diffs along the chain
+POST /experiments/search   {"query": "..."}   substring search
+GET  /experiments/families?task={task}  similar-arch clusters + best metric
+GET  /experiments/stats?task={task}     aggregate counts
+GET  /experiments/tasks                 known task names
+
+GET  /provenance/{idx}/influences       likely ancestors (component overlap)
+GET  /provenance/{idx}/impact           descendants — high impact = fertile
+GET  /provenance/{idx}/similar?top_k=K  nearest code neighbors (novelty check)
+GET  /provenance/{idx}/graph            full lineage graph
+GET  /provenance/components             every component seen + usage counts
+GET  /provenance/component_stats        per-component success/score stats
+GET  /provenance/dead_ends              lineages that stopped improving
+```
+
+Access-trail semantics (your queries are public provenance):
+
+- ~60 calls/min budget per round per category. Plan queries; don't bulk-dump.
+- Calls are logged under your hotkey and rendered on the public dashboard.
+- Responses >256 KB are returned intact but skipped by the ID extractor —
+  bulk dumps don't credit you for "having read" those experiments.
+- 4xx/5xx are not logged as accesses.
+- `/experiments/diff/{a}/{b}` returns `index_a`/`index_b`; the extractor
+  matches `index` only, so pair-diffs credit neither side. Use
+  `/experiments/{a}/diff` when you want the read on your trail.
+
+Recommended workflow:
+
+1. `GET /frontier` — what wins right now.
+2. For each interesting member: `GET /experiments/{idx}` then
+   `GET /experiments/{idx}/diff` to learn the edit that unlocked it.
+3. `GET /experiments/failures` — what to avoid.
+4. `GET /provenance/component_stats` — proven primitives.
+5. Before shipping: `GET /provenance/{parent_idx}/similar` to check you're
+   not resubmitting a known design.
 
 ### Arxiv Search (`challenge["desearch_url"]`)
 

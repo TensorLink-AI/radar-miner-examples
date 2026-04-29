@@ -28,14 +28,20 @@ def _get(client, base_url: str, path: str, params: dict | None = None) -> dict |
         return {}
 
 
-def recent_experiments(client, base_url: str, n: int = 15) -> dict | list:
+def recent_experiments(client, base_url: str, n: int = 15, task: str | None = None) -> dict | list:
     """Fetch recent experiment results."""
-    return _get(client, base_url, "/experiments/recent", {"n": n})
+    params: dict = {"n": n}
+    if task:
+        params["task"] = task
+    return _get(client, base_url, "/experiments/recent", params)
 
 
-def recent_failures(client, base_url: str, n: int = 5) -> dict | list:
+def recent_failures(client, base_url: str, n: int = 5, task: str | None = None) -> dict | list:
     """Fetch recent failures with reasons."""
-    return _get(client, base_url, "/experiments/failures", {"n": n})
+    params: dict = {"n": n}
+    if task:
+        params["task"] = task
+    return _get(client, base_url, "/experiments/failures", params)
 
 
 def component_stats(client, base_url: str) -> dict | list:
@@ -46,3 +52,30 @@ def component_stats(client, base_url: str) -> dict | list:
 def dead_ends(client, base_url: str) -> dict | list:
     """Fetch patterns that consistently fail."""
     return _get(client, base_url, "/provenance/dead_ends")
+
+
+def frontier(client, base_url: str, task: str | None = None) -> dict | list:
+    """Fetch the current Pareto frontier — cheapest signal of what wins."""
+    params = {"task": task} if task else None
+    return _get(client, base_url, "/frontier", params)
+
+
+def pareto(client, base_url: str, task: str | None = None) -> dict | list:
+    """Fetch frontier + near-frontier candidates."""
+    params = {"task": task} if task else None
+    return _get(client, base_url, "/experiments/pareto", params)
+
+
+def experiment(client, base_url: str, idx: int) -> dict | list:
+    """Fetch one experiment (full record incl. code)."""
+    return _get(client, base_url, f"/experiments/{idx}")
+
+
+def experiment_diff(client, base_url: str, idx: int) -> dict | list:
+    """Unified diff vs. parent. Credits the read on the access trail."""
+    return _get(client, base_url, f"/experiments/{idx}/diff")
+
+
+def similar(client, base_url: str, idx: int, top_k: int = 5) -> dict | list:
+    """Top-K nearest code neighbors — call before submit to check novelty."""
+    return _get(client, base_url, f"/provenance/{idx}/similar", {"top_k": top_k})
