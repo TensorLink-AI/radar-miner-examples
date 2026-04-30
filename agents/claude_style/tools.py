@@ -2195,6 +2195,7 @@ def build_handlers(
 ROLE_TOOLS: dict[str, frozenset[str]] = {
     "researcher": frozenset({
         "search_papers", "query_db", "list_frontier", "analyze_task",
+        "cognition_wiki_index", "cognition_wiki_read",
         "time_remaining",
     }),
     "designer": frozenset({
