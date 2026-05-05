@@ -2096,17 +2096,6 @@ def build_handlers(
                 "error: nothing to submit — pass either ``code`` or a "
                 "stored ``candidate_id``"
             )
-        # Record the submission so read_my_submissions can show it back
-        # in a later round, and so merge_results_into_state has a
-        # code_hash target when the validator's previous_results arrive.
-        add_submission(
-            state_holder["state"],
-            code=code,
-            name=name,
-            motivation=motivation,
-            candidate_id=candidate_id or None,
-            round_id=round_id,
-        )
         # Time-gate: only ship when we're inside the late-round window.
         # Before that, stash the candidate as best-so-far and tell the
         # LLM to keep iterating. The state_holder persists across tool
@@ -2134,6 +2123,17 @@ def build_handlers(
                 "to lock in your final choice."
             )
 
+        # Inside the late-round window — record the submission (so
+        # read_my_submissions / merge_results_into_state see what
+        # actually shipped) and ship.
+        add_submission(
+            state_holder["state"],
+            code=code,
+            name=name,
+            motivation=motivation,
+            candidate_id=candidate_id or None,
+            round_id=round_id,
+        )
         raise SubmitSignal(code=code, name=name, motivation=motivation)
 
     def _time_remaining(**_kwargs) -> str:

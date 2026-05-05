@@ -835,8 +835,11 @@ class TestOrchestratorIntegration:
     def test_routes_researcher_then_designer_then_submit(
         self, mock_openai,
     ):
-        """Full happy path: researcher returns brief → designer
-        validates and submits → orchestrator packages the submission."""
+        """Full happy path with multi-stash iteration on a long budget:
+        researcher returns brief → designer validates + stashes twice →
+        loop terminates → orchestrator's recovery branch ships the
+        latest best_so_far. Exercises ≥5 LLM turns, which is the point
+        of the v2 time-gated submit."""
         from agents.claude_style_v2 import agent
 
         call_log: list[dict] = []
@@ -844,51 +847,81 @@ class TestOrchestratorIntegration:
         def chat_side_effect(*args, **kwargs):
             call_log.append(kwargs)
             n = len(call_log)
-            # Round 1: researcher returns the brief in a fenced block.
+            # 1: researcher brief.
             if n == 1:
                 return _make_completion(content=(
                     "```json\n" + json.dumps(GOOD_BRIEF) + "\n```"
                 ))
-            # Round 2: designer validates the code.
+            # 2: designer validates code A.
             if n == 2:
                 return _make_completion(tool_calls=[
                     _make_tool_call(
                         "validate_code", {"code": VALID_CODE}, "v1",
                     ),
                 ])
-            # Round 3: critic call.
+            # 3: critic post-tool callback.
             if n == 3:
                 return _make_completion(content=(
-                    "KEEP: x\nCHANGE: nothing\nDROP: nothing"
+                    "KEEP: a\nCHANGE: nothing\nDROP: nothing"
                 ))
-            # Round 4: designer submits.
-            return _make_completion(tool_calls=[
-                _make_tool_call(
-                    "submit",
-                    {
-                        "code": VALID_CODE,
-                        "name": "shipped",
-                        "motivation": "happy path",
-                        "note": "n/a",
-                    },
-                    "s1",
-                ),
-            ])
+            # 4: designer submits A — STASHES (long budget).
+            if n == 4:
+                return _make_completion(tool_calls=[
+                    _make_tool_call(
+                        "submit",
+                        {
+                            "code": VALID_CODE,
+                            "name": "stash_a",
+                            "motivation": "first try",
+                            "note": "n/a",
+                        },
+                        "s1",
+                    ),
+                ])
+            # 5: designer re-validates (same code; resets the
+            # recent-validate window for the second submit).
+            if n == 5:
+                return _make_completion(tool_calls=[
+                    _make_tool_call(
+                        "validate_code", {"code": VALID_CODE}, "v2",
+                    ),
+                ])
+            # 6: second critic.
+            if n == 6:
+                return _make_completion(content=(
+                    "KEEP: b\nCHANGE: nothing\nDROP: nothing"
+                ))
+            # 7: designer submits B — STASHES again, best_so_far now B.
+            if n == 7:
+                return _make_completion(tool_calls=[
+                    _make_tool_call(
+                        "submit",
+                        {
+                            "code": VALID_CODE,
+                            "name": "stash_b",
+                            "motivation": "better try",
+                            "note": "n/a",
+                        },
+                        "s2",
+                    ),
+                ])
+            # 8+: designer gives up — no tool calls → loop terminates,
+            # recovery branch ships best_so_far.
+            return _make_completion(content="done iterating")
 
         mock_openai.return_value.chat.completions.create.side_effect = (
             chat_side_effect
         )
         ch = _make_challenge(with_flops=False)
-        # Keep agent_seconds short enough that the designer's deadline
-        # falls inside the late-window (< EARLY_SUBMIT_GATE_SECONDS=300)
-        # — but big enough that researcher gets > min_round_seconds=30s
-        # of budget after the 0.15 fraction.
-        ch["agent_seconds"] = 280
+        ch["agent_seconds"] = 600
         result = agent.design_architecture(ch, gated_client=None)
-        assert result["name"] == "shipped"
+        # Recovery branch ships the latest stash (best_so_far).
+        assert result["name"] == "stash_b"
         assert result["code"] == VALID_CODE
-        # 1 researcher + 1 validate + 1 critic + 1 submit = 4 calls.
-        assert len(call_log) == 4
+        # ≥5 turns of real iteration coverage.
+        assert len(call_log) >= 5
+        # The scratchpad-survival test asserts submissions stay empty
+        # for stash-only rounds; that property is exercised there.
 
     def test_long_budget_early_submit_recovers_via_stash(self, mock_openai):
         """Long budget: designer submits early → submit stashes
@@ -997,10 +1030,11 @@ class TestOrchestratorIntegration:
     def test_scratchpad_state_survives_across_calls(
         self, mock_openai, tmp_path,
     ):
-        """A submit on round N writes state to scratch_dir; round N+1
-        loads the same scratch_dir and sees the prior submission in
-        history. We simulate the harness by injecting
-        load_scratchpad/save_scratchpad into the agent module."""
+        """Multi-stash round on a long budget: every submit stashes
+        best_so_far without appending to submissions, the recovery
+        branch ships at the end, and the scratchpad save/load roundtrip
+        carries best_so_far forward to the next round. Exercises ≥5
+        loop turns to give the iteration loop real coverage."""
         from agents.claude_style_v2 import agent
         # Patch in the harness-style scratchpad globals.
         monkey_dir = str(tmp_path)
@@ -1015,11 +1049,11 @@ class TestOrchestratorIntegration:
         agent.__dict__["load_scratchpad"] = _load
         agent.__dict__["save_scratchpad"] = _save
         try:
-            # Round 1: submit succeeds.
-            def chat_round1(*args, **kwargs):
-                n = chat_round1.calls = chat_round1.calls + 1 if hasattr(
-                    chat_round1, "calls",
-                ) else 1
+            call_log: list[dict] = []
+
+            def chat_side_effect(*args, **kwargs):
+                call_log.append(kwargs)
+                n = len(call_log)
                 if n == 1:
                     return _make_completion(content=(
                         "```json\n" + json.dumps(GOOD_BRIEF) + "\n```"
@@ -1035,40 +1069,69 @@ class TestOrchestratorIntegration:
                     return _make_completion(content=(
                         "KEEP: x\nCHANGE: y\nDROP: z"
                     ))
-                return _make_completion(tool_calls=[
-                    _make_tool_call(
-                        "submit",
-                        {
-                            "code": VALID_CODE,
-                            "name": "round1",
-                            "motivation": "first",
-                        },
-                        "s1",
-                    ),
-                ])
+                if n == 4:
+                    return _make_completion(tool_calls=[
+                        _make_tool_call(
+                            "submit",
+                            {
+                                "code": VALID_CODE,
+                                "name": "round1_a",
+                                "motivation": "first attempt",
+                            },
+                            "s1",
+                        ),
+                    ])
+                if n == 5:
+                    return _make_completion(tool_calls=[
+                        _make_tool_call(
+                            "validate_code", {"code": VALID_CODE},
+                            "v2",
+                        ),
+                    ])
+                if n == 6:
+                    return _make_completion(content=(
+                        "KEEP: x\nCHANGE: y\nDROP: z"
+                    ))
+                if n == 7:
+                    return _make_completion(tool_calls=[
+                        _make_tool_call(
+                            "submit",
+                            {
+                                "code": VALID_CODE,
+                                "name": "round1_b",
+                                "motivation": "second attempt",
+                            },
+                            "s2",
+                        ),
+                    ])
+                # Loop terminates → recovery branch ships best_so_far.
+                return _make_completion(content="done iterating")
 
             mock_openai.return_value.chat.completions.create.side_effect = (
-                chat_round1
+                chat_side_effect
             )
             ch1 = _make_challenge(with_flops=False)
-            # Keep budget inside the late-window so the first submit
-            # actually ships (only one submission recorded). Larger
-            # budgets would stash and re-submit on every loop turn,
-            # appending to the submissions list each time.
-            ch1["agent_seconds"] = 280
+            ch1["agent_seconds"] = 600
             ch1["round_id"] = 1
             r1 = agent.design_architecture(ch1, gated_client=None)
-            assert r1["name"] == "round1"
+            # Recovery shipped the latest stash.
+            assert r1["name"] == "round1_b"
+            # ≥5 turns of iteration coverage.
+            assert len(call_log) >= 5
 
-            # Round 2: a fresh design_architecture call sees the prior
-            # submission persisted on disk.
+            # Round 2: a fresh design_architecture call loads the
+            # persisted state. best_so_far survived the save/load.
+            # submissions stays empty because no late-window ship
+            # happened — stashes don't accumulate into submissions.
             from agents.claude_style_v2.core.history import (
                 load_state, get_submissions,
             )
             state2 = load_state(monkey_dir)
             subs = get_submissions(state2)
-            assert len(subs) == 1
-            assert subs[0]["name"] == "round1"
+            assert subs == []
+            best = state2.get("best_so_far") or {}
+            assert best.get("name") == "round1_b"
+            assert best.get("code") == VALID_CODE
         finally:
             # Undo our globals injection.
             for k in ("load_scratchpad", "save_scratchpad"):
