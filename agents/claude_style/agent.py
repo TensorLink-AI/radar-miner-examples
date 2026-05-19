@@ -21,6 +21,7 @@ returns a packaged dict; the subagent calls are placeholders.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -95,8 +96,42 @@ def _agent_budget(challenge: dict) -> int:
     return b
 
 
-def _package(code: str, name: str, motivation: str) -> dict:
-    return {"code": code, "name": name, "motivation": motivation}
+def _package(
+    code: str, name: str, motivation: str, prompt_id: str = "",
+) -> dict:
+    out = {"code": code, "name": name, "motivation": motivation}
+    if prompt_id:
+        out["prompt_id"] = prompt_id
+    return out
+
+
+def _load_active_prompt(round_id: int) -> dict:
+    """Return ``{id, template}`` for the prompt variant this round.
+
+    Reads ``prompts/active.json`` (override via ``MINER_PROMPTS_DIR``)
+    and round-robins the population by ``round_id``. Empty when the
+    miner hasn't run ``miner/neuron.py optimize`` — designer then
+    falls back to its hardcoded system prompt. ``id`` round-trips back
+    via ``experiments.prompt_id`` so Phase C scores attribute to the
+    variant that produced them, closing the GEPA loop.
+    """
+    prompts_dir = os.getenv("MINER_PROMPTS_DIR", "prompts")
+    path = os.path.join(prompts_dir, "active.json")
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"id": "", "template": ""}
+    rows = payload.get("prompts") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) or not rows:
+        return {"id": "", "template": ""}
+    pick = rows[round_id % len(rows)]
+    if not isinstance(pick, dict):
+        return {"id": "", "template": ""}
+    return {
+        "id": str(pick.get("id", "")),
+        "template": str(pick.get("template", "")),
+    }
 
 
 def _llm_kwargs(challenge: dict) -> dict:
@@ -130,6 +165,21 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
 
     flops_min, flops_max = extract_flops_budget(challenge)
     bucket = identify_bucket(flops_min, flops_max)
+
+    # ── Active prompt variant (GEPA / random_mutate coevolution) ─
+    # Stashed under "_operator_prompt" so the designer subagent can
+    # append it to its system prompt without changing its builder
+    # signature. ``id`` round-trips back via the returned dict so
+    # Phase C scores attribute to this variant.
+    round_id = int(challenge.get("round_id", 0) or 0)
+    active_prompt = _load_active_prompt(round_id)
+    if active_prompt["id"]:
+        _log(
+            f"[orchestrator] prompt variant {active_prompt['id'][:8]}… "
+            f"(round_id={round_id})"
+        )
+        challenge["_operator_prompt"] = active_prompt["template"]
+        challenge["_operator_prompt_id"] = active_prompt["id"]
 
     # ── Scratchpad load ─────────────────────────────────────────
     scratch_dir: Optional[str] = None
@@ -259,6 +309,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     if submit_sig is not None:
         return _package(
             submit_sig.code, submit_sig.name, submit_sig.motivation,
+            prompt_id=active_prompt["id"],
         )
     if last_validated_code:
         return _package(
@@ -266,6 +317,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             f"auto_submit_{bucket}",
             "Auto-submitted validated code — designer did not call "
             "submit explicitly.",
+            prompt_id=active_prompt["id"],
         )
 
     # Designer failed → fallback template path.
@@ -276,4 +328,6 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         if config_error
         else "FALLBACK: designer failed to produce validated code"
     )
-    return _package(fb_code, fb_name, motivation)
+    return _package(
+        fb_code, fb_name, motivation, prompt_id=active_prompt["id"],
+    )

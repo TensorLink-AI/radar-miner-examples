@@ -14,6 +14,8 @@ Architecture:
   6. RevIN denormalisation (applied per-quantile to preserve last-dim = num_variates)
 """
 
+import json
+import os
 import sys
 import tempfile
 import textwrap
@@ -23,6 +25,34 @@ from core import validation, history
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def _load_active_prompt(round_id: int) -> dict:
+    """Return ``{id, template}`` for the prompt variant this round.
+
+    patch_decoder is deterministic — there's no LLM to steer with the
+    template — but we still surface ``prompt_id`` on the return dict so
+    Phase C scores attribute to the active variant when the miner runs
+    ``miner/neuron.py optimize`` against this agent. Empty when the
+    optimizer hasn't been run.
+    """
+    prompts_dir = os.getenv("MINER_PROMPTS_DIR", "prompts")
+    path = os.path.join(prompts_dir, "active.json")
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"id": "", "template": ""}
+    rows = payload.get("prompts") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) or not rows:
+        return {"id": "", "template": ""}
+    pick = rows[round_id % len(rows)]
+    if not isinstance(pick, dict):
+        return {"id": "", "template": ""}
+    return {
+        "id": str(pick.get("id", "")),
+        "template": str(pick.get("template", "")),
+    }
 
 
 # ── Dynamic scaling ─────────────────────────────────────────────
@@ -284,6 +314,10 @@ def _generate_code(cfg: dict, task_params: dict | None = None) -> str:
 def design_architecture(challenge: dict, client) -> dict:
     """Entry point called by the harness.  Deterministic — no LLM calls."""
 
+    # ── Active prompt variant (attribution-only, no template use) ─
+    round_id = int(challenge.get("round_id", 0) or 0)
+    active_prompt = _load_active_prompt(round_id)
+
     # ── Identify bucket ──────────────────────────────────────────
     flops_min, flops_max = history.extract_flops_budget(challenge)
     bucket = history.identify_bucket(flops_min, flops_max)
@@ -299,8 +333,14 @@ def design_architecture(challenge: dict, client) -> dict:
         task_name = challenge.get("task", {}).get("name", "<unknown>")
         _log(f"[patch_decoder] Skipping submission — patch_decoder only supports "
              f"ts_forecasting tasks (got {task_name!r})")
-        return {"code": "", "name": "patch_decoder_skip", "motivation":
-                f"patch_decoder only supports ts_forecasting tasks, not {task_name!r}"}
+        return {
+            "code": "",
+            "name": "patch_decoder_skip",
+            "motivation":
+                f"patch_decoder only supports ts_forecasting tasks, "
+                f"not {task_name!r}",
+            "prompt_id": active_prompt["id"],
+        }
 
     _log(f"[patch_decoder] Dynamic config: d_model={cfg['d_model']}, "
          f"layers={cfg['n_layers']}, patch_size={cfg['patch_size']}")
@@ -351,4 +391,9 @@ def design_architecture(challenge: dict, client) -> dict:
     except Exception:
         pass
 
-    return {"code": code, "name": name, "motivation": motivation}
+    return {
+        "code": code,
+        "name": name,
+        "motivation": motivation,
+        "prompt_id": active_prompt["id"],
+    }

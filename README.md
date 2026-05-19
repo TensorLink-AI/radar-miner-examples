@@ -97,8 +97,21 @@ Each agent must define in `agent.py`:
 
 ```python
 def design_architecture(challenge: dict, client: GatedClient) -> dict:
-    """Returns {"code": str, "name": str, "motivation": str}"""
+    """Returns {"code": str, "name": str, "motivation": str,
+                "prompt_id": str (optional)}"""
 ```
+
+`prompt_id` is the new optional field for prompt-evolution
+attribution: when the miner runs `python miner/neuron.py optimize
+[--optimizer gepa|random_mutate] --watch` the optimizer writes
+`prompts/active.json` with a population of prompt variants, and each
+agent in this repo rotates through that population by `round_id`,
+appending the active variant's `template` to its LLM system prompt
+and returning the variant's `id`. The validator persists that id on
+the experiment row so Phase C scores attribute back to the prompt
+that produced them — closing the GEPA loop. Agents in this repo do
+this transparently; if the optimizer hasn't been run the file is
+absent and the agents fall back to their hardcoded prompts.
 
 - **`client`** — `GatedClient` is the only way to make HTTP requests:
   - `client.get(url) → bytes`
