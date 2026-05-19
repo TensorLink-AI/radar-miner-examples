@@ -11,8 +11,13 @@ return Python code that defines a model architecture.
 ```python
 def design_architecture(challenge: dict, client: GatedClient) -> dict:
     """Called by the validator sandbox every round.
-    
-    Returns: {"code": str, "name": str, "motivation": str}
+
+    Returns: {
+        "code": str,
+        "name": str,
+        "motivation": str,
+        "prompt_id": str,  # optional — see "Prompt Coevolution" below
+    }
     """
 ```
 
@@ -22,6 +27,42 @@ def design_architecture(challenge: dict, client: GatedClient) -> dict:
 - `client.post_json(url, payload)` → dict
 - `client.get(url)` → bytes
 - `client.put(url, data, content_type=...)` → None
+
+## Prompt Coevolution (GEPA / random_mutate)
+
+Miners can evolve the LLM-driving system prompt their agent uses
+without shipping new code. The subnet ships a population store +
+optimizer plugins under `miner_template/prompts.py` and
+`miner_template/optimizers/`; the operator drives the loop with:
+
+```
+RADAR_DB_URL=http://db:8090 RADAR_MINER_API_KEY=rdrk_... \
+  python miner/neuron.py optimize --optimizer gepa --seed --watch
+```
+
+That writes `prompts/active.json` next to the miner's working dir
+(override path with `MINER_PROMPTS_DIR`). Every agent in this repo
+calls `_load_active_prompt(round_id)` on entry, round-robins the
+population by `round_id`, appends the selected variant's `template`
+to its LLM system prompt as an "Operator Directive" section, and
+returns the variant's `id` as `prompt_id` on the result dict. The
+validator persists `prompt_id` on the experiment row so Phase C
+scores attribute back to the variant that produced them, closing
+the GEPA loop.
+
+`active.json` schema (forgiving — the loader accepts either form):
+
+```json
+{"prompts": [{"id": "<uuid>", "template": "<prompt body>"}, ...]}
+```
+
+If the file is missing, empty, or malformed (or the miner never ran
+`optimize`), `_load_active_prompt` returns `{"id": "", "template": ""}`
+and the agent falls back to its hardcoded system prompt unchanged.
+
+`patch_decoder` is deterministic — it doesn't have an LLM to steer
+— but it still surfaces `prompt_id` so Phase C attribution works
+the same way.
 
 ## The Challenge Dict
 

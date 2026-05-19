@@ -1198,7 +1198,9 @@ class TestSmoke:
         )
 
         result = agent.design_architecture(loaded, gated_client=None)
-        assert set(result.keys()) == {"code", "name", "motivation"}
+        # Required base contract — extra keys (e.g. ``prompt_id`` for
+        # GEPA attribution) are allowed.
+        assert {"code", "name", "motivation"}.issubset(result.keys())
         assert isinstance(result["code"], str)
         assert isinstance(result["name"], str)
         assert isinstance(result["motivation"], str)

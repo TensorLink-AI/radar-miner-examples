@@ -55,6 +55,36 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _load_active_prompt(round_id: int) -> dict:
+    """Return ``{id, template}`` for the prompt variant this round.
+
+    Reads ``prompts/active.json`` next to the miner's working dir
+    (override via ``MINER_PROMPTS_DIR``) and round-robins over the
+    population by ``round_id``. Empty when the miner hasn't run the
+    prompt optimizer (``miner/neuron.py optimize``) — agents fall back
+    to their hardcoded heuristic in that case. ``id`` round-trips back
+    via ``experiments.prompt_id`` so Phase C scores attribute to the
+    variant that produced them, closing the GEPA loop.
+    """
+    prompts_dir = os.getenv("MINER_PROMPTS_DIR", "prompts")
+    path = os.path.join(prompts_dir, "active.json")
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"id": "", "template": ""}
+    rows = payload.get("prompts") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) or not rows:
+        return {"id": "", "template": ""}
+    pick = rows[round_id % len(rows)]
+    if not isinstance(pick, dict):
+        return {"id": "", "template": ""}
+    return {
+        "id": str(pick.get("id", "")),
+        "template": str(pick.get("template", "")),
+    }
+
+
 def _resolve_agent_budget(challenge: dict) -> int:
     """Resolve the seconds available to this agent (Phase A, design).
 
@@ -851,8 +881,28 @@ def design_architecture(challenge: dict, client) -> dict:
     tool_handlers = build_handlers(client, challenge, scratch_dir, deadline)
     tools = build_tools(challenge)
 
+    # ── Active prompt variant (GEPA / random_mutate coevolution) ──
+    # When the miner runs ``miner/neuron.py optimize`` the active
+    # population rotates through here by round_id; otherwise the
+    # template is empty and the agent runs with just its hardcoded
+    # system prompt.
+    round_id = int(challenge.get("round_id", 0) or 0)
+    active_prompt = _load_active_prompt(round_id)
+    if active_prompt["id"]:
+        _log(
+            f"[agent] Using prompt variant {active_prompt['id'][:8]}… "
+            f"(round_id={round_id} → population index "
+            f"{round_id % max(1, len(active_prompt['id']) and 1)})."
+        )
+
     # ── Build messages ────────────────────────────────────────────
     system_prompt = _build_system_prompt(challenge, strategy)
+    if active_prompt["template"]:
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            f"## Operator Directive (prompt variant {active_prompt['id'][:8]})\n"
+            f"{active_prompt['template']}"
+        )
     kickoff = _build_kickoff_message(challenge, strategy)
 
     messages = [
@@ -949,4 +999,9 @@ def design_architecture(challenge: dict, client) -> dict:
     history.save_state(scratch_dir, state)
     _try_save_scratchpad(challenge, scratch_dir)
 
-    return {"code": code, "name": name, "motivation": motivation}
+    return {
+        "code": code,
+        "name": name,
+        "motivation": motivation,
+        "prompt_id": active_prompt["id"],
+    }

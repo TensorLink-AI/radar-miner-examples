@@ -108,8 +108,42 @@ def _extract_code_block(text: str) -> str:
     return ""
 
 
-def _package(code: str, name: str, motivation: str) -> dict:
-    return {"code": code, "name": name, "motivation": motivation}
+def _package(
+    code: str, name: str, motivation: str, prompt_id: str = "",
+) -> dict:
+    out = {"code": code, "name": name, "motivation": motivation}
+    if prompt_id:
+        out["prompt_id"] = prompt_id
+    return out
+
+
+def _load_active_prompt(round_id: int) -> dict:
+    """Return ``{id, template}`` for the prompt variant this round.
+
+    Reads ``prompts/active.json`` (override via ``MINER_PROMPTS_DIR``)
+    and round-robins the population by ``round_id``. Empty when the
+    miner hasn't run ``miner/neuron.py optimize`` — the agent then
+    falls back to its hardcoded system prompt. ``id`` round-trips back
+    via ``experiments.prompt_id`` so Phase C scores attribute to the
+    variant that produced them, closing the GEPA loop.
+    """
+    prompts_dir = os.getenv("MINER_PROMPTS_DIR", "prompts")
+    path = os.path.join(prompts_dir, "active.json")
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"id": "", "template": ""}
+    rows = payload.get("prompts") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list) or not rows:
+        return {"id": "", "template": ""}
+    pick = rows[round_id % len(rows)]
+    if not isinstance(pick, dict):
+        return {"id": "", "template": ""}
+    return {
+        "id": str(pick.get("id", "")),
+        "template": str(pick.get("template", "")),
+    }
 
 
 def _serialize_assistant_message(msg) -> dict:
@@ -518,8 +552,24 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         config_broken = True
         config_error = f"config error: {exc}"
 
+    # ── Active prompt variant (GEPA / random_mutate coevolution) ─────
+    round_id = int(challenge.get("round_id", 0) or 0)
+    active_prompt = _load_active_prompt(round_id)
+    if active_prompt["id"]:
+        _log(
+            f"[agent] Using prompt variant {active_prompt['id'][:8]}… "
+            f"(round_id={round_id})."
+        )
+
+    system_content = build_system_prompt(challenge, bucket)
+    if active_prompt["template"]:
+        system_content = (
+            f"{system_content}\n\n"
+            f"## Operator Directive (prompt variant {active_prompt['id'][:8]})\n"
+            f"{active_prompt['template']}"
+        )
     messages: list[dict] = [
-        {"role": "system", "content": build_system_prompt(challenge, bucket)},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": build_user_prompt(challenge, bucket)},
     ]
 
@@ -609,12 +659,14 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
     if submit_sig is not None:
         return _package(
             submit_sig.code, submit_sig.name, submit_sig.motivation,
+            prompt_id=active_prompt["id"],
         )
     if last_validated_code:
         return _package(
             last_validated_code,
             "openai_sdk_llm",
             "LLM-generated and validated",
+            prompt_id=active_prompt["id"],
         )
     if last_proposed_code:
         joined = "; ".join(last_validation_errors)[:200]
@@ -622,6 +674,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             last_proposed_code,
             "openai_sdk_best_effort",
             f"LLM code failed validation: {joined}",
+            prompt_id=active_prompt["id"],
         )
 
     # Pick the most specific failure motivation we have.
@@ -661,6 +714,7 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
             f"auto_submit_{bucket}",
             "Auto-submitted validated code — LLM did not call submit "
             f"explicitly. Root cause: {fallback_motivation}",
+            prompt_id=active_prompt["id"],
         )
 
     # Stage B: honest failure. No template fallback — return empty code
@@ -674,4 +728,5 @@ def design_architecture(challenge: dict, gated_client=None) -> dict:
         "",
         f"failed_{bucket}",
         f"FAILURE: {fallback_motivation}",
+        prompt_id=active_prompt["id"],
     )

@@ -119,9 +119,24 @@ def run_designer(
         llm_kwargs=llm_kwargs,
     )
 
+    designer_sys = build_designer_system_prompt(challenge, bucket)
+    # Operator prompt directive (GEPA / random_mutate variant for this
+    # round) is stashed by the orchestrator. Appending it lets the
+    # subnet's prompt optimizer steer the designer's instructions
+    # without us forking ``build_designer_system_prompt`` for every
+    # variant.
+    op_directive = challenge.get("_operator_prompt") or ""
+    op_id = challenge.get("_operator_prompt_id") or ""
+    if op_directive:
+        designer_sys = (
+            f"{designer_sys}\n\n"
+            f"## Operator Directive (prompt variant {op_id[:8]})\n"
+            f"{op_directive}"
+        )
+
     sub = Subagent(
         name="designer",
-        system_prompt=build_designer_system_prompt(challenge, bucket),
+        system_prompt=designer_sys,
         user_prompt=build_designer_user_prompt(challenge, brief),
         tools=tools,
         handlers=handlers,
