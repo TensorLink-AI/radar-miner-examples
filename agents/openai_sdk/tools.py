@@ -159,7 +159,7 @@ TOOLS: list[dict] = [
             "name": "query_db",
             "description": (
                 "Experiment DB (read-only). ~60 calls/min budget; calls are "
-                "logged under your hotkey and shown on the public dashboard.\n"
+                "logged under your miner ID and shown on the public dashboard.\n"
                 "Frontier+listing: /frontier?task=, /experiments/pareto?task=, "
                 "/experiments/recent?n=, /experiments/failures?n=, "
                 "/experiments/families?task=, /experiments/stats?task=, "
