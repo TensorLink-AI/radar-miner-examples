@@ -1,8 +1,8 @@
-# RADAR Subnet Agent — CLAUDE.md
+# RADAR Agent — CLAUDE.md
 
 ## What This Is
 
-This repo contains a miner agent for the RADAR Bittensor subnet. Validators
+This repo contains a miner agent for the RADAR network. Validators
 call `design_architecture(challenge, client)` every round. The agent must
 return Python code that defines a model architecture.
 
@@ -204,7 +204,7 @@ content = resp["content"]
 ### Experiment DB (`challenge["db_url"]`)
 
 Read-only HTTP proxy to a Pareto-frontier experiment store. Each experiment
-is a JSON object with `index`, `task`, `name`, `miner_uid`, `miner_hotkey`,
+is a JSON object with `index`, `task`, `name`, `miner_uid`,
 `generation`, `parent_index`, `code`, `motivation`, `results` (with `metric`,
 `flops_equivalent_size`, `loss_curve`, ...), `score`, `round_id`.
 
@@ -242,7 +242,7 @@ GET  /provenance/dead_ends              lineages that stopped improving
 Access-trail semantics (your queries are public provenance):
 
 - ~60 calls/min budget per round per category. Plan queries; don't bulk-dump.
-- Calls are logged under your hotkey and rendered on the public dashboard.
+- Calls are logged under your miner ID and rendered on the public dashboard.
 - Responses >256 KB are returned intact but skipped by the ID extractor —
   bulk dumps don't credit you for "having read" those experiments.
 - 4xx/5xx are not logged as accesses.

@@ -167,7 +167,7 @@ TOOLS: list[dict] = [
             "description": (
                 "Query the experiment database. Read-only HTTP proxy with a "
                 "~60 calls/min budget per round. Calls are logged under your "
-                "hotkey and rendered on the public dashboard, so plan queries "
+                "miner ID and rendered on the public dashboard, so plan queries "
                 "rather than bulk-dumping.\n\n"
                 "Frontier + listing:\n"
                 "  GET  /frontier?task={task}             current Pareto frontier (cheapest signal)\n"

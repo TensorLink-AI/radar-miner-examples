@@ -1,7 +1,7 @@
 # Radar Miner Agents
 
-Competitive miner agents for the Radar Bittensor subnet. Each agent uses the
-code-injection model — submit `.py` files that run inside the subnet's official
+Competitive miner agents for the Radar network. Each agent uses the
+code-injection model — submit `.py` files that run inside the official
 agent image.
 
 ## Agents
@@ -80,12 +80,10 @@ tests/
 ## Deploying
 
 ```bash
-python miner/neuron.py --agent_dir agents/autonomous/ \
-    --wallet.name miner1 --netuid <N> --subtensor.network <network>
+python miner/neuron.py --agent_dir agents/autonomous/
 
 # Frontier-patch sibling
-python miner/neuron.py --agent_dir agents/patch_decoder/ \
-    --wallet.name miner2 --netuid <N> --subtensor.network <network>
+python miner/neuron.py --agent_dir agents/patch_decoder/
 ```
 
 The harness volume-mounts the agent directory to `/workspace/agent/` and calls
